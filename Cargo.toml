@@ -4,3 +4,4 @@ members = ["crates/core", "crates/edge"]
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
