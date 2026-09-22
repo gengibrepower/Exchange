@@ -24,4 +24,4 @@ Em desenvolvimento, por fases (ver seção 12 do escopo). Fase atual: setup / F0
 
 ## Licença
 
-A definir (MIT ou Apache-2.0).
+MIT — ver [`LICENSE`](LICENSE).IT
