@@ -80,13 +80,16 @@ pub fn match_order(book: &mut OrderBook, mut taker: Order) -> Vec<Fill> {
 }
 
 #[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests {
     use std::vec;
 
     use super::*;
     use crate::domain::{AccountId, Fill, InstrumentId, OrderId, OrderStatus, Seq};
 
-    fn order(id: u64, side: Side, price: i64, lots: i64) -> Order {
+    pub(super) fn order(id: u64, side: Side, price: i64, lots: i64) -> Order {
         Order {
             id: OrderId::new(id),
             account: AccountId::new(1),

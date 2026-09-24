@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b5aeb0366b011ee8210e6bcefaafaa4805f833b318ce1e601c52b97e62e512a2 # shrinks to orders = [Order { id: OrderId(1), account: AccountId(1), instrument: InstrumentId(1), side: Ask, price: Price(95), total: Lots(1), remaining: Lots(1), seq: Seq(1), status: New }, Order { id: OrderId(2), account: AccountId(1), instrument: InstrumentId(1), side: Bid, price: Price(95), total: Lots(1), remaining: Lots(1), seq: Seq(2), status: New }]
+cc 246b239b10ce3913b368a476eb010e6ba98e2ba412b88138e2b0c52f3b7d8b41 # shrinks to orders = [Order { id: OrderId(1), account: AccountId(1), instrument: InstrumentId(1), side: Ask, price: Price(101), total: Lots(1), remaining: Lots(1), seq: Seq(1), status: New }, Order { id: OrderId(2), account: AccountId(1), instrument: InstrumentId(1), side: Bid, price: Price(99), total: Lots(1), remaining: Lots(1), seq: Seq(2), status: New }, Order { id: OrderId(3), account: AccountId(1), instrument: InstrumentId(1), side: Ask, price: Price(95), total: Lots(2), remaining: Lots(2), seq: Seq(3), status: New }]
