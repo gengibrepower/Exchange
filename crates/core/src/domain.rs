@@ -15,12 +15,28 @@ impl Price {
 pub struct Lots(i64);
 
 impl Lots {
+    pub const ZERO: Self = Self(0);
+
     pub fn new(value: i64) -> Self {
         Self(value)
     }
 
     pub fn get(self) -> i64 {
         self.0
+    }
+}
+
+impl std::ops::Sub for Lots {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::SubAssign for Lots {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
     }
 }
 
@@ -74,6 +90,14 @@ impl InstrumentId {
     pub fn get(self) -> u32 {
         self.0
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Fill {
+    pub taker: OrderId,
+    pub maker: OrderId,
+    pub price: Price,
+    pub lots: Lots,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
