@@ -230,4 +230,35 @@ mod tests {
 
         assert_eq!(resting_ids(book.asks.get(&Price::new(100))), vec![2]);
     }
+
+    #[test]
+    fn ask_taker_sweeps_bids_from_highest() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Bid, 100, 2));
+        book.rest(order(2, Side::Bid, 101, 2));
+
+        let fills = match_order(&mut book, order(3, Side::Ask, 95, 5));
+
+        assert_eq!(
+            fills,
+            vec![
+                Fill {
+                    taker: OrderId::new(3),
+                    maker: OrderId::new(2),
+                    price: Price::new(101),
+                    lots: Lots::new(2)
+                },
+                Fill {
+                    taker: OrderId::new(3),
+                    maker: OrderId::new(1),
+                    price: Price::new(100),
+                    lots: Lots::new(2)
+                },
+            ]
+        );
+
+        assert_eq!(book.best_ask(), Some(Price::new(95)));
+
+        assert_eq!(book.best_bid(), None);
+    }
 }
