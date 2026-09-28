@@ -30,6 +30,9 @@ impl OrderBook {
     }
 }
 
+/// # Panics
+/// Nunca, por construção: `traded` é o mínimo entre os dois restantes, então nenhuma
+/// subtração fica negativa. Se ficar, o invariante quebrou e parar é o certo (fail-stop).
 pub fn match_order(book: &mut OrderBook, mut taker: Order) -> Vec<Fill> {
     let mut fills = Vec::new();
 
@@ -63,8 +66,14 @@ pub fn match_order(book: &mut OrderBook, mut taker: Order) -> Vec<Fill> {
             price: maker_price,
             lots: traded,
         });
-        taker.remaining -= traded;
-        maker.remaining -= traded;
+        taker.remaining = taker
+            .remaining
+            .checked_sub(traded)
+            .expect("traded é o mínimo dos dois restantes");
+        maker.remaining = maker
+            .remaining
+            .checked_sub(traded)
+            .expect("traded é o mínimo dos dois restantes");
         let maker_filled = maker.remaining == Lots::ZERO;
         if maker_filled {
             level.pop_front();
@@ -89,15 +98,23 @@ mod tests {
     use super::*;
     use crate::domain::{AccountId, Fill, InstrumentId, OrderId, OrderStatus, Seq};
 
-    pub(super) fn order(id: u64, side: Side, price: i64, lots: i64) -> Order {
+    pub(super) fn price(units_per_lot: i64) -> Price {
+        Price::new(units_per_lot).expect("preço de teste válido")
+    }
+
+    pub(super) fn lots(value: i64) -> Lots {
+        Lots::new(value).expect("lots de teste válidos")
+    }
+
+    pub(super) fn order(id: u64, side: Side, price_units: i64, quantity: i64) -> Order {
         Order {
             id: OrderId::new(id),
             account: AccountId::new(1),
             instrument: InstrumentId::new(1),
             side,
-            price: Price::new(price),
-            total: Lots::new(lots),
-            remaining: Lots::new(lots),
+            price: price(price_units),
+            total: lots(quantity),
+            remaining: lots(quantity),
             seq: Seq::new(id),
             status: OrderStatus::New,
         }
@@ -116,8 +133,8 @@ mod tests {
         let fills = match_order(&mut book, order(1, Side::Bid, 100, 5));
 
         assert!(fills.is_empty());
-        assert_eq!(book.best_bid(), Some(Price::new(100)));
-        assert_eq!(resting_ids(book.bids.get(&Price::new(100))), vec![1]);
+        assert_eq!(book.best_bid(), Some(price(100)));
+        assert_eq!(resting_ids(book.bids.get(&price(100))), vec![1]);
     }
 
     #[test]
@@ -128,9 +145,9 @@ mod tests {
         let fills = match_order(&mut book, order(2, Side::Bid, 100, 5));
 
         assert!(fills.is_empty());
-        assert_eq!(book.best_bid(), Some(Price::new(100)));
-        assert_eq!(book.best_ask(), Some(Price::new(101)));
-        assert_eq!(resting_ids(book.asks.get(&Price::new(101))), vec![1]);
+        assert_eq!(book.best_bid(), Some(price(100)));
+        assert_eq!(book.best_ask(), Some(price(101)));
+        assert_eq!(resting_ids(book.asks.get(&price(101))), vec![1]);
     }
 
     #[test]
@@ -145,8 +162,8 @@ mod tests {
             vec![Fill {
                 taker: OrderId::new(2),
                 maker: OrderId::new(1),
-                price: Price::new(100),
-                lots: Lots::new(5),
+                price: price(100),
+                lots: lots(5),
             }]
         );
 
@@ -167,17 +184,14 @@ mod tests {
             vec![Fill {
                 taker: OrderId::new(2),
                 maker: OrderId::new(1),
-                price: Price::new(100),
-                lots: Lots::new(5),
+                price: price(100),
+                lots: lots(5),
             }]
         );
 
-        assert_eq!(resting_ids(book.asks.get(&Price::new(100))), vec![1]);
+        assert_eq!(resting_ids(book.asks.get(&price(100))), vec![1]);
 
-        assert_eq!(
-            book.asks[&Price::new(100)].front().unwrap().remaining,
-            Lots::new(5)
-        );
+        assert_eq!(book.asks[&price(100)].front().unwrap().remaining, lots(5));
 
         assert_eq!(book.best_bid(), None);
     }
@@ -196,21 +210,21 @@ mod tests {
                 Fill {
                     taker: OrderId::new(3),
                     maker: OrderId::new(1),
-                    price: Price::new(100),
-                    lots: Lots::new(2)
+                    price: price(100),
+                    lots: lots(2)
                 },
                 Fill {
                     taker: OrderId::new(3),
                     maker: OrderId::new(2),
-                    price: Price::new(101),
-                    lots: Lots::new(2)
+                    price: price(101),
+                    lots: lots(2)
                 },
             ]
         );
 
         assert_eq!(book.best_ask(), None);
 
-        assert_eq!(book.best_bid(), Some(Price::new(105)));
+        assert_eq!(book.best_bid(), Some(price(105)));
     }
 
     #[test]
@@ -226,12 +240,12 @@ mod tests {
             vec![Fill {
                 taker: OrderId::new(3),
                 maker: OrderId::new(1),
-                price: Price::new(100),
-                lots: Lots::new(3),
+                price: price(100),
+                lots: lots(3),
             }]
         );
 
-        assert_eq!(resting_ids(book.asks.get(&Price::new(100))), vec![2]);
+        assert_eq!(resting_ids(book.asks.get(&price(100))), vec![2]);
     }
 
     #[test]
@@ -248,19 +262,19 @@ mod tests {
                 Fill {
                     taker: OrderId::new(3),
                     maker: OrderId::new(2),
-                    price: Price::new(101),
-                    lots: Lots::new(2)
+                    price: price(101),
+                    lots: lots(2)
                 },
                 Fill {
                     taker: OrderId::new(3),
                     maker: OrderId::new(1),
-                    price: Price::new(100),
-                    lots: Lots::new(2)
+                    price: price(100),
+                    lots: lots(2)
                 },
             ]
         );
 
-        assert_eq!(book.best_ask(), Some(Price::new(95)));
+        assert_eq!(book.best_ask(), Some(price(95)));
 
         assert_eq!(book.best_bid(), None);
     }
