@@ -24,4 +24,4 @@ Em desenvolvimento, por fases (ver seção 12 do escopo). Fase atual: setup / F0
 
 ## Licença
 
-MIT — ver [`LICENSE`](LICENSE).IT
+MIT — ver [`LICENSE`](LICENSE).
