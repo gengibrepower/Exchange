@@ -1,9 +1,32 @@
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DomainError {
+    NonPositivePrice(i64),
+    NegativeLots(i64),
+}
+
+impl std::fmt::Display for DomainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonPositivePrice(value) => write!(f, "preço {value} deve ser positivo"),
+            Self::NegativeLots(value) => write!(f, "lots {value} não pode ser negativo"),
+        }
+    }
+}
+
+impl std::error::Error for DomainError {}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Price(i64);
 
 impl Price {
-    pub fn new(units_per_lot: i64) -> Self {
-        Self(units_per_lot)
+    /// # Errors
+    /// [`DomainError::NonPositivePrice`] se `units_per_lot <= 0`.
+    pub fn new(units_per_lot: i64) -> Result<Self, DomainError> {
+        if units_per_lot <= 0 {
+            Err(DomainError::NonPositivePrice(units_per_lot))
+        } else {
+            Ok(Self(units_per_lot))
+        }
     }
 
     pub fn get(self) -> i64 {
@@ -17,26 +40,25 @@ pub struct Lots(i64);
 impl Lots {
     pub const ZERO: Self = Self(0);
 
-    pub fn new(value: i64) -> Self {
-        Self(value)
+    /// # Errors
+    /// [`DomainError::NegativeLots`] se `value < 0`.
+    pub fn new(value: i64) -> Result<Self, DomainError> {
+        if value < 0 {
+            Err(DomainError::NegativeLots(value))
+        } else {
+            Ok(Self(value))
+        }
     }
 
     pub fn get(self) -> i64 {
         self.0
     }
-}
 
-impl std::ops::Sub for Lots {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self {
-        Self(self.0 - rhs.0)
-    }
-}
-
-impl std::ops::SubAssign for Lots {
-    fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        match self.0.checked_sub(rhs.0) {
+            Some(n) if n >= 0 => Some(Self(n)),
+            _ => None,
+        }
     }
 }
 
@@ -136,7 +158,47 @@ mod tests {
 
     #[test]
     fn price_orders_ascending() {
-        assert!(Price::new(100) < Price::new(101));
+        assert!(Price::new(100).unwrap() < Price::new(101).unwrap());
+    }
+
+    #[test]
+    fn price_rejects_zero_and_negative() {
+        assert_eq!(Price::new(0), Err(DomainError::NonPositivePrice(0)));
+        assert_eq!(Price::new(-3), Err(DomainError::NonPositivePrice(-3)));
+    }
+
+    #[test]
+    fn price_accepts_positive() {
+        assert_eq!(Price::new(1).map(Price::get), Ok(1));
+    }
+
+    #[test]
+    fn lots_rejects_negative() {
+        assert_eq!(Lots::new(-1), Err(DomainError::NegativeLots(-1)));
+    }
+
+    #[test]
+    fn lots_accepts_zero() {
+        assert_eq!(Lots::new(0), Ok(Lots::ZERO));
+    }
+
+    #[test]
+    fn checked_sub_subtracts_down_to_zero() {
+        let five = Lots::new(5).unwrap();
+        assert_eq!(five.checked_sub(Lots::new(2).unwrap()), Lots::new(3).ok());
+        assert_eq!(five.checked_sub(five), Some(Lots::ZERO));
+    }
+
+    #[test]
+    fn checked_sub_refuses_to_go_negative() {
+        let two = Lots::new(2).unwrap();
+        assert_eq!(two.checked_sub(Lots::new(5).unwrap()), None);
+    }
+
+    #[test]
+    fn domain_error_messages_carry_the_value() {
+        assert!(DomainError::NonPositivePrice(-3).to_string().contains("-3"));
+        assert!(DomainError::NegativeLots(-1).to_string().contains("-1"));
     }
 
     #[test]
@@ -146,13 +208,13 @@ mod tests {
             account: AccountId::new(1),
             instrument: InstrumentId::new(1),
             side: Side::Bid,
-            price: Price::new(10_000),
-            total: Lots::new(5),
-            remaining: Lots::new(5),
+            price: Price::new(10_000).unwrap(),
+            total: Lots::new(5).unwrap(),
+            remaining: Lots::new(5).unwrap(),
             seq: Seq::new(1),
             status: OrderStatus::New,
         };
 
-        assert_eq!(order.remaining, Lots::new(5));
+        assert_eq!(order.remaining, Lots::new(5).unwrap());
     }
 }
