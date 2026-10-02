@@ -2,6 +2,9 @@
 pub enum DomainError {
     NonPositivePrice(i64),
     NegativeLots(i64),
+    EmptyOrder,
+    Overfill { remaining: Lots, requested: Lots },
+    IllegalTransition { from: OrderStatus, to: OrderStatus },
 }
 
 impl std::fmt::Display for DomainError {
@@ -9,6 +12,19 @@ impl std::fmt::Display for DomainError {
         match self {
             Self::NonPositivePrice(value) => write!(f, "preço {value} deve ser positivo"),
             Self::NegativeLots(value) => write!(f, "lots {value} não pode ser negativo"),
+            Self::EmptyOrder => write!(f, "ordem precisa de pelo menos 1 lot"),
+            Self::Overfill {
+                remaining,
+                requested,
+            } => write!(
+                f,
+                "execução de {} lots excede os {} restantes",
+                requested.get(),
+                remaining.get()
+            ),
+            Self::IllegalTransition { from, to } => {
+                write!(f, "transição ilegal de {from:?} para {to:?}")
+            }
         }
     }
 }
@@ -139,17 +155,125 @@ pub enum OrderStatus {
     Expired,
 }
 
+impl OrderStatus {
+    pub fn can_transition_to(self, to: Self) -> bool {
+        matches!(
+            (self, to),
+            (Self::New, Self::Accepted | Self::Rejected)
+                | (
+                    Self::Accepted,
+                    Self::PartiallyFilled | Self::Filled | Self::Cancelled | Self::Expired
+                )
+                | (
+                    Self::PartiallyFilled,
+                    Self::PartiallyFilled | Self::Filled | Self::Cancelled
+                )
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Order {
-    pub id: OrderId,
-    pub account: AccountId,
-    pub instrument: InstrumentId,
-    pub side: Side,
-    pub price: Price,
-    pub total: Lots,
-    pub remaining: Lots,
-    pub seq: Seq,
-    pub status: OrderStatus,
+    id: OrderId,
+    account: AccountId,
+    instrument: InstrumentId,
+    side: Side,
+    price: Price,
+    total: Lots,
+    remaining: Lots,
+    seq: Seq,
+    status: OrderStatus,
+}
+
+impl Order {
+    /// # Errors
+    /// [`DomainError::EmptyOrder`] se `total` for zero.
+    pub fn new(
+        id: OrderId,
+        account: AccountId,
+        instrument: InstrumentId,
+        side: Side,
+        price: Price,
+        total: Lots,
+        seq: Seq,
+    ) -> Result<Self, DomainError> {
+        if total == Lots::ZERO {
+            return Err(DomainError::EmptyOrder);
+        }
+        Ok(Self {
+            id,
+            account,
+            instrument,
+            side,
+            price,
+            total,
+            remaining: total,
+            seq,
+            status: OrderStatus::New,
+        })
+    }
+
+    pub fn id(&self) -> OrderId {
+        self.id
+    }
+
+    pub fn account(&self) -> AccountId {
+        self.account
+    }
+
+    pub fn instrument(&self) -> InstrumentId {
+        self.instrument
+    }
+
+    pub fn side(&self) -> Side {
+        self.side
+    }
+
+    pub fn price(&self) -> Price {
+        self.price
+    }
+
+    pub fn total(&self) -> Lots {
+        self.total
+    }
+
+    pub fn remaining(&self) -> Lots {
+        self.remaining
+    }
+
+    pub fn seq(&self) -> Seq {
+        self.seq
+    }
+
+    pub fn status(&self) -> OrderStatus {
+        self.status
+    }
+
+    /// # Errors
+    /// [`DomainError::Overfill`] se `lots` for maior que o restante; nada muda.
+    pub fn fill(&mut self, lots: Lots) -> Result<(), DomainError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(lots)
+            .ok_or(DomainError::Overfill {
+                remaining: self.remaining,
+                requested: lots,
+            })?;
+        Ok(())
+    }
+
+    /// # Errors
+    /// [`DomainError::IllegalTransition`] se a seção 3.4 do escopo não permitir; nada muda.
+    pub fn transition(&mut self, to: OrderStatus) -> Result<(), DomainError> {
+        if !self.status.can_transition_to(to) {
+            return Err(DomainError::IllegalTransition {
+                from: self.status,
+                to,
+            });
+        }
+        self.status = to;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -201,20 +325,163 @@ mod tests {
         assert!(DomainError::NegativeLots(-1).to_string().contains("-1"));
     }
 
-    #[test]
-    fn order_construction() {
-        let order = Order {
-            id: OrderId::new(1),
-            account: AccountId::new(1),
-            instrument: InstrumentId::new(1),
-            side: Side::Bid,
-            price: Price::new(10_000).unwrap(),
-            total: Lots::new(5).unwrap(),
-            remaining: Lots::new(5).unwrap(),
-            seq: Seq::new(1),
-            status: OrderStatus::New,
-        };
+    const ALL_STATUSES: [OrderStatus; 7] = [
+        OrderStatus::New,
+        OrderStatus::Rejected,
+        OrderStatus::Accepted,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::Filled,
+        OrderStatus::Cancelled,
+        OrderStatus::Expired,
+    ];
 
-        assert_eq!(order.remaining, Lots::new(5).unwrap());
+    const TERMINAL_STATUSES: [OrderStatus; 4] = [
+        OrderStatus::Rejected,
+        OrderStatus::Filled,
+        OrderStatus::Cancelled,
+        OrderStatus::Expired,
+    ];
+
+    fn order_with_total(total: i64) -> Result<Order, DomainError> {
+        Order::new(
+            OrderId::new(1),
+            AccountId::new(1),
+            InstrumentId::new(1),
+            Side::Bid,
+            Price::new(10_000).unwrap(),
+            Lots::new(total).unwrap(),
+            Seq::new(1),
+        )
+    }
+
+    #[test]
+    fn new_order_starts_new_with_everything_remaining() {
+        let order = order_with_total(5).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::New);
+        assert_eq!(order.remaining(), Lots::new(5).unwrap());
+        assert_eq!(order.total(), Lots::new(5).unwrap());
+    }
+
+    #[test]
+    fn order_rejects_zero_lots() {
+        assert_eq!(order_with_total(0).unwrap_err(), DomainError::EmptyOrder);
+    }
+
+    #[test]
+    fn fill_reduces_remaining_but_not_total() {
+        let mut order = order_with_total(5).unwrap();
+
+        order.fill(Lots::new(2).unwrap()).unwrap();
+
+        assert_eq!(order.remaining(), Lots::new(3).unwrap());
+        assert_eq!(order.total(), Lots::new(5).unwrap());
+    }
+
+    #[test]
+    fn overfill_is_rejected_and_changes_nothing() {
+        let mut order = order_with_total(2).unwrap();
+
+        let result = order.fill(Lots::new(3).unwrap());
+
+        assert_eq!(
+            result,
+            Err(DomainError::Overfill {
+                remaining: Lots::new(2).unwrap(),
+                requested: Lots::new(3).unwrap(),
+            })
+        );
+        assert_eq!(order.remaining(), Lots::new(2).unwrap());
+    }
+
+    #[test]
+    fn happy_path_is_legal() {
+        assert!(OrderStatus::New.can_transition_to(OrderStatus::Accepted));
+        assert!(OrderStatus::Accepted.can_transition_to(OrderStatus::PartiallyFilled));
+        assert!(OrderStatus::PartiallyFilled.can_transition_to(OrderStatus::Filled));
+    }
+
+    #[test]
+    fn terminal_states_never_leave() {
+        for from in TERMINAL_STATUSES {
+            for to in ALL_STATUSES {
+                assert!(!from.can_transition_to(to), "{from:?} -> {to:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_returns_to_new() {
+        for from in ALL_STATUSES {
+            assert!(!from.can_transition_to(OrderStatus::New), "{from:?} -> New");
+        }
+    }
+
+    #[test]
+    fn only_new_can_be_rejected_or_accepted() {
+        for from in ALL_STATUSES {
+            let is_new = from == OrderStatus::New;
+            assert_eq!(
+                from.can_transition_to(OrderStatus::Rejected),
+                is_new,
+                "{from:?}"
+            );
+            assert_eq!(
+                from.can_transition_to(OrderStatus::Accepted),
+                is_new,
+                "{from:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_cannot_skip_acceptance() {
+        for to in [
+            OrderStatus::PartiallyFilled,
+            OrderStatus::Filled,
+            OrderStatus::Cancelled,
+            OrderStatus::Expired,
+        ] {
+            assert!(!OrderStatus::New.can_transition_to(to), "New -> {to:?}");
+        }
+    }
+
+    #[test]
+    fn fills_can_complete_at_once_or_repeat_partially() {
+        assert!(OrderStatus::Accepted.can_transition_to(OrderStatus::Filled));
+        assert!(OrderStatus::PartiallyFilled.can_transition_to(OrderStatus::PartiallyFilled));
+    }
+
+    #[test]
+    fn partial_order_can_be_cancelled_but_not_expired() {
+        assert!(OrderStatus::Accepted.can_transition_to(OrderStatus::Cancelled));
+        assert!(OrderStatus::PartiallyFilled.can_transition_to(OrderStatus::Cancelled));
+        assert!(OrderStatus::Accepted.can_transition_to(OrderStatus::Expired));
+        assert!(!OrderStatus::PartiallyFilled.can_transition_to(OrderStatus::Expired));
+    }
+
+    #[test]
+    fn transition_applies_legal_move() {
+        let mut order = order_with_total(5).unwrap();
+
+        order.transition(OrderStatus::Accepted).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[test]
+    fn transition_refuses_illegal_move_and_keeps_status() {
+        let mut order = order_with_total(5).unwrap();
+
+        let result = order.transition(OrderStatus::Filled);
+
+        assert_eq!(
+            result,
+            Err(DomainError::IllegalTransition {
+                from: OrderStatus::New,
+                to: OrderStatus::Filled,
+            })
+        );
+        assert_eq!(order.status(), OrderStatus::New);
     }
 }
