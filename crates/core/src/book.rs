@@ -160,7 +160,7 @@ mod tests {
 
         let fills = book.submit(order(1, Side::Bid, 100, 5)).fills;
 
-        assert!(fills.is_empty());
+        assert_eq!(fills, []);
         assert_eq!(book.best_bid(), Some(price(100)));
         assert_eq!(resting_ids(book.bids.get(&price(100))), vec![1]);
     }
@@ -172,7 +172,7 @@ mod tests {
 
         let fills = book.submit(order(2, Side::Bid, 100, 5)).fills;
 
-        assert!(fills.is_empty());
+        assert_eq!(fills, []);
         assert_eq!(book.best_bid(), Some(price(100)));
         assert_eq!(book.best_ask(), Some(price(101)));
         assert_eq!(resting_ids(book.asks.get(&price(101))), vec![1]);
