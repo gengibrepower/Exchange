@@ -22,34 +22,34 @@ impl OrderBook {
     }
 
     fn rest(&mut self, order: Order) {
-        let side = match order.side {
+        let side = match order.side() {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        side.entry(order.price).or_default().push_back(order);
+        side.entry(order.price()).or_default().push_back(order);
     }
 }
 
 /// # Panics
-/// Nunca, por construção: `traded` é o mínimo entre os dois restantes, então nenhuma
-/// subtração fica negativa. Se ficar, o invariante quebrou e parar é o certo (fail-stop).
+/// Nunca, por construção: `traded` é o mínimo entre os dois restantes, então nenhum
+/// `fill` excede o restante. Se exceder, o invariante quebrou e parar é o certo (fail-stop).
 pub fn match_order(book: &mut OrderBook, mut taker: Order) -> Vec<Fill> {
     let mut fills = Vec::new();
 
-    while taker.remaining > Lots::ZERO {
-        let best = match taker.side {
+    while taker.remaining() > Lots::ZERO {
+        let best = match taker.side() {
             Side::Bid => book.best_ask(),
             Side::Ask => book.best_bid(),
         };
         let Some(maker_price) = best else { break };
-        let crosses = match taker.side {
-            Side::Bid => taker.price >= maker_price,
-            Side::Ask => taker.price <= maker_price,
+        let crosses = match taker.side() {
+            Side::Bid => taker.price() >= maker_price,
+            Side::Ask => taker.price() <= maker_price,
         };
         if !crosses {
             break;
         }
-        let opposite = match taker.side {
+        let opposite = match taker.side() {
             Side::Bid => &mut book.asks,
             Side::Ask => &mut book.bids,
         };
@@ -59,22 +59,20 @@ pub fn match_order(book: &mut OrderBook, mut taker: Order) -> Vec<Fill> {
         let Some(maker) = level.front_mut() else {
             break;
         };
-        let traded = taker.remaining.min(maker.remaining);
+        let traded = taker.remaining().min(maker.remaining());
         fills.push(Fill {
-            taker: taker.id,
-            maker: maker.id,
+            taker: taker.id(),
+            maker: maker.id(),
             price: maker_price,
             lots: traded,
         });
-        taker.remaining = taker
-            .remaining
-            .checked_sub(traded)
+        taker
+            .fill(traded)
             .expect("traded é o mínimo dos dois restantes");
-        maker.remaining = maker
-            .remaining
-            .checked_sub(traded)
+        maker
+            .fill(traded)
             .expect("traded é o mínimo dos dois restantes");
-        let maker_filled = maker.remaining == Lots::ZERO;
+        let maker_filled = maker.remaining() == Lots::ZERO;
         if maker_filled {
             level.pop_front();
         }
@@ -82,7 +80,7 @@ pub fn match_order(book: &mut OrderBook, mut taker: Order) -> Vec<Fill> {
             opposite.remove(&maker_price);
         }
     }
-    if taker.remaining > Lots::ZERO {
+    if taker.remaining() > Lots::ZERO {
         book.rest(taker);
     }
     fills
@@ -96,7 +94,7 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::domain::{AccountId, Fill, InstrumentId, OrderId, OrderStatus, Seq};
+    use crate::domain::{AccountId, Fill, InstrumentId, OrderId, Seq};
 
     pub(super) fn price(units_per_lot: i64) -> Price {
         Price::new(units_per_lot).expect("preço de teste válido")
@@ -107,22 +105,21 @@ mod tests {
     }
 
     pub(super) fn order(id: u64, side: Side, price_units: i64, quantity: i64) -> Order {
-        Order {
-            id: OrderId::new(id),
-            account: AccountId::new(1),
-            instrument: InstrumentId::new(1),
+        Order::new(
+            OrderId::new(id),
+            AccountId::new(1),
+            InstrumentId::new(1),
             side,
-            price: price(price_units),
-            total: lots(quantity),
-            remaining: lots(quantity),
-            seq: Seq::new(id),
-            status: OrderStatus::New,
-        }
+            price(price_units),
+            lots(quantity),
+            Seq::new(id),
+        )
+        .expect("ordem de teste válida")
     }
 
     fn resting_ids(level: Option<&VecDeque<Order>>) -> Vec<u64> {
         level
-            .map(|orders| orders.iter().map(|order| order.id.get()).collect())
+            .map(|orders| orders.iter().map(|order| order.id().get()).collect())
             .unwrap_or_default()
     }
 
@@ -191,7 +188,7 @@ mod tests {
 
         assert_eq!(resting_ids(book.asks.get(&price(100))), vec![1]);
 
-        assert_eq!(book.asks[&price(100)].front().unwrap().remaining, lots(5));
+        assert_eq!(book.asks[&price(100)].front().unwrap().remaining(), lots(5));
 
         assert_eq!(book.best_bid(), None);
     }
