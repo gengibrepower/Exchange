@@ -2,6 +2,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::domain::{Fill, Lots, Order, Price, Side};
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MatchOutcome {
+    pub fills: Vec<Fill>,
+    pub rested: Option<Lots>,
+}
+
 #[derive(Default)]
 pub struct OrderBook {
     bids: BTreeMap<Price, VecDeque<Order>>,
@@ -21,6 +27,66 @@ impl OrderBook {
         self.asks.first_key_value().map(|(price, _)| *price)
     }
 
+    /// # Panics
+    /// Nunca, por construção: `traded` é o mínimo entre os dois restantes, então nenhum
+    /// `fill` excede o restante. Se exceder, o invariante quebrou e parar é o certo (fail-stop).
+    pub fn submit(&mut self, mut taker: Order) -> MatchOutcome {
+        let mut fills = Vec::new();
+
+        while taker.remaining() > Lots::ZERO {
+            let best = match taker.side() {
+                Side::Bid => self.best_ask(),
+                Side::Ask => self.best_bid(),
+            };
+            let Some(maker_price) = best else { break };
+            let crosses = match taker.side() {
+                Side::Bid => taker.price() >= maker_price,
+                Side::Ask => taker.price() <= maker_price,
+            };
+            if !crosses {
+                break;
+            }
+            let opposite = match taker.side() {
+                Side::Bid => &mut self.asks,
+                Side::Ask => &mut self.bids,
+            };
+            let Some(level) = opposite.get_mut(&maker_price) else {
+                break;
+            };
+            let Some(maker) = level.front_mut() else {
+                break;
+            };
+            let traded = taker.remaining().min(maker.remaining());
+            fills.push(Fill {
+                taker: taker.id(),
+                maker: maker.id(),
+                price: maker_price,
+                lots: traded,
+            });
+            taker
+                .fill(traded)
+                .expect("traded é o mínimo dos dois restantes");
+            maker
+                .fill(traded)
+                .expect("traded é o mínimo dos dois restantes");
+            let maker_filled = maker.remaining() == Lots::ZERO;
+            if maker_filled {
+                level.pop_front();
+            }
+            if level.is_empty() {
+                opposite.remove(&maker_price);
+            }
+        }
+        let remaining = taker.remaining();
+        let rested = if remaining > Lots::ZERO {
+            self.rest(taker);
+            Some(remaining)
+        } else {
+            None
+        };
+        MatchOutcome { fills, rested }
+    }
+
     fn rest(&mut self, order: Order) {
         let side = match order.side() {
             Side::Bid => &mut self.bids,
@@ -28,62 +94,6 @@ impl OrderBook {
         };
         side.entry(order.price()).or_default().push_back(order);
     }
-}
-
-/// # Panics
-/// Nunca, por construção: `traded` é o mínimo entre os dois restantes, então nenhum
-/// `fill` excede o restante. Se exceder, o invariante quebrou e parar é o certo (fail-stop).
-pub fn match_order(book: &mut OrderBook, mut taker: Order) -> Vec<Fill> {
-    let mut fills = Vec::new();
-
-    while taker.remaining() > Lots::ZERO {
-        let best = match taker.side() {
-            Side::Bid => book.best_ask(),
-            Side::Ask => book.best_bid(),
-        };
-        let Some(maker_price) = best else { break };
-        let crosses = match taker.side() {
-            Side::Bid => taker.price() >= maker_price,
-            Side::Ask => taker.price() <= maker_price,
-        };
-        if !crosses {
-            break;
-        }
-        let opposite = match taker.side() {
-            Side::Bid => &mut book.asks,
-            Side::Ask => &mut book.bids,
-        };
-        let Some(level) = opposite.get_mut(&maker_price) else {
-            break;
-        };
-        let Some(maker) = level.front_mut() else {
-            break;
-        };
-        let traded = taker.remaining().min(maker.remaining());
-        fills.push(Fill {
-            taker: taker.id(),
-            maker: maker.id(),
-            price: maker_price,
-            lots: traded,
-        });
-        taker
-            .fill(traded)
-            .expect("traded é o mínimo dos dois restantes");
-        maker
-            .fill(traded)
-            .expect("traded é o mínimo dos dois restantes");
-        let maker_filled = maker.remaining() == Lots::ZERO;
-        if maker_filled {
-            level.pop_front();
-        }
-        if level.is_empty() {
-            opposite.remove(&maker_price);
-        }
-    }
-    if taker.remaining() > Lots::ZERO {
-        book.rest(taker);
-    }
-    fills
 }
 
 #[cfg(test)]
@@ -117,6 +127,27 @@ mod tests {
         .expect("ordem de teste válida")
     }
 
+    #[test]
+    fn outcome_reports_rested_remainder() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 2));
+
+        let outcome = book.submit(order(2, Side::Bid, 100, 5));
+
+        assert_eq!(outcome.fills.len(), 1);
+        assert_eq!(outcome.rested, Some(lots(3)));
+    }
+
+    #[test]
+    fn outcome_reports_nothing_rested_when_fully_filled() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 5));
+
+        let outcome = book.submit(order(2, Side::Bid, 100, 5));
+
+        assert_eq!(outcome.rested, None);
+    }
+
     fn resting_ids(level: Option<&VecDeque<Order>>) -> Vec<u64> {
         level
             .map(|orders| orders.iter().map(|order| order.id().get()).collect())
@@ -127,7 +158,7 @@ mod tests {
     fn taker_rests_when_book_is_empty() {
         let mut book = OrderBook::new();
 
-        let fills = match_order(&mut book, order(1, Side::Bid, 100, 5));
+        let fills = book.submit(order(1, Side::Bid, 100, 5)).fills;
 
         assert!(fills.is_empty());
         assert_eq!(book.best_bid(), Some(price(100)));
@@ -139,7 +170,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.rest(order(1, Side::Ask, 101, 5));
 
-        let fills = match_order(&mut book, order(2, Side::Bid, 100, 5));
+        let fills = book.submit(order(2, Side::Bid, 100, 5)).fills;
 
         assert!(fills.is_empty());
         assert_eq!(book.best_bid(), Some(price(100)));
@@ -152,7 +183,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.rest(order(1, Side::Ask, 100, 5));
 
-        let fills = match_order(&mut book, order(2, Side::Bid, 100, 5));
+        let fills = book.submit(order(2, Side::Bid, 100, 5)).fills;
 
         assert_eq!(
             fills,
@@ -174,7 +205,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.rest(order(1, Side::Ask, 100, 10));
 
-        let fills = match_order(&mut book, order(2, Side::Bid, 100, 5));
+        let fills = book.submit(order(2, Side::Bid, 100, 5)).fills;
 
         assert_eq!(
             fills,
@@ -199,7 +230,7 @@ mod tests {
         book.rest(order(1, Side::Ask, 100, 2));
         book.rest(order(2, Side::Ask, 101, 2));
 
-        let fills = match_order(&mut book, order(3, Side::Bid, 105, 5));
+        let fills = book.submit(order(3, Side::Bid, 105, 5)).fills;
 
         assert_eq!(
             fills,
@@ -230,7 +261,7 @@ mod tests {
         book.rest(order(1, Side::Ask, 100, 3));
         book.rest(order(2, Side::Ask, 100, 3));
 
-        let fills = match_order(&mut book, order(3, Side::Bid, 100, 3));
+        let fills = book.submit(order(3, Side::Bid, 100, 3)).fills;
 
         assert_eq!(
             fills,
@@ -251,7 +282,7 @@ mod tests {
         book.rest(order(1, Side::Bid, 100, 2));
         book.rest(order(2, Side::Bid, 101, 2));
 
-        let fills = match_order(&mut book, order(3, Side::Ask, 95, 5));
+        let fills = book.submit(order(3, Side::Ask, 95, 5)).fills;
 
         assert_eq!(
             fills,
