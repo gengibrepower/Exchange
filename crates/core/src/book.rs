@@ -30,7 +30,7 @@ impl OrderBook {
     /// # Panics
     /// Nunca, por construção: `traded` é o mínimo entre os dois restantes, então nenhum
     /// `fill` excede o restante. Se exceder, o invariante quebrou e parar é o certo (fail-stop).
-    pub fn submit(&mut self, mut taker: Order) -> MatchOutcome {
+    pub(crate) fn submit(&mut self, mut taker: Order) -> MatchOutcome {
         let mut fills = Vec::new();
 
         while taker.remaining() > Lots::ZERO {
