@@ -121,7 +121,7 @@ impl AccountId {
 pub struct InstrumentId(u32);
 
 impl InstrumentId {
-    pub fn new(value: u32) -> Self {
+    pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
