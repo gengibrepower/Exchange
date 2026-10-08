@@ -2,7 +2,7 @@ use proptest::prelude::*;
 
 use super::OrderBook;
 use super::tests::order;
-use crate::domain::{Order, Side};
+use crate::domain::{Lots, Order, OrderStatus, Side};
 
 fn side() -> impl Strategy<Value = Side> {
     prop_oneof![Just(Side::Bid), Just(Side::Ask)]
@@ -38,6 +38,23 @@ proptest! {
             book.submit(order);
             prop_assert!(book.bids.values().all(|level| !level.is_empty()));
             prop_assert!(book.asks.values().all(|level| !level.is_empty()));
+        }
+    }
+
+    #[test]
+    fn resting_orders_have_status_coherent_with_remaining(orders in order_flow()) {
+        let mut book = OrderBook::new();
+        for order in orders {
+            book.submit(order);
+            for resting in book.bids.values().chain(book.asks.values()).flatten() {
+                let expected = if resting.remaining() == resting.total() {
+                    OrderStatus::Accepted
+                } else {
+                    OrderStatus::PartiallyFilled
+                };
+                prop_assert!(resting.remaining() > Lots::ZERO);
+                prop_assert_eq!(resting.status(), expected, "ordem {:?}", resting.id());
+            }
         }
     }
 }

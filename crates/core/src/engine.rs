@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::book::OrderBook;
-use crate::domain::{Fill, InstrumentId, Lots, Order, OrderId};
+use crate::domain::{Fill, InstrumentId, Lots, Order, OrderId, OrderStatus};
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -28,6 +28,7 @@ pub enum Event {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RejectReason {
     UnknownInstrument(InstrumentId),
+    NotNew(OrderStatus),
 }
 
 pub struct Engine {
@@ -49,7 +50,7 @@ impl Engine {
 
     pub fn apply(&mut self, command: Command) -> Vec<Event> {
         match command {
-            Command::Submit(order) => {
+            Command::Submit(mut order) => {
                 let id = order.id();
                 let instrument = order.instrument();
 
@@ -59,6 +60,13 @@ impl Engine {
                         reason: RejectReason::UnknownInstrument(instrument),
                     }];
                 };
+
+                if order.transition(OrderStatus::Accepted).is_err() {
+                    return vec![Event::Rejected {
+                        order: id,
+                        reason: RejectReason::NotNew(order.status()),
+                    }];
+                }
 
                 let outcome = book.submit(order);
 
@@ -118,6 +126,27 @@ mod tests {
                 reason: RejectReason::UnknownInstrument(unknown),
             }]
         );
+    }
+
+    #[test]
+    fn order_not_new_is_rejected() {
+        let mut engine = Engine::new([TESTE_BRL]);
+        let mut accepted = order(1, TESTE_BRL, Side::Bid, 100, 5);
+        accepted
+            .transition(OrderStatus::Accepted)
+            .expect("ordem nova pode ser aceita");
+
+        let events = engine.apply(Command::Submit(accepted));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::NotNew(OrderStatus::Accepted),
+            }]
+        );
+        let book = engine.book(TESTE_BRL).expect("instrumento registrado");
+        assert_eq!(book.best_bid(), None);
     }
 
     #[test]
