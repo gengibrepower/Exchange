@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 
-use crate::book::OrderBook;
-use crate::domain::{Fill, InstrumentId, Lots, Order, OrderId, OrderStatus};
+use crate::book::{CancelError, OrderBook};
+use crate::domain::{AccountId, Fill, InstrumentId, Lots, Order, OrderId, OrderStatus};
 
 #[derive(Clone, Debug)]
 pub enum Command {
     Submit(Order),
+    Cancel {
+        instrument: InstrumentId,
+        account: AccountId,
+        order: OrderId,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -15,6 +20,11 @@ pub enum Event {
         fill: Fill,
     },
     Rested {
+        instrument: InstrumentId,
+        order: OrderId,
+        lots: Lots,
+    },
+    Cancelled {
         instrument: InstrumentId,
         order: OrderId,
         lots: Lots,
@@ -29,6 +39,9 @@ pub enum Event {
 pub enum RejectReason {
     UnknownInstrument(InstrumentId),
     NotNew(OrderStatus),
+    DuplicateOrderId,
+    UnknownOrder,
+    NotOwner,
 }
 
 pub struct Engine {
@@ -61,6 +74,13 @@ impl Engine {
                     }];
                 };
 
+                if book.contains(id) {
+                    return vec![Event::Rejected {
+                        order: id,
+                        reason: RejectReason::DuplicateOrderId,
+                    }];
+                }
+
                 if order.transition(OrderStatus::Accepted).is_err() {
                     return vec![Event::Rejected {
                         order: id,
@@ -82,6 +102,34 @@ impl Engine {
                     });
                 }
                 events
+            }
+            Command::Cancel {
+                instrument,
+                account,
+                order,
+            } => {
+                let Some(book) = self.books.get_mut(&instrument) else {
+                    return vec![Event::Rejected {
+                        order,
+                        reason: RejectReason::UnknownInstrument(instrument),
+                    }];
+                };
+                let event = match book.cancel(order, account) {
+                    Ok(cancelled) => Event::Cancelled {
+                        instrument,
+                        order,
+                        lots: cancelled.remaining(),
+                    },
+                    Err(CancelError::UnknownOrder) => Event::Rejected {
+                        order,
+                        reason: RejectReason::UnknownOrder,
+                    },
+                    Err(CancelError::NotOwner) => Event::Rejected {
+                        order,
+                        reason: RejectReason::NotOwner,
+                    },
+                };
+                vec![event]
             }
         }
     }
@@ -147,6 +195,101 @@ mod tests {
         );
         let book = engine.book(TESTE_BRL).expect("instrumento registrado");
         assert_eq!(book.best_bid(), None);
+    }
+
+    fn cancel(instrument: InstrumentId, account: u64, order: u64) -> Command {
+        Command::Cancel {
+            instrument,
+            account: AccountId::new(account),
+            order: OrderId::new(order),
+        }
+    }
+
+    #[test]
+    fn cancel_resting_order_emits_cancelled_with_remainder() {
+        let mut engine = Engine::new([TESTE_BRL]);
+        engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 100, 5)));
+        engine.apply(Command::Submit(order(2, TESTE_BRL, Side::Bid, 100, 2)));
+
+        let events = engine.apply(cancel(TESTE_BRL, 1, 1));
+
+        assert_eq!(
+            events,
+            vec![Event::Cancelled {
+                instrument: TESTE_BRL,
+                order: OrderId::new(1),
+                lots: lots(3),
+            }]
+        );
+        let book = engine.book(TESTE_BRL).expect("instrumento registrado");
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn cancel_in_unknown_instrument_is_rejected() {
+        let mut engine = Engine::new([TESTE_BRL]);
+        let unknown = InstrumentId::new(99);
+
+        let events = engine.apply(cancel(unknown, 1, 1));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::UnknownInstrument(unknown),
+            }]
+        );
+    }
+
+    #[test]
+    fn cancel_of_unknown_order_is_rejected() {
+        let mut engine = Engine::new([TESTE_BRL]);
+
+        let events = engine.apply(cancel(TESTE_BRL, 1, 7));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(7),
+                reason: RejectReason::UnknownOrder,
+            }]
+        );
+    }
+
+    #[test]
+    fn cancel_by_another_account_is_rejected_and_order_stays() {
+        let mut engine = Engine::new([TESTE_BRL]);
+        engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 100, 5)));
+
+        let events = engine.apply(cancel(TESTE_BRL, 2, 1));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::NotOwner,
+            }]
+        );
+        let book = engine.book(TESTE_BRL).expect("instrumento registrado");
+        assert_eq!(book.best_ask(), Price::new(100).ok());
+    }
+
+    #[test]
+    fn duplicate_order_id_is_rejected_and_original_stays() {
+        let mut engine = Engine::new([TESTE_BRL]);
+        engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 100, 5)));
+
+        let events = engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 200, 1)));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::DuplicateOrderId,
+            }]
+        );
+        let book = engine.book(TESTE_BRL).expect("instrumento registrado");
+        assert_eq!(book.best_ask(), Price::new(100).ok());
     }
 
     #[test]
