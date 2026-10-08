@@ -20,7 +20,22 @@ Demonstrar quatro competências:
 
 ## Status
 
-Em desenvolvimento, por fases (ver seção 12 do escopo). Fase atual: setup / F0 (modelo de domínio + matching básico).
+Em desenvolvimento, por fases (ver seção 12 do escopo). F0 (modelo de domínio + matching básico) concluída; próxima: F1 (market, parcial, TIF).
+
+## Uso
+
+```
+cargo run -p edge
+```
+
+Uma ordem por linha: `buy|sell <instrumento> <preço> <lots>`, ou `quit`. Preço em centavos por lot, quantidade em lots inteiros. Na F0 só existe o instrumento `TESTE/BRL`.
+
+```
+sell TESTE/BRL 10000 5
+#1 descansou: 5 lots em TESTE/BRL
+buy TESTE/BRL 10100 3
+fill TESTE/BRL: taker #2, maker #1, 3 lots @ 10000
+```
 
 ## Licença
 
