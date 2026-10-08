@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use crate::domain::{Fill, Lots, Order, Price, Side};
+use crate::domain::{AccountId, Fill, Lots, Order, OrderId, OrderStatus, Price, Side};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MatchOutcome {
@@ -8,10 +8,17 @@ pub struct MatchOutcome {
     pub rested: Option<Lots>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CancelError {
+    UnknownOrder,
+    NotOwner,
+}
+
 #[derive(Default)]
 pub struct OrderBook {
     bids: BTreeMap<Price, VecDeque<Order>>,
     asks: BTreeMap<Price, VecDeque<Order>>,
+    index: HashMap<OrderId, (Side, Price)>,
 }
 
 impl OrderBook {
@@ -25,6 +32,10 @@ impl OrderBook {
 
     pub fn best_ask(&self) -> Option<Price> {
         self.asks.first_key_value().map(|(price, _)| *price)
+    }
+
+    pub fn contains(&self, id: OrderId) -> bool {
+        self.index.contains_key(&id)
     }
 
     /// Espera um taker já aceito; o [`crate::engine::Engine`] aceita antes de chamar.
@@ -73,8 +84,8 @@ impl OrderBook {
                 .fill(traded)
                 .expect("maker no livro está aceito e traded dentro do restante");
             let maker_filled = maker.remaining() == Lots::ZERO;
-            if maker_filled {
-                level.pop_front();
+            if maker_filled && let Some(filled) = level.pop_front() {
+                self.index.remove(&filled.id());
             }
             if level.is_empty() {
                 opposite.remove(&maker_price);
@@ -90,7 +101,48 @@ impl OrderBook {
         MatchOutcome { fills, rested }
     }
 
+    /// Tira do livro uma ordem descansando e a leva a `Cancelled`.
+    ///
+    /// # Errors
+    /// Em qualquer erro, nada muda:
+    /// [`CancelError::UnknownOrder`] se a ordem não estiver descansando neste livro,
+    /// [`CancelError::NotOwner`] se `account` não for a dona da ordem.
+    pub(crate) fn cancel(&mut self, id: OrderId, account: AccountId) -> Result<Order, CancelError> {
+        let Some(&(side, price)) = self.index.get(&id) else {
+            return Err(CancelError::UnknownOrder);
+        };
+
+        let levels = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        let level = levels
+            .get_mut(&price)
+            .expect("índice só aponta para nível que existe");
+        let position = level
+            .iter()
+            .position(|order| order.id() == id)
+            .expect("índice só aponta para ordem que existe");
+
+        if level[position].account() != account {
+            return Err(CancelError::NotOwner);
+        }
+
+        let mut order = level
+            .remove(position)
+            .expect("posição veio do position() deste nível");
+        if level.is_empty() {
+            levels.remove(&price);
+        }
+        self.index.remove(&id);
+        order
+            .transition(OrderStatus::Cancelled)
+            .expect("ordem no livro está Accepted ou PartiallyFilled");
+        Ok(order)
+    }
+
     fn rest(&mut self, order: Order) {
+        self.index.insert(order.id(), (order.side(), order.price()));
         let side = match order.side() {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
@@ -107,7 +159,7 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::domain::{AccountId, Fill, InstrumentId, OrderId, OrderStatus, Seq};
+    use crate::domain::{Fill, InstrumentId, OrderStatus, Seq};
 
     pub(super) fn price(units_per_lot: i64) -> Price {
         Price::new(units_per_lot).expect("preço de teste válido")
@@ -153,6 +205,94 @@ mod tests {
         let outcome = book.submit(order(2, Side::Bid, 100, 5));
 
         assert_eq!(outcome.rested, None);
+    }
+
+    const OWNER: AccountId = AccountId::new(1);
+
+    #[test]
+    fn cancel_removes_resting_order_and_returns_it_cancelled() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Bid, 100, 5));
+
+        let cancelled = book.cancel(OrderId::new(1), OWNER).unwrap();
+
+        assert_eq!(cancelled.id(), OrderId::new(1));
+        assert_eq!(cancelled.status(), OrderStatus::Cancelled);
+        assert_eq!(cancelled.remaining(), lots(5));
+        assert_eq!(book.best_bid(), None);
+        assert!(!book.contains(OrderId::new(1)));
+    }
+
+    #[test]
+    fn cancel_keeps_time_priority_of_the_others() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 1));
+        book.rest(order(2, Side::Ask, 100, 1));
+        book.rest(order(3, Side::Ask, 100, 1));
+
+        book.cancel(OrderId::new(2), OWNER).unwrap();
+
+        assert_eq!(resting_ids(book.asks.get(&price(100))), vec![1, 3]);
+    }
+
+    #[test]
+    fn cancel_partially_filled_order_returns_what_was_left() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 10));
+        book.submit(order(2, Side::Bid, 100, 4));
+
+        let cancelled = book.cancel(OrderId::new(1), OWNER).unwrap();
+
+        assert_eq!(cancelled.remaining(), lots(6));
+        assert_eq!(cancelled.total(), lots(10));
+        assert_eq!(cancelled.status(), OrderStatus::Cancelled);
+    }
+
+    #[test]
+    fn cancel_unknown_order_changes_nothing() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Bid, 100, 5));
+
+        let result = book.cancel(OrderId::new(99), OWNER);
+
+        assert_eq!(result.unwrap_err(), CancelError::UnknownOrder);
+        assert_eq!(resting_ids(book.bids.get(&price(100))), vec![1]);
+    }
+
+    #[test]
+    fn cancel_by_another_account_changes_nothing() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Bid, 100, 5));
+
+        let result = book.cancel(OrderId::new(1), AccountId::new(2));
+
+        assert_eq!(result.unwrap_err(), CancelError::NotOwner);
+        assert_eq!(resting_ids(book.bids.get(&price(100))), vec![1]);
+        assert!(book.contains(OrderId::new(1)));
+    }
+
+    #[test]
+    fn cancel_twice_is_unknown_the_second_time() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Bid, 100, 5));
+        book.cancel(OrderId::new(1), OWNER).unwrap();
+
+        let result = book.cancel(OrderId::new(1), OWNER);
+
+        assert_eq!(result.unwrap_err(), CancelError::UnknownOrder);
+    }
+
+    #[test]
+    fn fully_filled_maker_leaves_the_index() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 5));
+        book.submit(order(2, Side::Bid, 100, 5));
+
+        assert!(!book.contains(OrderId::new(1)));
+        assert_eq!(
+            book.cancel(OrderId::new(1), OWNER).unwrap_err(),
+            CancelError::UnknownOrder
+        );
     }
 
     fn resting_ids(level: Option<&VecDeque<Order>>) -> Vec<u64> {

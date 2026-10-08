@@ -110,7 +110,7 @@ impl Seq {
 pub struct AccountId(u64);
 
 impl AccountId {
-    pub fn new(value: u64) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
 

@@ -1,4 +1,6 @@
-use exchange_core::domain::{DomainError, Lots, Price, Side};
+use std::str::FromStr;
+
+use exchange_core::domain::{DomainError, Lots, OrderId, Price, Side};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Input {
@@ -7,6 +9,10 @@ pub enum Input {
         symbol: String,
         price: Price,
         lots: Lots,
+    },
+    Cancel {
+        symbol: String,
+        order: OrderId,
     },
     Quit,
 }
@@ -25,7 +31,10 @@ impl std::fmt::Display for ParseError {
         match self {
             Self::Empty => write!(f, "linha vazia"),
             Self::UnknownCommand(command) => write!(f, "comando desconhecido \"{command}\""),
-            Self::WrongArity => write!(f, "uso: buy|sell <instrumento> <preço> <lots> | quit"),
+            Self::WrongArity => write!(
+                f,
+                "uso: buy|sell <instrumento> <preço> <lots> | cancel <instrumento> <id> | quit"
+            ),
             Self::InvalidNumber(token) => write!(f, "número inválido \"{token}\""),
             Self::Domain(error) => write!(f, "{error}"),
         }
@@ -43,7 +52,11 @@ pub fn parse_line(line: &str) -> Result<Input, ParseError> {
         ["quit"] => Ok(Input::Quit),
         ["buy", symbol, price, lots] => submit(Side::Bid, symbol, price, lots),
         ["sell", symbol, price, lots] => submit(Side::Ask, symbol, price, lots),
-        ["buy" | "sell" | "quit", ..] => Err(ParseError::WrongArity),
+        ["cancel", symbol, id] => Ok(Input::Cancel {
+            symbol: symbol.to_string(),
+            order: OrderId::new(number(id)?),
+        }),
+        ["buy" | "sell" | "cancel" | "quit", ..] => Err(ParseError::WrongArity),
         [command, ..] => Err(ParseError::UnknownCommand(command.to_string())),
     }
 }
@@ -59,7 +72,7 @@ fn submit(side: Side, symbol: &str, price: &str, lots: &str) -> Result<Input, Pa
     })
 }
 
-fn number(token: &str) -> Result<i64, ParseError> {
+fn number<T: FromStr>(token: &str) -> Result<T, ParseError> {
     token
         .parse()
         .map_err(|_| ParseError::InvalidNumber(token.to_string()))
@@ -105,6 +118,26 @@ mod tests {
     #[test]
     fn parses_quit() {
         assert_eq!(parse_line("quit"), Ok(Input::Quit));
+    }
+
+    #[test]
+    fn parses_cancel() {
+        assert_eq!(
+            parse_line("cancel TESTE/BRL 7"),
+            Ok(Input::Cancel {
+                symbol: "TESTE/BRL".to_string(),
+                order: OrderId::new(7),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_cancel_with_bad_id() {
+        assert_eq!(
+            parse_line("cancel TESTE/BRL -1"),
+            Err(ParseError::InvalidNumber("-1".to_string()))
+        );
+        assert_eq!(parse_line("cancel TESTE/BRL"), Err(ParseError::WrongArity));
     }
 
     #[test]
