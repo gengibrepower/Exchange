@@ -95,10 +95,13 @@ fn render(event: &Event) -> String {
             lots.get(),
             symbol(*instrument)
         ),
-        Event::Rejected {
-            order,
-            reason: RejectReason::UnknownInstrument(_),
-        } => format!("#{} rejeitada: instrumento desconhecido", order.get()),
+        Event::Rejected { order, reason } => {
+            let reason = match reason {
+                RejectReason::UnknownInstrument(_) => "instrumento desconhecido".to_string(),
+                RejectReason::NotNew(status) => format!("ordem já estava em {status:?}"),
+            };
+            format!("#{} rejeitada: {reason}", order.get())
+        }
     }
 }
 

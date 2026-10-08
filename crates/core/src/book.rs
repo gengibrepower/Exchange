@@ -27,9 +27,12 @@ impl OrderBook {
         self.asks.first_key_value().map(|(price, _)| *price)
     }
 
+    /// Espera um taker já aceito; o [`crate::engine::Engine`] aceita antes de chamar.
+    ///
     /// # Panics
-    /// Nunca, por construção: `traded` é o mínimo entre os dois restantes, então nenhum
-    /// `fill` excede o restante. Se exceder, o invariante quebrou e parar é o certo (fail-stop).
+    /// Se o taker não estiver aceito. Fora isso, nunca: makers no livro estão sempre
+    /// aceitos e `traded` é positivo e não excede nenhum dos dois restantes. Se um `fill`
+    /// falhar, o invariante quebrou e parar é o certo (fail-stop).
     pub(crate) fn submit(&mut self, mut taker: Order) -> MatchOutcome {
         let mut fills = Vec::new();
 
@@ -65,10 +68,10 @@ impl OrderBook {
             });
             taker
                 .fill(traded)
-                .expect("traded é o mínimo dos dois restantes");
+                .expect("taker aceito e traded dentro do restante");
             maker
                 .fill(traded)
-                .expect("traded é o mínimo dos dois restantes");
+                .expect("maker no livro está aceito e traded dentro do restante");
             let maker_filled = maker.remaining() == Lots::ZERO;
             if maker_filled {
                 level.pop_front();
@@ -104,7 +107,7 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::domain::{AccountId, Fill, InstrumentId, OrderId, Seq};
+    use crate::domain::{AccountId, Fill, InstrumentId, OrderId, OrderStatus, Seq};
 
     pub(super) fn price(units_per_lot: i64) -> Price {
         Price::new(units_per_lot).expect("preço de teste válido")
@@ -115,7 +118,7 @@ mod tests {
     }
 
     pub(super) fn order(id: u64, side: Side, price_units: i64, quantity: i64) -> Order {
-        Order::new(
+        let mut order = Order::new(
             OrderId::new(id),
             AccountId::new(1),
             InstrumentId::new(1),
@@ -124,7 +127,11 @@ mod tests {
             lots(quantity),
             Seq::new(id),
         )
-        .expect("ordem de teste válida")
+        .expect("ordem de teste válida");
+        order
+            .transition(OrderStatus::Accepted)
+            .expect("ordem nova pode ser aceita");
+        order
     }
 
     #[test]
@@ -219,7 +226,9 @@ mod tests {
 
         assert_eq!(resting_ids(book.asks.get(&price(100))), vec![1]);
 
-        assert_eq!(book.asks[&price(100)].front().unwrap().remaining(), lots(5));
+        let maker = book.asks[&price(100)].front().unwrap();
+        assert_eq!(maker.remaining(), lots(5));
+        assert_eq!(maker.status(), OrderStatus::PartiallyFilled);
 
         assert_eq!(book.best_bid(), None);
     }

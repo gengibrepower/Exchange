@@ -3,6 +3,7 @@ pub enum DomainError {
     NonPositivePrice(i64),
     NegativeLots(i64),
     EmptyOrder,
+    EmptyFill,
     Overfill { remaining: Lots, requested: Lots },
     IllegalTransition { from: OrderStatus, to: OrderStatus },
 }
@@ -13,6 +14,7 @@ impl std::fmt::Display for DomainError {
             Self::NonPositivePrice(value) => write!(f, "preço {value} deve ser positivo"),
             Self::NegativeLots(value) => write!(f, "lots {value} não pode ser negativo"),
             Self::EmptyOrder => write!(f, "ordem precisa de pelo menos 1 lot"),
+            Self::EmptyFill => write!(f, "execução precisa de pelo menos 1 lot"),
             Self::Overfill {
                 remaining,
                 requested,
@@ -249,16 +251,37 @@ impl Order {
         self.status
     }
 
+    /// Reduz o restante e move o status junto (`PartiallyFilled` ou `Filled`).
+    ///
     /// # Errors
-    /// [`DomainError::Overfill`] se `lots` for maior que o restante; nada muda.
+    /// Verificados nesta ordem; em qualquer erro, nada muda:
+    /// [`DomainError::EmptyFill`] se `lots` for zero,
+    /// [`DomainError::Overfill`] se `lots` for maior que o restante,
+    /// [`DomainError::IllegalTransition`] se o status atual não puder ir para o de destino.
     pub fn fill(&mut self, lots: Lots) -> Result<(), DomainError> {
-        self.remaining = self
+        if lots == Lots::ZERO {
+            return Err(DomainError::EmptyFill);
+        }
+        let remaining = self
             .remaining
             .checked_sub(lots)
             .ok_or(DomainError::Overfill {
                 remaining: self.remaining,
                 requested: lots,
             })?;
+        let to = if remaining == Lots::ZERO {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartiallyFilled
+        };
+        if !self.status.can_transition_to(to) {
+            return Err(DomainError::IllegalTransition {
+                from: self.status,
+                to,
+            });
+        }
+        self.remaining = remaining;
+        self.status = to;
         Ok(())
     }
 
@@ -368,19 +391,48 @@ mod tests {
         assert_eq!(order_with_total(0).unwrap_err(), DomainError::EmptyOrder);
     }
 
+    fn accepted_order(total: i64) -> Order {
+        let mut order = order_with_total(total).unwrap();
+        order.transition(OrderStatus::Accepted).unwrap();
+        order
+    }
+
     #[test]
-    fn fill_reduces_remaining_but_not_total() {
-        let mut order = order_with_total(5).unwrap();
+    fn partial_fill_reduces_remaining_and_moves_to_partially_filled() {
+        let mut order = accepted_order(5);
 
         order.fill(Lots::new(2).unwrap()).unwrap();
 
         assert_eq!(order.remaining(), Lots::new(3).unwrap());
         assert_eq!(order.total(), Lots::new(5).unwrap());
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+    }
+
+    #[test]
+    fn complete_fill_moves_to_filled() {
+        let mut order = accepted_order(5);
+
+        order.fill(Lots::new(5).unwrap()).unwrap();
+
+        assert_eq!(order.remaining(), Lots::ZERO);
+        assert_eq!(order.status(), OrderStatus::Filled);
+    }
+
+    #[test]
+    fn successive_partial_fills_end_filled() {
+        let mut order = accepted_order(5);
+
+        order.fill(Lots::new(2).unwrap()).unwrap();
+        order.fill(Lots::new(2).unwrap()).unwrap();
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+
+        order.fill(Lots::new(1).unwrap()).unwrap();
+        assert_eq!(order.status(), OrderStatus::Filled);
     }
 
     #[test]
     fn overfill_is_rejected_and_changes_nothing() {
-        let mut order = order_with_total(2).unwrap();
+        let mut order = accepted_order(2);
 
         let result = order.fill(Lots::new(3).unwrap());
 
@@ -392,6 +444,50 @@ mod tests {
             })
         );
         assert_eq!(order.remaining(), Lots::new(2).unwrap());
+        assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[test]
+    fn empty_fill_is_rejected_and_changes_nothing() {
+        let mut order = accepted_order(5);
+
+        assert_eq!(order.fill(Lots::ZERO), Err(DomainError::EmptyFill));
+        assert_eq!(order.remaining(), Lots::new(5).unwrap());
+        assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[test]
+    fn fill_on_order_not_yet_accepted_is_rejected_and_changes_nothing() {
+        let mut order = order_with_total(5).unwrap();
+
+        let result = order.fill(Lots::new(2).unwrap());
+
+        assert_eq!(
+            result,
+            Err(DomainError::IllegalTransition {
+                from: OrderStatus::New,
+                to: OrderStatus::PartiallyFilled,
+            })
+        );
+        assert_eq!(order.remaining(), Lots::new(5).unwrap());
+        assert_eq!(order.status(), OrderStatus::New);
+    }
+
+    #[test]
+    fn fill_on_filled_order_is_overfill() {
+        let mut order = accepted_order(1);
+        order.fill(Lots::new(1).unwrap()).unwrap();
+
+        let result = order.fill(Lots::new(1).unwrap());
+
+        assert_eq!(
+            result,
+            Err(DomainError::Overfill {
+                remaining: Lots::ZERO,
+                requested: Lots::new(1).unwrap(),
+            })
+        );
+        assert_eq!(order.status(), OrderStatus::Filled);
     }
 
     #[test]
