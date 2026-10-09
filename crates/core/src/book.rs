@@ -1,11 +1,19 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use crate::domain::{AccountId, Fill, Lots, Order, OrderId, OrderStatus, Price, Side};
+use crate::domain::{AccountId, Fill, Lots, Order, OrderId, OrderStatus, Price, Side, TimeInForce};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Leftover {
+    None,
+    Rested(Lots),
+    Cancelled(Lots),
+    Expired(Lots),
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MatchOutcome {
     pub fills: Vec<Fill>,
-    pub rested: Option<Lots>,
+    pub leftover: Leftover,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -15,6 +23,7 @@ pub enum CancelError {
 }
 
 #[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
 pub struct OrderBook {
     bids: BTreeMap<Price, VecDeque<Order>>,
     asks: BTreeMap<Price, VecDeque<Order>>,
@@ -39,12 +48,26 @@ impl OrderBook {
     }
 
     /// Espera um taker já aceito; o [`crate::engine::Engine`] aceita antes de chamar.
+    /// A sobra segue o time-in-force: GTC descansa, IOC cancela; FOK sem liquidez para
+    /// tudo expira sem tocar no livro.
     ///
     /// # Panics
     /// Se o taker não estiver aceito. Fora isso, nunca: makers no livro estão sempre
-    /// aceitos e `traded` é positivo e não excede nenhum dos dois restantes. Se um `fill`
-    /// falhar, o invariante quebrou e parar é o certo (fail-stop).
+    /// aceitos, `traded` é positivo e não excede nenhum dos dois restantes, e uma FOK só
+    /// executa quando a liquidez cobre tudo. Se algo disso falhar, o invariante quebrou e
+    /// parar é o certo (fail-stop).
     pub(crate) fn submit(&mut self, mut taker: Order) -> MatchOutcome {
+        if taker.time_in_force() == TimeInForce::Fok && !self.can_fill_completely(&taker) {
+            let lots = taker.remaining();
+            taker
+                .transition(OrderStatus::Expired)
+                .expect("FOK aceita e sem fill pode expirar");
+            return MatchOutcome {
+                fills: Vec::new(),
+                leftover: Leftover::Expired(lots),
+            };
+        }
+
         let mut fills = Vec::new();
 
         while taker.remaining() > Lots::ZERO {
@@ -92,13 +115,59 @@ impl OrderBook {
             }
         }
         let remaining = taker.remaining();
-        let rested = if remaining > Lots::ZERO {
-            self.rest(taker);
-            Some(remaining)
+        let leftover = if remaining == Lots::ZERO {
+            Leftover::None
         } else {
-            None
+            match taker.time_in_force() {
+                TimeInForce::Gtc => {
+                    self.rest(taker);
+                    Leftover::Rested(remaining)
+                }
+                TimeInForce::Ioc => {
+                    taker
+                        .transition(OrderStatus::Cancelled)
+                        .expect("sobra de IOC aceita ou parcial pode ser cancelada");
+                    Leftover::Cancelled(remaining)
+                }
+                TimeInForce::Fok => unreachable!("FOK só executa quando a liquidez cobre tudo"),
+            }
         };
-        MatchOutcome { fills, rested }
+        MatchOutcome { fills, leftover }
+    }
+
+    /// Consulta só de leitura: o lado oposto, nos níveis que cruzam o preço do taker,
+    /// tem quantidade suficiente para executar o restante inteiro?
+    fn can_fill_completely(&self, taker: &Order) -> bool {
+        let mut needed = taker.remaining();
+        match taker.side() {
+            Side::Bid => {
+                for (price, level) in &self.asks {
+                    if *price > taker.price() {
+                        break;
+                    }
+                    for maker in level {
+                        match needed.checked_sub(maker.remaining()) {
+                            Some(rest) if rest > Lots::ZERO => needed = rest,
+                            _ => return true,
+                        }
+                    }
+                }
+            }
+            Side::Ask => {
+                for (price, level) in self.bids.iter().rev() {
+                    if *price < taker.price() {
+                        break;
+                    }
+                    for maker in level {
+                        match needed.checked_sub(maker.remaining()) {
+                            Some(rest) if rest > Lots::ZERO => needed = rest,
+                            _ => return true,
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Tira do livro uma ordem descansando e a leva a `Cancelled`.
@@ -169,6 +238,116 @@ mod tests {
         Lots::new(value).expect("lots de teste válidos")
     }
 
+    fn with_tif(order: Order, time_in_force: TimeInForce) -> Order {
+        order.with_time_in_force(time_in_force)
+    }
+
+    fn total_filled(fills: &[Fill]) -> i64 {
+        fills.iter().map(|fill| fill.lots.get()).sum()
+    }
+
+    fn book_state(book: &OrderBook) -> Vec<(u64, i64)> {
+        book.bids
+            .values()
+            .chain(book.asks.values())
+            .flatten()
+            .map(|order| (order.id().get(), order.remaining().get()))
+            .collect()
+    }
+
+    #[test]
+    fn can_fill_completely_sums_crossing_levels() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 2));
+        book.rest(order(2, Side::Ask, 101, 3));
+        book.rest(order(3, Side::Ask, 102, 10));
+
+        assert!(book.can_fill_completely(&order(4, Side::Bid, 101, 5)));
+        assert!(!book.can_fill_completely(&order(4, Side::Bid, 101, 6)));
+        assert!(book.can_fill_completely(&order(4, Side::Bid, 102, 15)));
+        assert!(!book.can_fill_completely(&order(4, Side::Bid, 99, 1)));
+    }
+
+    #[test]
+    fn can_fill_completely_reads_bids_from_highest() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Bid, 100, 2));
+        book.rest(order(2, Side::Bid, 98, 5));
+
+        assert!(book.can_fill_completely(&order(3, Side::Ask, 99, 2)));
+        assert!(!book.can_fill_completely(&order(3, Side::Ask, 99, 3)));
+        assert!(book.can_fill_completely(&order(3, Side::Ask, 98, 7)));
+    }
+
+    #[test]
+    fn can_fill_completely_is_false_on_empty_side() {
+        let book = OrderBook::new();
+
+        assert!(!book.can_fill_completely(&order(1, Side::Bid, 100, 1)));
+    }
+
+    #[test]
+    fn fok_with_enough_liquidity_fills_across_levels() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 2));
+        book.rest(order(2, Side::Ask, 101, 3));
+
+        let outcome = book.submit(with_tif(order(3, Side::Bid, 101, 5), TimeInForce::Fok));
+
+        assert_eq!(total_filled(&outcome.fills), 5);
+        assert_eq!(outcome.leftover, Leftover::None);
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn fok_without_enough_liquidity_expires_and_leaves_book_untouched() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 2));
+        book.rest(order(2, Side::Ask, 105, 10));
+        let before = book_state(&book);
+
+        let outcome = book.submit(with_tif(order(3, Side::Bid, 101, 5), TimeInForce::Fok));
+
+        assert_eq!(outcome.fills, []);
+        assert_eq!(outcome.leftover, Leftover::Expired(lots(5)));
+        assert_eq!(book_state(&book), before);
+        assert!(!book.contains(OrderId::new(3)));
+    }
+
+    #[test]
+    fn ioc_cancels_remainder_after_partial_fill() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Ask, 100, 2));
+
+        let outcome = book.submit(with_tif(order(2, Side::Bid, 100, 5), TimeInForce::Ioc));
+
+        assert_eq!(total_filled(&outcome.fills), 2);
+        assert_eq!(outcome.leftover, Leftover::Cancelled(lots(3)));
+        assert_eq!(book.best_bid(), None);
+        assert!(!book.contains(OrderId::new(2)));
+    }
+
+    #[test]
+    fn ioc_without_liquidity_is_cancelled_entirely() {
+        let mut book = OrderBook::new();
+
+        let outcome = book.submit(with_tif(order(1, Side::Ask, 100, 4), TimeInForce::Ioc));
+
+        assert_eq!(outcome.fills, []);
+        assert_eq!(outcome.leftover, Leftover::Cancelled(lots(4)));
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn ioc_fully_filled_leaves_nothing() {
+        let mut book = OrderBook::new();
+        book.rest(order(1, Side::Bid, 100, 5));
+
+        let outcome = book.submit(with_tif(order(2, Side::Ask, 100, 5), TimeInForce::Ioc));
+
+        assert_eq!(outcome.leftover, Leftover::None);
+    }
+
     pub(super) fn order(id: u64, side: Side, price_units: i64, quantity: i64) -> Order {
         let mut order = Order::new(
             OrderId::new(id),
@@ -194,7 +373,7 @@ mod tests {
         let outcome = book.submit(order(2, Side::Bid, 100, 5));
 
         assert_eq!(outcome.fills.len(), 1);
-        assert_eq!(outcome.rested, Some(lots(3)));
+        assert_eq!(outcome.leftover, Leftover::Rested(lots(3)));
     }
 
     #[test]
@@ -204,7 +383,7 @@ mod tests {
 
         let outcome = book.submit(order(2, Side::Bid, 100, 5));
 
-        assert_eq!(outcome.rested, None);
+        assert_eq!(outcome.leftover, Leftover::None);
     }
 
     const OWNER: AccountId = AccountId::new(1);

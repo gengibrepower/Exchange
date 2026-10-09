@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::book::{CancelError, OrderBook};
+use crate::book::{CancelError, Leftover, OrderBook};
 use crate::domain::{AccountId, Fill, InstrumentId, Lots, Order, OrderId, OrderStatus};
 
 #[derive(Clone, Debug)]
@@ -25,6 +25,11 @@ pub enum Event {
         lots: Lots,
     },
     Cancelled {
+        instrument: InstrumentId,
+        order: OrderId,
+        lots: Lots,
+    },
+    Expired {
         instrument: InstrumentId,
         order: OrderId,
         lots: Lots,
@@ -94,12 +99,23 @@ impl Engine {
                 for fill in outcome.fills {
                     events.push(Event::Fill { instrument, fill });
                 }
-                if let Some(lots) = outcome.rested {
-                    events.push(Event::Rested {
+                match outcome.leftover {
+                    Leftover::None => {}
+                    Leftover::Rested(lots) => events.push(Event::Rested {
                         instrument,
                         order: id,
                         lots,
-                    });
+                    }),
+                    Leftover::Cancelled(lots) => events.push(Event::Cancelled {
+                        instrument,
+                        order: id,
+                        lots,
+                    }),
+                    Leftover::Expired(lots) => events.push(Event::Expired {
+                        instrument,
+                        order: id,
+                        lots,
+                    }),
                 }
                 events
             }
@@ -138,7 +154,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccountId, Price, Seq, Side};
+    use crate::domain::{AccountId, Price, Seq, Side, TimeInForce};
 
     const TESTE_BRL: InstrumentId = InstrumentId::new(1);
     const OUTRO_BRL: InstrumentId = InstrumentId::new(2);
@@ -286,6 +302,47 @@ mod tests {
             vec![Event::Rejected {
                 order: OrderId::new(1),
                 reason: RejectReason::DuplicateOrderId,
+            }]
+        );
+        let book = engine.book(TESTE_BRL).expect("instrumento registrado");
+        assert_eq!(book.best_ask(), Price::new(100).ok());
+    }
+
+    #[test]
+    fn ioc_remainder_emits_cancelled_after_fills() {
+        let mut engine = Engine::new([TESTE_BRL]);
+        engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 100, 2)));
+        let ioc = order(2, TESTE_BRL, Side::Bid, 100, 5).with_time_in_force(TimeInForce::Ioc);
+
+        let events = engine.apply(Command::Submit(ioc));
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Event::Fill { .. },
+                Event::Cancelled {
+                    order,
+                    lots: remainder,
+                    ..
+                },
+            ] if *order == OrderId::new(2) && *remainder == lots(3)
+        ));
+    }
+
+    #[test]
+    fn fok_without_liquidity_emits_only_expired() {
+        let mut engine = Engine::new([TESTE_BRL]);
+        engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 100, 2)));
+        let fok = order(2, TESTE_BRL, Side::Bid, 100, 5).with_time_in_force(TimeInForce::Fok);
+
+        let events = engine.apply(Command::Submit(fok));
+
+        assert_eq!(
+            events,
+            vec![Event::Expired {
+                instrument: TESTE_BRL,
+                order: OrderId::new(2),
+                lots: lots(5),
             }]
         );
         let book = engine.book(TESTE_BRL).expect("instrumento registrado");
