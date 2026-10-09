@@ -157,6 +157,14 @@ pub enum OrderStatus {
     Expired,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TimeInForce {
+    #[default]
+    Gtc,
+    Ioc,
+    Fok,
+}
+
 impl OrderStatus {
     pub fn can_transition_to(self, to: Self) -> bool {
         matches!(
@@ -185,6 +193,7 @@ pub struct Order {
     remaining: Lots,
     seq: Seq,
     status: OrderStatus,
+    time_in_force: TimeInForce,
 }
 
 impl Order {
@@ -212,7 +221,14 @@ impl Order {
             remaining: total,
             seq,
             status: OrderStatus::New,
+            time_in_force: TimeInForce::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_time_in_force(mut self, time_in_force: TimeInForce) -> Self {
+        self.time_in_force = time_in_force;
+        self
     }
 
     pub fn id(&self) -> OrderId {
@@ -249,6 +265,10 @@ impl Order {
 
     pub fn status(&self) -> OrderStatus {
         self.status
+    }
+
+    pub fn time_in_force(&self) -> TimeInForce {
+        self.time_in_force
     }
 
     /// Reduz o restante e move o status junto (`PartiallyFilled` ou `Filled`).
@@ -375,6 +395,17 @@ mod tests {
             Lots::new(total).unwrap(),
             Seq::new(1),
         )
+    }
+
+    #[test]
+    fn new_order_defaults_to_gtc() {
+        let order = order_with_total(5).unwrap();
+
+        assert_eq!(order.time_in_force(), TimeInForce::Gtc);
+        assert_eq!(
+            order.with_time_in_force(TimeInForce::Fok).time_in_force(),
+            TimeInForce::Fok
+        );
     }
 
     #[test]

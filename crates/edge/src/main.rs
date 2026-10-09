@@ -27,6 +27,7 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                 symbol,
                 price,
                 lots,
+                time_in_force,
             }) => {
                 let Some(instrument) = instrument_id(&symbol) else {
                     writeln!(output, "erro: instrumento desconhecido \"{symbol}\"")?;
@@ -41,7 +42,7 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                     lots,
                     Seq::new(next_seq),
                 ) {
-                    Ok(order) => order,
+                    Ok(order) => order.with_time_in_force(time_in_force),
                     Err(error) => {
                         writeln!(output, "erro: {error}")?;
                         continue;
@@ -119,6 +120,16 @@ fn render(event: &Event) -> String {
             lots.get(),
             symbol(*instrument)
         ),
+        Event::Expired {
+            instrument,
+            order,
+            lots,
+        } => format!(
+            "#{} expirou: {} lots em {}",
+            order.get(),
+            lots.get(),
+            symbol(*instrument)
+        ),
         Event::Rejected { order, reason } => {
             let reason = match reason {
                 RejectReason::UnknownInstrument(_) => "instrumento desconhecido".to_string(),
@@ -181,6 +192,22 @@ mod tests {
              fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000\n\
              #1 cancelada: 3 lots em TESTE/BRL\n\
              #1 rejeitada: ordem não está no livro\n"
+        );
+    }
+
+    #[test]
+    fn ioc_cancels_remainder_and_fok_expires_without_fills() {
+        let output = session(
+            "sell TESTE/BRL 10000 2\nbuy TESTE/BRL 10000 5 ioc\nsell TESTE/BRL 10000 2\nbuy TESTE/BRL 10000 5 fok\n",
+        );
+
+        assert_eq!(
+            output,
+            "#1 descansou: 2 lots em TESTE/BRL\n\
+             fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000\n\
+             #2 cancelada: 3 lots em TESTE/BRL\n\
+             #3 descansou: 2 lots em TESTE/BRL\n\
+             #4 expirou: 5 lots em TESTE/BRL\n"
         );
     }
 
