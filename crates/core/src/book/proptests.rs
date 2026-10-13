@@ -1,6 +1,6 @@
 use proptest::prelude::*;
 
-use super::tests::order;
+use super::tests::{market_order, order};
 use super::{Leftover, OrderBook};
 use crate::domain::{AccountId, Lots, Order, OrderId, OrderStatus, Side, TimeInForce};
 
@@ -17,15 +17,30 @@ fn time_in_force() -> impl Strategy<Value = TimeInForce> {
     ]
 }
 
+fn is_market() -> impl Strategy<Value = bool> {
+    prop_oneof![4 => Just(false), 1 => Just(true)]
+}
+
 // Faixa de preço estreita de propósito: com preços espalhados quase nada cruzaria
 // e as propriedades passariam sem exercitar o matching.
 fn order_flow() -> impl Strategy<Value = Vec<Order>> {
-    let spec = (side(), 95..=105_i64, 1..=10_i64, time_in_force());
+    let spec = (
+        side(),
+        95..=105_i64,
+        1..=10_i64,
+        time_in_force(),
+        is_market(),
+    );
     prop::collection::vec(spec, 1..=50).prop_map(|specs| {
         (1..)
             .zip(specs)
-            .map(|(id, (side, price, lots, tif))| {
-                order(id, side, price, lots).with_time_in_force(tif)
+            .map(|(id, (side, price, lots, tif, is_market))| {
+                let order = if is_market {
+                    market_order(id, side, lots)
+                } else {
+                    order(id, side, price, lots)
+                };
+                order.with_time_in_force(tif)
             })
             .collect()
     })
@@ -127,12 +142,15 @@ proptest! {
     }
 
     #[test]
-    fn only_gtc_orders_rest(orders in order_flow()) {
+    fn only_gtc_limit_orders_rest_at_their_own_price(orders in order_flow()) {
         let mut book = OrderBook::new();
         for order in orders {
             book.submit(order);
-            for resting in book.bids.values().chain(book.asks.values()).flatten() {
-                prop_assert_eq!(resting.time_in_force(), TimeInForce::Gtc);
+            for (price, level) in book.bids.iter().chain(book.asks.iter()) {
+                for resting in level {
+                    prop_assert_eq!(resting.time_in_force(), TimeInForce::Gtc);
+                    prop_assert_eq!(resting.limit_price(), Some(*price));
+                }
             }
         }
     }

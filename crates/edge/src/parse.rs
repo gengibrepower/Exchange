@@ -1,13 +1,13 @@
 use std::str::FromStr;
 
-use exchange_core::domain::{DomainError, Lots, OrderId, Price, Side, TimeInForce};
+use exchange_core::domain::{DomainError, Lots, OrderId, OrderKind, Price, Side, TimeInForce};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Input {
     Submit {
         side: Side,
         symbol: String,
-        price: Price,
+        kind: OrderKind,
         lots: Lots,
         time_in_force: TimeInForce,
     },
@@ -35,7 +35,7 @@ impl std::fmt::Display for ParseError {
             Self::UnknownCommand(command) => write!(f, "comando desconhecido \"{command}\""),
             Self::WrongArity => write!(
                 f,
-                "uso: buy|sell <instrumento> <preço> <lots> [gtc|ioc|fok] | cancel <instrumento> <id> | quit"
+                "uso: buy|sell <instrumento> <preço|mkt> <lots> [gtc|ioc|fok] | cancel <instrumento> <id> | quit"
             ),
             Self::InvalidNumber(token) => write!(f, "número inválido \"{token}\""),
             Self::UnknownTimeInForce(token) => {
@@ -78,7 +78,10 @@ fn submit(
     lots: &str,
     time_in_force: &str,
 ) -> Result<Input, ParseError> {
-    let price = Price::new(number(price)?).map_err(ParseError::Domain)?;
+    let kind = match price {
+        "mkt" => OrderKind::Market,
+        price => OrderKind::Limit(Price::new(number(price)?).map_err(ParseError::Domain)?),
+    };
     let lots = Lots::new(number(lots)?).map_err(ParseError::Domain)?;
     let time_in_force = match time_in_force {
         "gtc" => TimeInForce::Gtc,
@@ -89,7 +92,7 @@ fn submit(
     Ok(Input::Submit {
         side,
         symbol: symbol.to_string(),
-        price,
+        kind,
         lots,
         time_in_force,
     })
@@ -109,7 +112,7 @@ mod tests {
         Input::Submit {
             side,
             symbol: "TESTE/BRL".to_string(),
-            price: Price::new(price).expect("preço de teste válido"),
+            kind: OrderKind::Limit(Price::new(price).expect("preço de teste válido")),
             lots: Lots::new(lots).expect("lots de teste válidos"),
             time_in_force: TimeInForce::Gtc,
         }
@@ -158,6 +161,14 @@ mod tests {
             parse_line("buy TESTE/BRL 100 5 day"),
             Err(ParseError::UnknownTimeInForce("day".to_string()))
         );
+    }
+
+    #[test]
+    fn parses_market_order() {
+        let Ok(Input::Submit { kind, .. }) = parse_line("buy TESTE/BRL mkt 5") else {
+            panic!("deveria ser uma submissão");
+        };
+        assert_eq!(kind, OrderKind::Market);
     }
 
     #[test]
