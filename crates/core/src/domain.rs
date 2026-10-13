@@ -2,6 +2,9 @@
 pub enum DomainError {
     NonPositivePrice(i64),
     NegativeLots(i64),
+    NegativeAmount(i64),
+    SameAsset(AssetId),
+    NonPositiveLotSize,
     EmptyOrder,
     EmptyFill,
     Overfill { remaining: Lots, requested: Lots },
@@ -13,6 +16,15 @@ impl std::fmt::Display for DomainError {
         match self {
             Self::NonPositivePrice(value) => write!(f, "preço {value} deve ser positivo"),
             Self::NegativeLots(value) => write!(f, "lots {value} não pode ser negativo"),
+            Self::NegativeAmount(value) => write!(f, "quantia {value} não pode ser negativa"),
+            Self::SameAsset(asset) => {
+                write!(
+                    f,
+                    "base e quote não podem ser o mesmo ativo ({})",
+                    asset.get()
+                )
+            }
+            Self::NonPositiveLotSize => write!(f, "tamanho do lot deve ser positivo"),
             Self::EmptyOrder => write!(f, "ordem precisa de pelo menos 1 lot"),
             Self::EmptyFill => write!(f, "execução precisa de pelo menos 1 lot"),
             Self::Overfill {
@@ -129,6 +141,105 @@ impl InstrumentId {
 
     pub fn get(self) -> u32 {
         self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AssetId(u32);
+
+impl AssetId {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Quantia de um ativo em unidades-mínimas (centavos de BRL, unidades de TESTE...).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Amount(i64);
+
+impl Amount {
+    pub const ZERO: Self = Self(0);
+
+    /// # Errors
+    /// [`DomainError::NegativeAmount`] se `value < 0`.
+    pub fn new(value: i64) -> Result<Self, DomainError> {
+        if value < 0 {
+            Err(DomainError::NegativeAmount(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Par negociável: `base` muda de mão, `quote` paga. Preço em unidades-mínimas de
+/// `quote` por lot; um lot são `lot_size` unidades-mínimas de `base`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Instrument {
+    id: InstrumentId,
+    base: AssetId,
+    quote: AssetId,
+    tick: Price,
+    lot_size: Amount,
+}
+
+impl Instrument {
+    /// # Errors
+    /// Verificados nesta ordem:
+    /// [`DomainError::SameAsset`] se `base == quote`,
+    /// [`DomainError::NonPositiveLotSize`] se `lot_size` for zero.
+    pub fn new(
+        id: InstrumentId,
+        base: AssetId,
+        quote: AssetId,
+        tick: Price,
+        lot_size: Amount,
+    ) -> Result<Self, DomainError> {
+        if base == quote {
+            return Err(DomainError::SameAsset(base));
+        }
+        if lot_size == Amount::ZERO {
+            return Err(DomainError::NonPositiveLotSize);
+        }
+        Ok(Self {
+            id,
+            base,
+            quote,
+            tick,
+            lot_size,
+        })
+    }
+
+    pub fn id(&self) -> InstrumentId {
+        self.id
+    }
+
+    pub fn base(&self) -> AssetId {
+        self.base
+    }
+
+    pub fn quote(&self) -> AssetId {
+        self.quote
+    }
+
+    pub fn tick(&self) -> Price {
+        self.tick
+    }
+
+    pub fn lot_size(&self) -> Amount {
+        self.lot_size
+    }
+
+    /// O preço é múltiplo do tick?
+    pub fn accepts_price(&self, price: Price) -> bool {
+        price.get() % self.tick.get() == 0
     }
 }
 
@@ -536,6 +647,84 @@ mod tests {
         );
 
         assert_eq!(result.unwrap_err(), DomainError::EmptyOrder);
+    }
+
+    const TESTE: AssetId = AssetId::new(1);
+    const BRL: AssetId = AssetId::new(2);
+
+    fn instrument(
+        base: AssetId,
+        quote: AssetId,
+        tick: i64,
+        lot_size: i64,
+    ) -> Result<Instrument, DomainError> {
+        Instrument::new(
+            InstrumentId::new(1),
+            base,
+            quote,
+            Price::new(tick).unwrap(),
+            Amount::new(lot_size).unwrap(),
+        )
+    }
+
+    #[test]
+    fn amount_rejects_negative_and_accepts_zero() {
+        assert_eq!(Amount::new(-1), Err(DomainError::NegativeAmount(-1)));
+        assert_eq!(Amount::new(0), Ok(Amount::ZERO));
+    }
+
+    #[test]
+    fn instrument_keeps_its_specification() {
+        let spec = instrument(TESTE, BRL, 10, 100).unwrap();
+
+        assert_eq!(spec.id(), InstrumentId::new(1));
+        assert_eq!(spec.base(), TESTE);
+        assert_eq!(spec.quote(), BRL);
+        assert_eq!(spec.tick(), Price::new(10).unwrap());
+        assert_eq!(spec.lot_size(), Amount::new(100).unwrap());
+    }
+
+    #[test]
+    fn instrument_rejects_same_asset_on_both_sides() {
+        assert_eq!(
+            instrument(BRL, BRL, 10, 100),
+            Err(DomainError::SameAsset(BRL))
+        );
+    }
+
+    #[test]
+    fn instrument_rejects_zero_lot_size() {
+        assert_eq!(
+            instrument(TESTE, BRL, 10, 0),
+            Err(DomainError::NonPositiveLotSize)
+        );
+    }
+
+    #[test]
+    fn same_asset_is_checked_before_lot_size() {
+        assert_eq!(
+            instrument(BRL, BRL, 10, 0),
+            Err(DomainError::SameAsset(BRL))
+        );
+    }
+
+    #[test]
+    fn instrument_accepts_only_multiples_of_tick() {
+        let spec = instrument(TESTE, BRL, 10, 100).unwrap();
+
+        assert!(spec.accepts_price(Price::new(10).unwrap()));
+        assert!(spec.accepts_price(Price::new(10_000).unwrap()));
+        assert!(!spec.accepts_price(Price::new(10_005).unwrap()));
+        assert!(!spec.accepts_price(Price::new(5).unwrap()));
+    }
+
+    #[test]
+    fn tick_of_one_accepts_every_price() {
+        let spec = instrument(TESTE, BRL, 1, 1).unwrap();
+
+        for price in [1, 7, 10_001, i64::MAX] {
+            assert!(spec.accepts_price(Price::new(price).unwrap()), "{price}");
+        }
     }
 
     #[test]
