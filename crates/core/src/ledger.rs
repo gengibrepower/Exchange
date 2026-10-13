@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use crate::domain::{AccountId, Amount, AssetId};
 
+/// Seção 3.5, não-negatividade: garantida pelo tipo. `Amount` só nasce de
+/// `Amount::new`, que recusa negativo, ou de aritmética `checked_*` que devolve `None`
+/// em vez de ficar abaixo de zero — não há como um saldo negativo existir.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Balance {
     pub available: Amount,
