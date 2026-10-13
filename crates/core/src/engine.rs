@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::book::{CancelError, Leftover, OrderBook};
 use crate::domain::{
-    AccountId, Amount, AssetId, Fill, Instrument, InstrumentId, Lots, Order, OrderId, OrderKind,
-    OrderStatus, Price, Side,
+    AccountId, Amount, AssetId, Fill, Instrument, InstrumentId, Lots, Order, OrderId, OrderStatus,
+    Price, Side,
 };
 use crate::ledger::{Balance, Ledger, LedgerError, Transfer};
 
@@ -230,7 +230,7 @@ impl Engine {
         );
 
         let side = order.side();
-        let limit = order.limit_price();
+        let limit = order.price_bound();
         let outcome = listing.book.submit(order);
 
         let taker = Taker {
@@ -376,12 +376,12 @@ fn required_reservation(
     order: &Order,
     instrument: &Instrument,
 ) -> Result<(AssetId, Amount), RejectReason> {
-    match (order.side(), order.kind()) {
-        (Side::Bid, OrderKind::Limit(price)) => price
+    match (order.side(), order.price_bound()) {
+        (Side::Bid, Some(bound)) => bound
             .times(order.remaining())
             .map(|amount| (instrument.quote(), amount))
             .ok_or(RejectReason::ValueOverflow),
-        (Side::Bid, OrderKind::Market) => Err(RejectReason::MarketBuyNeedsProtection),
+        (Side::Bid, None) => Err(RejectReason::MarketBuyNeedsProtection),
         (Side::Ask, _) => instrument
             .lot_size()
             .times(order.remaining())
@@ -529,6 +529,16 @@ mod tests {
     }
 
     fn market_for(account: AccountId, id: u64, side: Side, quantity: i64) -> Order {
+        protected_for(account, id, side, quantity, None)
+    }
+
+    fn protected_for(
+        account: AccountId,
+        id: u64,
+        side: Side,
+        quantity: i64,
+        protection: Option<i64>,
+    ) -> Order {
         Order::market(
             OrderId::new(id),
             account,
@@ -536,6 +546,7 @@ mod tests {
             side,
             lots(quantity),
             Seq::new(id),
+            protection.map(|bound| Price::new(bound).expect("proteção de teste válida")),
         )
         .expect("ordem de teste válida")
     }
@@ -708,6 +719,43 @@ mod tests {
             }]
         );
         assert_eq!(engine.balance(ALICE, BRL), balance(1_000, 0));
+    }
+
+    #[test]
+    fn protected_market_buy_reserves_its_bound_and_returns_the_rest() {
+        let mut engine = lean_engine();
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 90, 2));
+        submit(&mut engine, order_for(BOB, 2, Side::Ask, 120, 2));
+
+        let events = submit(
+            &mut engine,
+            protected_for(ALICE, 3, Side::Bid, 4, Some(100)),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Fill { .. }, Event::Cancelled { lots: remainder, .. }] if *remainder == lots(2)
+        ));
+        assert_eq!(engine.balance(ALICE, BRL), balance(820, 0));
+        assert_eq!(engine.balance(ALICE, TESTE), balance(200, 0));
+    }
+
+    #[test]
+    fn protected_market_buy_without_funds_for_its_bound_is_rejected() {
+        let mut engine = lean_engine();
+
+        let events = submit(
+            &mut engine,
+            protected_for(ALICE, 1, Side::Bid, 4, Some(300)),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Rejected {
+                reason: RejectReason::InsufficientFunds { .. },
+                ..
+            }]
+        ));
     }
 
     #[test]

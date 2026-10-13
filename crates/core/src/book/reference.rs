@@ -3,9 +3,7 @@
 // a lógica de cruzamento nem de prioridade do OrderBook — um bug lá não pode se repetir aqui.
 
 use super::{CancelError, Leftover, MatchOutcome};
-use crate::domain::{
-    AccountId, Fill, Lots, Order, OrderId, OrderKind, OrderStatus, Side, TimeInForce,
-};
+use crate::domain::{AccountId, Fill, Lots, Order, OrderId, OrderStatus, Side, TimeInForce};
 use std::cmp::Reverse;
 
 #[derive(Default)]
@@ -109,10 +107,12 @@ impl ReferenceBook {
 fn is_eligible(taker: &Order, maker: &Order) -> bool {
     let maker_price = maker.limit_price().expect("só ordem limite descansa");
     let opposite = taker.side() != maker.side();
-    let price_ok = match (taker.side(), taker.kind()) {
-        (_, OrderKind::Market) => true,
-        (Side::Bid, OrderKind::Limit(limit)) => maker_price.get() <= limit.get(),
-        (Side::Ask, OrderKind::Limit(limit)) => maker_price.get() >= limit.get(),
+    let price_ok = match taker.price_bound() {
+        None => true,
+        Some(bound) => match taker.side() {
+            Side::Bid => maker_price.get() <= bound.get(),
+            Side::Ask => maker_price.get() >= bound.get(),
+        },
     };
     opposite && price_ok
 }

@@ -32,6 +32,7 @@ pub enum ParseError {
     WrongArity,
     InvalidNumber(String),
     UnknownTimeInForce(String),
+    ProtectionNeedsMarket,
     Domain(DomainError),
 }
 
@@ -42,9 +43,12 @@ impl std::fmt::Display for ParseError {
             Self::UnknownCommand(command) => write!(f, "comando desconhecido \"{command}\""),
             Self::WrongArity => write!(
                 f,
-                "uso: buy|sell <instrumento> <preço|mkt> <lots> [gtc|ioc|fok] | cancel <instrumento> <id> | deposit <ativo> <quantia> | balance | quit"
+                "uso: buy|sell <instrumento> <preço|mkt> <lots> [max <proteção>] [gtc|ioc|fok] | cancel <instrumento> <id> | deposit <ativo> <quantia> | balance | quit"
             ),
             Self::InvalidNumber(token) => write!(f, "número inválido \"{token}\""),
+            Self::ProtectionNeedsMarket => {
+                write!(f, "\"max\" só vale para ordem a mercado (preço mkt)")
+            }
             Self::UnknownTimeInForce(token) => {
                 write!(
                     f,
@@ -65,10 +69,17 @@ pub fn parse_line(line: &str) -> Result<Input, ParseError> {
     match tokens.as_slice() {
         [] => Err(ParseError::Empty),
         ["quit"] => Ok(Input::Quit),
-        ["buy", symbol, price, lots] => submit(Side::Bid, symbol, price, lots, "gtc"),
-        ["sell", symbol, price, lots] => submit(Side::Ask, symbol, price, lots, "gtc"),
-        ["buy", symbol, price, lots, tif] => submit(Side::Bid, symbol, price, lots, tif),
-        ["sell", symbol, price, lots, tif] => submit(Side::Ask, symbol, price, lots, tif),
+        [side @ ("buy" | "sell"), symbol, price, lots, options @ ..] => {
+            let side = if *side == "buy" { Side::Bid } else { Side::Ask };
+            let (protection, time_in_force) = match options {
+                [] => (None, "gtc"),
+                [tif] => (None, *tif),
+                ["max", bound] => (Some(*bound), "gtc"),
+                ["max", bound, tif] => (Some(*bound), *tif),
+                _ => return Err(ParseError::WrongArity),
+            };
+            submit(side, symbol, price, lots, protection, time_in_force)
+        }
         ["cancel", symbol, id] => Ok(Input::Cancel {
             symbol: symbol.to_string(),
             order: OrderId::new(number(id)?),
@@ -91,11 +102,16 @@ fn submit(
     symbol: &str,
     price: &str,
     lots: &str,
+    protection: Option<&str>,
     time_in_force: &str,
 ) -> Result<Input, ParseError> {
-    let kind = match price {
-        "mkt" => OrderKind::Market,
-        price => OrderKind::Limit(Price::new(number(price)?).map_err(ParseError::Domain)?),
+    let protection = protection
+        .map(|bound| Price::new(number(bound)?).map_err(ParseError::Domain))
+        .transpose()?;
+    let kind = match (price, protection) {
+        ("mkt", protection) => OrderKind::Market { protection },
+        (_, Some(_)) => return Err(ParseError::ProtectionNeedsMarket),
+        (price, None) => OrderKind::Limit(Price::new(number(price)?).map_err(ParseError::Domain)?),
     };
     let lots = Lots::new(number(lots)?).map_err(ParseError::Domain)?;
     let time_in_force = match time_in_force {
@@ -183,7 +199,38 @@ mod tests {
         let Ok(Input::Submit { kind, .. }) = parse_line("buy TESTE/BRL mkt 5") else {
             panic!("deveria ser uma submissão");
         };
-        assert_eq!(kind, OrderKind::Market);
+        assert_eq!(kind, OrderKind::Market { protection: None });
+    }
+
+    #[test]
+    fn parses_market_protection_with_optional_time_in_force() {
+        let Ok(Input::Submit {
+            kind,
+            time_in_force,
+            ..
+        }) = parse_line("buy TESTE/BRL mkt 5 max 10500 fok")
+        else {
+            panic!("deveria ser uma submissão");
+        };
+        assert_eq!(
+            kind,
+            OrderKind::Market {
+                protection: Some(Price::new(10_500).unwrap())
+            }
+        );
+        assert_eq!(time_in_force, TimeInForce::Fok);
+    }
+
+    #[test]
+    fn rejects_protection_on_limit_order_and_bad_bound() {
+        assert_eq!(
+            parse_line("buy TESTE/BRL 10000 5 max 10500"),
+            Err(ParseError::ProtectionNeedsMarket)
+        );
+        assert_eq!(
+            parse_line("buy TESTE/BRL mkt 5 max zero"),
+            Err(ParseError::InvalidNumber("zero".to_string()))
+        );
     }
 
     #[test]
