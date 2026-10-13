@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-use exchange_core::domain::{DomainError, Lots, OrderId, OrderKind, Price, Side, TimeInForce};
+use exchange_core::domain::{
+    Amount, DomainError, Lots, OrderId, OrderKind, Price, Side, TimeInForce,
+};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Input {
@@ -15,6 +17,11 @@ pub enum Input {
         symbol: String,
         order: OrderId,
     },
+    Deposit {
+        asset: String,
+        amount: Amount,
+    },
+    Balance,
     Quit,
 }
 
@@ -35,7 +42,7 @@ impl std::fmt::Display for ParseError {
             Self::UnknownCommand(command) => write!(f, "comando desconhecido \"{command}\""),
             Self::WrongArity => write!(
                 f,
-                "uso: buy|sell <instrumento> <preço|mkt> <lots> [gtc|ioc|fok] | cancel <instrumento> <id> | quit"
+                "uso: buy|sell <instrumento> <preço|mkt> <lots> [gtc|ioc|fok] | cancel <instrumento> <id> | deposit <ativo> <quantia> | balance | quit"
             ),
             Self::InvalidNumber(token) => write!(f, "número inválido \"{token}\""),
             Self::UnknownTimeInForce(token) => {
@@ -66,7 +73,15 @@ pub fn parse_line(line: &str) -> Result<Input, ParseError> {
             symbol: symbol.to_string(),
             order: OrderId::new(number(id)?),
         }),
-        ["buy" | "sell" | "cancel" | "quit", ..] => Err(ParseError::WrongArity),
+        ["deposit", asset, amount] => Ok(Input::Deposit {
+            asset: asset.to_string(),
+            amount: Amount::new(number(amount)?).map_err(ParseError::Domain)?,
+        }),
+        ["balance"] => Ok(Input::Balance),
+        [
+            "buy" | "sell" | "cancel" | "deposit" | "balance" | "quit",
+            ..,
+        ] => Err(ParseError::WrongArity),
         [command, ..] => Err(ParseError::UnknownCommand(command.to_string())),
     }
 }
@@ -169,6 +184,23 @@ mod tests {
             panic!("deveria ser uma submissão");
         };
         assert_eq!(kind, OrderKind::Market);
+    }
+
+    #[test]
+    fn parses_deposit_and_balance() {
+        assert_eq!(
+            parse_line("deposit BRL 500"),
+            Ok(Input::Deposit {
+                asset: "BRL".to_string(),
+                amount: Amount::new(500).unwrap(),
+            })
+        );
+        assert_eq!(parse_line("balance"), Ok(Input::Balance));
+        assert_eq!(
+            parse_line("deposit BRL -1"),
+            Err(ParseError::Domain(DomainError::NegativeAmount(-1)))
+        );
+        assert_eq!(parse_line("balance BRL"), Err(ParseError::WrongArity));
     }
 
     #[test]

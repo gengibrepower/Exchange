@@ -36,13 +36,21 @@ pub enum LedgerError {
         account: AccountId,
         asset: AssetId,
     },
+    SupplyOverflow {
+        asset: AssetId,
+    },
 }
 
 /// Dono único dos saldos (decisão 10b). Toda operação é atômica: em erro, nada muda.
+///
+/// A oferta total de cada ativo nunca passa de `i64::MAX`. Como nenhum saldo é maior que
+/// a soma de todos, nenhum crédito pode estourar — o que deixa a liquidação infalível
+/// quando a reserva cobre os débitos.
 #[derive(Default)]
 #[cfg_attr(test, derive(Clone, PartialEq, Eq, Debug))]
 pub struct Ledger {
     balances: HashMap<(AccountId, AssetId), Balance>,
+    supply: HashMap<AssetId, Amount>,
 }
 
 impl Ledger {
@@ -57,21 +65,30 @@ impl Ledger {
             .unwrap_or_default()
     }
 
+    pub fn supply(&self, asset: AssetId) -> Amount {
+        self.supply.get(&asset).copied().unwrap_or_default()
+    }
+
     /// Entrada de valor de fora do sistema: único jeito de a soma de um ativo crescer.
     ///
     /// # Errors
-    /// [`LedgerError::Overflow`] se o disponível estourar.
+    /// [`LedgerError::SupplyOverflow`] se a oferta total do ativo passar de `i64::MAX`.
     pub fn deposit(
         &mut self,
         account: AccountId,
         asset: AssetId,
         amount: Amount,
     ) -> Result<(), LedgerError> {
+        let supply = self
+            .supply(asset)
+            .checked_add(amount)
+            .ok_or(LedgerError::SupplyOverflow { asset })?;
         let balance = self.balance(account, asset);
         let available = balance
             .available
             .checked_add(amount)
             .ok_or(LedgerError::Overflow { account, asset })?;
+        self.supply.insert(asset, supply);
         self.balances.insert(
             (account, asset),
             Balance {
@@ -247,21 +264,26 @@ mod tests {
     }
 
     #[test]
-    fn deposit_overflow_changes_nothing() {
+    fn deposit_beyond_total_supply_changes_nothing() {
         let mut ledger = Ledger::new();
         ledger.deposit(B, BRL, amount(i64::MAX)).unwrap();
         let before = ledger.clone();
 
-        let result = ledger.deposit(B, BRL, amount(1));
+        let result = ledger.deposit(S, BRL, amount(1));
 
-        assert_eq!(
-            result,
-            Err(LedgerError::Overflow {
-                account: B,
-                asset: BRL
-            })
-        );
+        assert_eq!(result, Err(LedgerError::SupplyOverflow { asset: BRL }));
         assert_eq!(ledger, before);
+        assert_eq!(ledger.supply(BRL), amount(i64::MAX));
+    }
+
+    #[test]
+    fn supply_is_per_asset() {
+        let mut ledger = Ledger::new();
+        ledger.deposit(B, BRL, amount(i64::MAX)).unwrap();
+
+        ledger.deposit(B, TESTE, amount(i64::MAX)).unwrap();
+
+        assert_eq!(ledger.supply(TESTE), amount(i64::MAX));
     }
 
     #[test]
@@ -364,26 +386,6 @@ mod tests {
                 asset: BRL,
                 reserved: amount(50),
                 requested: amount(100),
-            })
-        );
-        assert_eq!(ledger, before);
-    }
-
-    #[test]
-    fn settle_credit_overflow_changes_nothing() {
-        let mut ledger = Ledger::new();
-        ledger.deposit(B, BRL, amount(10)).unwrap();
-        ledger.reserve(B, BRL, amount(10)).unwrap();
-        ledger.deposit(S, BRL, amount(i64::MAX)).unwrap();
-        let before = ledger.clone();
-
-        let result = ledger.settle(&[transfer(BRL, B, S, 10)]);
-
-        assert_eq!(
-            result,
-            Err(LedgerError::Overflow {
-                account: S,
-                asset: BRL
             })
         );
         assert_eq!(ledger, before);

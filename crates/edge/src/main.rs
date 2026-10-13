@@ -13,6 +13,7 @@ const INSTRUMENTS: [(&str, InstrumentId); 1] = [("TESTE/BRL", InstrumentId::new(
 const ACCOUNT: AccountId = AccountId::new(1);
 const TESTE: AssetId = AssetId::new(1);
 const BRL: AssetId = AssetId::new(2);
+const ASSETS: [(&str, AssetId); 2] = [("TESTE", TESTE), ("BRL", BRL)];
 
 // TESTE/BRL: preço em centavos por lot, tick de 10 centavos, 1 lot = 100 unidades de TESTE.
 fn instrument_specs() -> [Instrument; 1] {
@@ -65,6 +66,32 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                 next_seq += 1;
                 Command::Submit(order)
             }
+            Ok(Input::Deposit {
+                asset: name,
+                amount,
+            }) => {
+                let Some(asset) = asset_id(&name) else {
+                    writeln!(output, "erro: ativo desconhecido \"{name}\"")?;
+                    continue;
+                };
+                Command::Deposit {
+                    account: ACCOUNT,
+                    asset,
+                    amount,
+                }
+            }
+            Ok(Input::Balance) => {
+                for (name, asset) in ASSETS {
+                    let balance = engine.balance(ACCOUNT, asset);
+                    writeln!(
+                        output,
+                        "{name}: disponível {}, reservado {}",
+                        balance.available.get(),
+                        balance.reserved.get()
+                    )?;
+                }
+                continue;
+            }
             Ok(Input::Cancel { symbol, order }) => {
                 let Some(instrument) = instrument_id(&symbol) else {
                     writeln!(output, "erro: instrumento desconhecido \"{symbol}\"")?;
@@ -90,6 +117,20 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
+fn asset_id(name: &str) -> Option<AssetId> {
+    ASSETS
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, asset)| *asset)
+}
+
+fn asset_name(asset: AssetId) -> &'static str {
+    ASSETS
+        .iter()
+        .find(|(_, id)| *id == asset)
+        .map_or("?", |(name, _)| name)
+}
+
 fn instrument_id(symbol: &str) -> Option<InstrumentId> {
     INSTRUMENTS
         .iter()
@@ -106,6 +147,14 @@ fn symbol(instrument: InstrumentId) -> &'static str {
 
 fn render(event: &Event) -> String {
     match event {
+        Event::Deposited { asset, amount, .. } => {
+            format!("depósito: {} {}", amount.get(), asset_name(*asset))
+        }
+        Event::DepositRejected { asset, amount, .. } => format!(
+            "depósito recusado: {} {} estouraria a oferta total",
+            amount.get(),
+            asset_name(*asset)
+        ),
         Event::Fill { instrument, fill } => format!(
             "fill {}: taker #{}, maker #{}, {} lots @ {}",
             symbol(*instrument),
@@ -151,6 +200,20 @@ fn render(event: &Event) -> String {
                 RejectReason::OffTick { price, tick } => {
                     format!("preço {} fora do tick {}", price.get(), tick.get())
                 }
+                RejectReason::MarketBuyNeedsProtection => {
+                    "compra a mercado precisa de preço de proteção".to_string()
+                }
+                RejectReason::ValueOverflow => "valor da ordem estoura o limite".to_string(),
+                RejectReason::InsufficientFunds {
+                    asset,
+                    available,
+                    required,
+                } => format!(
+                    "saldo insuficiente em {}: disponível {}, necessário {}",
+                    asset_name(*asset),
+                    available.get(),
+                    required.get()
+                ),
                 RejectReason::DuplicateOrderId => "id de ordem já em uso".to_string(),
                 RejectReason::UnknownOrder => "ordem não está no livro".to_string(),
                 RejectReason::NotOwner => "ordem pertence a outra conta".to_string(),
@@ -164,10 +227,45 @@ fn render(event: &Event) -> String {
 mod tests {
     use super::*;
 
-    fn session(input: &str) -> String {
+    const FUNDING: &str = "deposit BRL 100000000\ndeposit TESTE 100000\n";
+
+    fn raw_session(input: &str) -> String {
         let mut output = Vec::new();
         run(input.as_bytes(), &mut output).expect("I/O em memória não falha");
         String::from_utf8(output).expect("saída é UTF-8")
+    }
+
+    // Sessão com a conta já abastecida; as duas linhas de confirmação do depósito saem
+    // da saída comparada para os cenários focarem no que testam.
+    fn session(input: &str) -> String {
+        raw_session(&format!("{FUNDING}{input}"))
+            .split_inclusive('\n')
+            .skip(2)
+            .collect()
+    }
+
+    #[test]
+    fn deposit_then_balance_shows_reserved_part() {
+        let output = raw_session("deposit BRL 50000\nbuy TESTE/BRL 10000 2\nbalance\n");
+
+        assert_eq!(
+            output,
+            "depósito: 50000 BRL\n\
+             #1 descansou: 2 lots em TESTE/BRL\n\
+             TESTE: disponível 0, reservado 0\n\
+             BRL: disponível 30000, reservado 20000\n"
+        );
+    }
+
+    #[test]
+    fn order_without_funds_is_rejected() {
+        let output = raw_session("buy TESTE/BRL 10000 1\ndeposit OURO 1\n");
+
+        assert_eq!(
+            output,
+            "#1 rejeitada: saldo insuficiente em BRL: disponível 0, necessário 10000\n\
+             erro: ativo desconhecido \"OURO\"\n"
+        );
     }
 
     #[test]
@@ -229,17 +327,19 @@ mod tests {
     }
 
     #[test]
-    fn market_order_sweeps_and_never_rests() {
-        let output =
-            session("sell TESTE/BRL 10000 2\nsell TESTE/BRL 10500 2\nbuy TESTE/BRL mkt 5\n");
+    fn market_sell_sweeps_and_never_rests_while_market_buy_needs_protection() {
+        let output = session(
+            "buy TESTE/BRL 10500 2\nbuy TESTE/BRL 10000 2\nsell TESTE/BRL mkt 5\nbuy TESTE/BRL mkt 1\n",
+        );
 
         assert_eq!(
             output,
             "#1 descansou: 2 lots em TESTE/BRL\n\
              #2 descansou: 2 lots em TESTE/BRL\n\
-             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000\n\
-             fill TESTE/BRL: taker #3, maker #2, 2 lots @ 10500\n\
-             #3 cancelada: 1 lots em TESTE/BRL\n"
+             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10500\n\
+             fill TESTE/BRL: taker #3, maker #2, 2 lots @ 10000\n\
+             #3 cancelada: 1 lots em TESTE/BRL\n\
+             #4 rejeitada: compra a mercado precisa de preço de proteção\n"
         );
     }
 
