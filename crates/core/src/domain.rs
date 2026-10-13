@@ -292,7 +292,11 @@ pub enum OrderStatus {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OrderKind {
     Limit(Price),
-    Market,
+    /// Sem preço próprio; `protection` é o pior preço aceitável (máximo na compra,
+    /// mínimo na venda). É uma trava, não um preço de negócio: não precisa seguir o tick.
+    Market {
+        protection: Option<Price>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -359,7 +363,7 @@ impl Order {
         )
     }
 
-    /// Ordem a mercado: sem preço, nunca descansa.
+    /// Ordem a mercado: sem preço, nunca descansa; opcionalmente travada por `protection`.
     ///
     /// # Errors
     /// [`DomainError::EmptyOrder`] se `total` for zero.
@@ -370,8 +374,17 @@ impl Order {
         side: Side,
         total: Lots,
         seq: Seq,
+        protection: Option<Price>,
     ) -> Result<Self, DomainError> {
-        Self::build(id, account, instrument, side, OrderKind::Market, total, seq)
+        Self::build(
+            id,
+            account,
+            instrument,
+            side,
+            OrderKind::Market { protection },
+            total,
+            seq,
+        )
     }
 
     fn build(
@@ -426,19 +439,43 @@ impl Order {
         self.kind
     }
 
+    /// Preço em que a ordem descansaria: só ordem limite tem.
     pub fn limit_price(&self) -> Option<Price> {
         match self.kind {
             OrderKind::Limit(price) => Some(price),
-            OrderKind::Market => None,
+            OrderKind::Market { .. } => None,
+        }
+    }
+
+    /// Pior preço que a ordem aceita: o limite, ou a proteção de uma ordem a mercado.
+    pub fn price_bound(&self) -> Option<Price> {
+        match self.kind {
+            OrderKind::Limit(bound)
+            | OrderKind::Market {
+                protection: Some(bound),
+            } => Some(bound),
+            OrderKind::Market { protection: None } => None,
         }
     }
 
     /// Esta ordem, como taker, cruza com um maker parado em `maker_price`?
     pub fn crosses(&self, maker_price: Price) -> bool {
         match (self.side, self.kind) {
-            (_, OrderKind::Market) => true,
-            (Side::Bid, OrderKind::Limit(limit)) => maker_price <= limit,
-            (Side::Ask, OrderKind::Limit(limit)) => maker_price >= limit,
+            (_, OrderKind::Market { protection: None }) => true,
+            (
+                Side::Bid,
+                OrderKind::Limit(bound)
+                | OrderKind::Market {
+                    protection: Some(bound),
+                },
+            ) => maker_price <= bound,
+            (
+                Side::Ask,
+                OrderKind::Limit(bound)
+                | OrderKind::Market {
+                    protection: Some(bound),
+                },
+            ) => maker_price >= bound,
         }
     }
 
@@ -601,7 +638,7 @@ mod tests {
         .unwrap()
     }
 
-    fn market(side: Side) -> Order {
+    fn protected(side: Side, protection: Option<i64>) -> Order {
         Order::market(
             OrderId::new(1),
             AccountId::new(1),
@@ -609,8 +646,45 @@ mod tests {
             side,
             Lots::new(1).unwrap(),
             Seq::new(1),
+            protection.map(|bound| Price::new(bound).unwrap()),
         )
         .unwrap()
+    }
+
+    fn market(side: Side) -> Order {
+        protected(side, None)
+    }
+
+    #[test]
+    fn protected_market_buy_crosses_only_up_to_its_protection() {
+        let buy = protected(Side::Bid, Some(105));
+
+        assert!(buy.crosses(Price::new(100).unwrap()));
+        assert!(buy.crosses(Price::new(105).unwrap()));
+        assert!(!buy.crosses(Price::new(106).unwrap()));
+    }
+
+    #[test]
+    fn protected_market_sell_crosses_only_down_to_its_protection() {
+        let sell = protected(Side::Ask, Some(95));
+
+        assert!(sell.crosses(Price::new(100).unwrap()));
+        assert!(sell.crosses(Price::new(95).unwrap()));
+        assert!(!sell.crosses(Price::new(94).unwrap()));
+    }
+
+    #[test]
+    fn price_bound_is_the_limit_or_the_protection() {
+        assert_eq!(
+            limit(Side::Bid, 100).price_bound(),
+            Some(Price::new(100).unwrap())
+        );
+        assert_eq!(
+            protected(Side::Bid, Some(105)).price_bound(),
+            Some(Price::new(105).unwrap())
+        );
+        assert_eq!(market(Side::Bid).price_bound(), None);
+        assert_eq!(protected(Side::Bid, Some(105)).limit_price(), None);
     }
 
     #[test]
@@ -648,7 +722,7 @@ mod tests {
     fn market_order_has_no_limit_price() {
         let order = market(Side::Bid);
 
-        assert_eq!(order.kind(), OrderKind::Market);
+        assert_eq!(order.kind(), OrderKind::Market { protection: None });
         assert_eq!(order.limit_price(), None);
         assert_eq!(
             limit(Side::Bid, 100).limit_price(),
@@ -665,6 +739,7 @@ mod tests {
             Side::Bid,
             Lots::ZERO,
             Seq::new(1),
+            None,
         );
 
         assert_eq!(result.unwrap_err(), DomainError::EmptyOrder);

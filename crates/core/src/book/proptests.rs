@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 
 use super::reference::ReferenceBook;
-use super::tests::{market_order, order};
+use super::tests::{order, protected_market};
 use super::{Leftover, OrderBook};
 use crate::domain::{AccountId, Lots, Order, OrderId, OrderStatus, Side, TimeInForce};
 
@@ -18,8 +18,13 @@ fn time_in_force() -> impl Strategy<Value = TimeInForce> {
     ]
 }
 
-fn is_market() -> impl Strategy<Value = bool> {
-    prop_oneof![4 => Just(false), 1 => Just(true)]
+// `None` é ordem limite; `Some(proteção)` é ordem a mercado, protegida ou não.
+fn market_kind() -> impl Strategy<Value = Option<Option<i64>>> {
+    prop_oneof![
+        4 => Just(None),
+        1 => Just(Some(None)),
+        1 => (95..=105_i64).prop_map(|bound| Some(Some(bound))),
+    ]
 }
 
 // Faixa de preço estreita de propósito: com preços espalhados quase nada cruzaria
@@ -30,16 +35,15 @@ fn order_flow() -> impl Strategy<Value = Vec<Order>> {
         95..=105_i64,
         1..=10_i64,
         time_in_force(),
-        is_market(),
+        market_kind(),
     );
     prop::collection::vec(spec, 1..=50).prop_map(|specs| {
         (1..)
             .zip(specs)
-            .map(|(id, (side, price, lots, tif, is_market))| {
-                let order = if is_market {
-                    market_order(id, side, lots)
-                } else {
-                    order(id, side, price, lots)
+            .map(|(id, (side, price, lots, tif, market))| {
+                let order = match market {
+                    Some(protection) => protected_market(id, side, lots, protection),
+                    None => order(id, side, price, lots),
                 };
                 order.with_time_in_force(tif)
             })
@@ -98,23 +102,22 @@ fn mixed_op_flow() -> impl Strategy<Value = Vec<Op>> {
         95..=105_i64,
         1..=10_i64,
         time_in_force(),
-        is_market(),
+        market_kind(),
         any::<prop::sample::Index>(),
     );
     prop::collection::vec(spec, 1..=80).prop_map(|specs| {
         let mut next_id = 1;
         specs
             .into_iter()
-            .map(|(is_cancel, side, price, lots, tif, is_market, target)| {
+            .map(|(is_cancel, side, price, lots, tif, market, target)| {
                 if is_cancel && next_id > 1 {
                     return Op::Cancel(OrderId::new(1 + target.index(next_id - 1) as u64));
                 }
                 let id = next_id as u64;
                 next_id += 1;
-                let order = if is_market {
-                    market_order(id, side, lots)
-                } else {
-                    order(id, side, price, lots)
+                let order = match market {
+                    Some(protection) => protected_market(id, side, lots, protection),
+                    None => order(id, side, price, lots),
                 };
                 Op::Submit(order.with_time_in_force(tif))
             })

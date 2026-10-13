@@ -129,7 +129,7 @@ impl OrderBook {
                     self.rest(taker, price);
                     Leftover::Rested(remaining)
                 }
-                (TimeInForce::Ioc, _) | (TimeInForce::Gtc, OrderKind::Market) => {
+                (TimeInForce::Ioc, _) | (TimeInForce::Gtc, OrderKind::Market { .. }) => {
                     taker
                         .transition(OrderStatus::Cancelled)
                         .expect("sobra aceita ou parcial pode ser cancelada");
@@ -362,6 +362,15 @@ mod tests {
     }
 
     pub(super) fn market_order(id: u64, side: Side, quantity: i64) -> Order {
+        protected_market(id, side, quantity, None)
+    }
+
+    pub(super) fn protected_market(
+        id: u64,
+        side: Side,
+        quantity: i64,
+        protection: Option<i64>,
+    ) -> Order {
         let mut order = Order::market(
             OrderId::new(id),
             AccountId::new(1),
@@ -369,6 +378,7 @@ mod tests {
             side,
             lots(quantity),
             Seq::new(id),
+            protection.map(price),
         )
         .expect("ordem de teste válida");
         order
@@ -403,6 +413,32 @@ mod tests {
             ]
         );
         assert_eq!(outcome.leftover, Leftover::None);
+    }
+
+    #[test]
+    fn protected_market_buy_stops_at_its_protection() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Ask, 100, 2));
+        place(&mut book, order(2, Side::Ask, 106, 2));
+
+        let outcome = book.submit(protected_market(3, Side::Bid, 5, Some(105)));
+
+        assert_eq!(total_filled(&outcome.fills), 2);
+        assert_eq!(outcome.leftover, Leftover::Cancelled(lots(3)));
+        assert_eq!(book.best_ask(), Some(price(106)));
+    }
+
+    #[test]
+    fn protected_market_sell_stops_at_its_protection() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Bid, 100, 2));
+        place(&mut book, order(2, Side::Bid, 94, 2));
+
+        let outcome = book.submit(protected_market(3, Side::Ask, 5, Some(95)));
+
+        assert_eq!(total_filled(&outcome.fills), 2);
+        assert_eq!(outcome.leftover, Leftover::Cancelled(lots(3)));
+        assert_eq!(book.best_bid(), Some(price(94)));
     }
 
     #[test]

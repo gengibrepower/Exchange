@@ -32,6 +32,7 @@ enum Op {
         account: usize,
         side: Side,
         price: Option<i64>,
+        protection: Option<i64>,
         lots: i64,
         tif: TimeInForce,
     },
@@ -49,11 +50,19 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(TimeInForce::Fok),
     ];
     let price = prop_oneof![4 => (95..=105_i64).prop_map(Some), 1 => Just(None)];
+    let protection = prop_oneof![Just(None), (95..=105_i64).prop_map(Some)];
     prop_oneof![
         2 => (0..2_usize, prop_oneof![Just(TESTE), Just(BRL)], 0..=600_i64)
             .prop_map(|(account, asset, value)| Op::Deposit(account, asset, value)),
-        6 => (0..2_usize, side, price, 1..=10_i64, tif).prop_map(
-            |(account, side, price, lots, tif)| Op::Submit { account, side, price, lots, tif }
+        6 => (0..2_usize, side, price, protection, 1..=10_i64, tif).prop_map(
+            |(account, side, price, protection, lots, tif)| Op::Submit {
+                account,
+                side,
+                price,
+                protection,
+                lots,
+                tif,
+            }
         ),
         2 => (0..2_usize, any::<prop::sample::Index>())
             .prop_map(|(account, target)| Op::Cancel { account, target }),
@@ -71,6 +80,7 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
             account,
             side,
             price,
+            protection,
             lots,
             tif,
         } => {
@@ -78,12 +88,12 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
             *next_id += 1;
             let lots = Lots::new(*lots).expect("faixa positiva");
             let (order_id, account, seq) = (OrderId::new(id), ACCOUNTS[*account], Seq::new(id));
-            let order = match price {
-                Some(price) => {
-                    let price = Price::new(*price).expect("faixa positiva");
-                    Order::new(order_id, account, TESTE_BRL, *side, price, lots, seq)
-                }
-                None => Order::market(order_id, account, TESTE_BRL, *side, lots, seq),
+            let order = if let Some(price) = price {
+                let price = Price::new(*price).expect("faixa positiva");
+                Order::new(order_id, account, TESTE_BRL, *side, price, lots, seq)
+            } else {
+                let protection = protection.map(|bound| Price::new(bound).expect("faixa positiva"));
+                Order::market(order_id, account, TESTE_BRL, *side, lots, seq, protection)
             };
             Command::Submit(order.expect("ordem válida").with_time_in_force(*tif))
         }

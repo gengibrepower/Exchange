@@ -54,7 +54,9 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                     OrderKind::Limit(price) => {
                         Order::new(id, ACCOUNT, instrument, side, price, lots, seq)
                     }
-                    OrderKind::Market => Order::market(id, ACCOUNT, instrument, side, lots, seq),
+                    OrderKind::Market { protection } => {
+                        Order::market(id, ACCOUNT, instrument, side, lots, seq, protection)
+                    }
                 };
                 let order = match order {
                     Ok(order) => order.with_time_in_force(time_in_force),
@@ -351,6 +353,21 @@ mod tests {
             output,
             "#1 rejeitada: preço 10005 fora do tick 10\n\
              #2 descansou: 1 lots em TESTE/BRL\n"
+        );
+    }
+
+    #[test]
+    fn protected_market_buy_sweeps_only_within_protection() {
+        let output = session(
+            "sell TESTE/BRL 10000 2\nsell TESTE/BRL 10600 2\nbuy TESTE/BRL mkt 5 max 10500\n",
+        );
+
+        assert_eq!(
+            output,
+            "#1 descansou: 2 lots em TESTE/BRL\n\
+             #2 descansou: 2 lots em TESTE/BRL\n\
+             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000\n\
+             #3 cancelada: 3 lots em TESTE/BRL\n"
         );
     }
 
