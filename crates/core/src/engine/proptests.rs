@@ -2,16 +2,17 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use super::{Command, Engine};
+use super::{Command, Engine, FeeSchedule};
 use crate::domain::{
-    AccountId, Amount, AssetId, Instrument, InstrumentId, Lots, Order, OrderId, Price, Seq, Side,
-    TimeInForce,
+    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, Order, OrderId, Price, Seq,
+    Side, TimeInForce,
 };
 
 const TESTE_BRL: InstrumentId = InstrumentId::new(1);
 const TESTE: AssetId = AssetId::new(1);
 const BRL: AssetId = AssetId::new(2);
 const ACCOUNTS: [AccountId; 2] = [AccountId::new(1), AccountId::new(2)];
+const HOUSE: AccountId = AccountId::new(9);
 const ASSETS: [AssetId; 2] = [TESTE, BRL];
 
 fn spec() -> Instrument {
@@ -108,14 +109,16 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2_000))]
 
-    // Seção 3.5 pelo Engine inteiro: conservação de valor (soma de cada ativo = depósitos)
-    // e reserva consistente (reservado de cada conta = soma das reservas das suas ordens
+    // Seção 3.5 pelo Engine inteiro: conservação de valor (soma de cada ativo, contando a
+    // conta da casa, = depósitos) e reserva consistente (reservado de cada conta = soma das reservas das suas ordens
     // abertas; reserva existe exatamente para as ordens que estão no livro).
     #[test]
     fn value_is_conserved_and_reservations_are_consistent(
+        taker_bps in prop_oneof![Just(0_u32), Just(1), Just(10), Just(50), Just(9_999), Just(10_000)],
         ops in prop::collection::vec(op(), 1..=80)
     ) {
-        let mut engine = Engine::new([spec()]).expect("config válida");
+        let fees = FeeSchedule { house: HOUSE, taker_bps: Bps::new(taker_bps).expect("até 100%") };
+        let mut engine = Engine::new([spec()], fees).expect("config válida");
         let mut next_id = 1;
         for op in ops {
             engine.apply(command(&op, &mut next_id));
@@ -123,6 +126,7 @@ proptest! {
             for asset in ASSETS {
                 let total: i128 = ACCOUNTS
                     .iter()
+                    .chain([&HOUSE])
                     .map(|account| engine.balance(*account, asset))
                     .map(|b| i128::from(b.available.get()) + i128::from(b.reserved.get()))
                     .sum();

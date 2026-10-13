@@ -3,14 +3,16 @@ mod parse;
 use std::io::{self, BufRead, Write};
 
 use exchange_core::domain::{
-    AccountId, Amount, AssetId, Instrument, InstrumentId, Order, OrderId, OrderKind, Price, Seq,
+    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Order, OrderId, OrderKind, Price,
+    Seq,
 };
-use exchange_core::engine::{Command, Engine, Event, RejectReason};
+use exchange_core::engine::{Command, Engine, Event, FeeSchedule, RejectReason};
 
 use crate::parse::{Input, parse_line};
 
 const INSTRUMENTS: [(&str, InstrumentId); 1] = [("TESTE/BRL", InstrumentId::new(1))];
 const ACCOUNT: AccountId = AccountId::new(1);
+const HOUSE: AccountId = AccountId::new(0);
 const TESTE: AssetId = AssetId::new(1);
 const BRL: AssetId = AssetId::new(2);
 const ASSETS: [(&str, AssetId); 2] = [("TESTE", TESTE), ("BRL", BRL)];
@@ -30,7 +32,13 @@ fn main() -> io::Result<()> {
 }
 
 fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
-    let mut engine = Engine::new(instrument_specs()).expect("instrumentos fixos não se repetem");
+    // Taxa de taker de 10 bps (0,1%) para a casa: pequena, mas exercita o caminho (decisão 7).
+    let fees = FeeSchedule {
+        house: HOUSE,
+        taker_bps: Bps::new(10).expect("10 bps é menos que 100%"),
+    };
+    let mut engine =
+        Engine::new(instrument_specs(), fees).expect("instrumentos fixos não se repetem");
     let mut next_seq: u64 = 1;
 
     for line in input.lines() {
@@ -157,13 +165,18 @@ fn render(event: &Event) -> String {
             amount.get(),
             asset_name(*asset)
         ),
-        Event::Fill { instrument, fill } => format!(
-            "fill {}: taker #{}, maker #{}, {} lots @ {}",
+        Event::Fill {
+            instrument,
+            fill,
+            fee,
+        } => format!(
+            "fill {}: taker #{}, maker #{}, {} lots @ {}, taxa {}",
             symbol(*instrument),
             fill.taker.get(),
             fill.maker.get(),
             fill.lots.get(),
-            fill.price.get()
+            fill.price.get(),
+            fee.get()
         ),
         Event::Rested {
             instrument,
@@ -217,6 +230,7 @@ fn render(event: &Event) -> String {
                     required.get()
                 ),
                 RejectReason::DuplicateOrderId => "id de ordem já em uso".to_string(),
+                RejectReason::HouseCannotTrade => "a conta da casa não negocia".to_string(),
                 RejectReason::UnknownOrder => "ordem não está no livro".to_string(),
                 RejectReason::NotOwner => "ordem pertence a outra conta".to_string(),
             };
@@ -255,7 +269,7 @@ mod tests {
             "depósito: 50000 BRL\n\
              #1 descansou: 2 lots em TESTE/BRL\n\
              TESTE: disponível 0, reservado 0\n\
-             BRL: disponível 30000, reservado 20000\n"
+             BRL: disponível 29980, reservado 20020\n"
         );
     }
 
@@ -265,7 +279,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "#1 rejeitada: saldo insuficiente em BRL: disponível 0, necessário 10000\n\
+            "#1 rejeitada: saldo insuficiente em BRL: disponível 0, necessário 10010\n\
              erro: ativo desconhecido \"OURO\"\n"
         );
     }
@@ -277,7 +291,7 @@ mod tests {
         assert_eq!(
             output,
             "#1 descansou: 5 lots em TESTE/BRL\n\
-             fill TESTE/BRL: taker #2, maker #1, 5 lots @ 10000\n\
+             fill TESTE/BRL: taker #2, maker #1, 5 lots @ 10000, taxa 50\n\
              #2 descansou: 3 lots em TESTE/BRL\n"
         );
     }
@@ -306,7 +320,7 @@ mod tests {
         assert_eq!(
             output,
             "#1 descansou: 5 lots em TESTE/BRL\n\
-             fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000\n\
+             fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20\n\
              #1 cancelada: 3 lots em TESTE/BRL\n\
              #1 rejeitada: ordem não está no livro\n"
         );
@@ -321,7 +335,7 @@ mod tests {
         assert_eq!(
             output,
             "#1 descansou: 2 lots em TESTE/BRL\n\
-             fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000\n\
+             fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20\n\
              #2 cancelada: 3 lots em TESTE/BRL\n\
              #3 descansou: 2 lots em TESTE/BRL\n\
              #4 expirou: 5 lots em TESTE/BRL\n"
@@ -338,8 +352,8 @@ mod tests {
             output,
             "#1 descansou: 2 lots em TESTE/BRL\n\
              #2 descansou: 2 lots em TESTE/BRL\n\
-             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10500\n\
-             fill TESTE/BRL: taker #3, maker #2, 2 lots @ 10000\n\
+             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10500, taxa 21\n\
+             fill TESTE/BRL: taker #3, maker #2, 2 lots @ 10000, taxa 20\n\
              #3 cancelada: 1 lots em TESTE/BRL\n\
              #4 rejeitada: compra a mercado precisa de preço de proteção\n"
         );
@@ -366,7 +380,7 @@ mod tests {
             output,
             "#1 descansou: 2 lots em TESTE/BRL\n\
              #2 descansou: 2 lots em TESTE/BRL\n\
-             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000\n\
+             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000, taxa 20\n\
              #3 cancelada: 3 lots em TESTE/BRL\n"
         );
     }
