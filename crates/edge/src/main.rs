@@ -2,20 +2,34 @@ mod parse;
 
 use std::io::{self, BufRead, Write};
 
-use exchange_core::domain::{AccountId, InstrumentId, Order, OrderId, OrderKind, Seq};
+use exchange_core::domain::{
+    AccountId, Amount, AssetId, Instrument, InstrumentId, Order, OrderId, OrderKind, Price, Seq,
+};
 use exchange_core::engine::{Command, Engine, Event, RejectReason};
 
 use crate::parse::{Input, parse_line};
 
 const INSTRUMENTS: [(&str, InstrumentId); 1] = [("TESTE/BRL", InstrumentId::new(1))];
 const ACCOUNT: AccountId = AccountId::new(1);
+const TESTE: AssetId = AssetId::new(1);
+const BRL: AssetId = AssetId::new(2);
+
+// TESTE/BRL: preço em centavos por lot, tick de 10 centavos, 1 lot = 100 unidades de TESTE.
+fn instrument_specs() -> [Instrument; 1] {
+    let tick = Price::new(10).expect("tick fixo é positivo");
+    let lot_size = Amount::new(100).expect("lot fixo é positivo");
+    [
+        Instrument::new(INSTRUMENTS[0].1, TESTE, BRL, tick, lot_size)
+            .expect("especificação fixa é válida"),
+    ]
+}
 
 fn main() -> io::Result<()> {
     run(io::stdin().lock(), &mut io::stdout().lock())
 }
 
 fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
-    let mut engine = Engine::new(INSTRUMENTS.map(|(_, instrument)| instrument));
+    let mut engine = Engine::new(instrument_specs()).expect("instrumentos fixos não se repetem");
     let mut next_seq: u64 = 1;
 
     for line in input.lines() {
@@ -134,6 +148,9 @@ fn render(event: &Event) -> String {
             let reason = match reason {
                 RejectReason::UnknownInstrument(_) => "instrumento desconhecido".to_string(),
                 RejectReason::NotNew(status) => format!("ordem já estava em {status:?}"),
+                RejectReason::OffTick { price, tick } => {
+                    format!("preço {} fora do tick {}", price.get(), tick.get())
+                }
                 RejectReason::DuplicateOrderId => "id de ordem já em uso".to_string(),
                 RejectReason::UnknownOrder => "ordem não está no livro".to_string(),
                 RejectReason::NotOwner => "ordem pertence a outra conta".to_string(),
@@ -223,6 +240,17 @@ mod tests {
              fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000\n\
              fill TESTE/BRL: taker #3, maker #2, 2 lots @ 10500\n\
              #3 cancelada: 1 lots em TESTE/BRL\n"
+        );
+    }
+
+    #[test]
+    fn off_tick_price_is_rejected_by_the_core_and_consumes_seq() {
+        let output = session("buy TESTE/BRL 10005 1\nbuy TESTE/BRL 10010 1\n");
+
+        assert_eq!(
+            output,
+            "#1 rejeitada: preço 10005 fora do tick 10\n\
+             #2 descansou: 1 lots em TESTE/BRL\n"
         );
     }
 
