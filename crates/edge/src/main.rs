@@ -3,10 +3,12 @@ mod parse;
 use std::io::{self, BufRead, Write};
 
 use exchange_core::domain::{
-    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Order, OrderId, OrderKind, Price,
-    Seq,
+    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, Order, OrderId, OrderKind,
+    Price, Seq,
 };
-use exchange_core::engine::{Command, Engine, Event, FeeSchedule, RejectReason};
+use exchange_core::engine::{
+    Command, Engine, Event, FeeSchedule, ListingConfig, RejectReason, RiskLimits,
+};
 
 use crate::parse::{Input, parse_line};
 
@@ -18,13 +20,17 @@ const BRL: AssetId = AssetId::new(2);
 const ASSETS: [(&str, AssetId); 2] = [("TESTE", TESTE), ("BRL", BRL)];
 
 // TESTE/BRL: preço em centavos por lot, tick de 10 centavos, 1 lot = 100 unidades de TESTE.
-fn instrument_specs() -> [Instrument; 1] {
+// Risco: no máximo 1.000 lots por ordem e colar de 10% sobre o melhor preço oposto.
+fn listings() -> [ListingConfig; 1] {
     let tick = Price::new(10).expect("tick fixo é positivo");
     let lot_size = Amount::new(100).expect("lot fixo é positivo");
-    [
-        Instrument::new(INSTRUMENTS[0].1, TESTE, BRL, tick, lot_size)
-            .expect("especificação fixa é válida"),
-    ]
+    let instrument = Instrument::new(INSTRUMENTS[0].1, TESTE, BRL, tick, lot_size)
+        .expect("especificação fixa é válida");
+    let risk = RiskLimits {
+        max_lots: Lots::new(1_000).expect("limite fixo é válido"),
+        collar: Bps::new(1_000).expect("10% é menos que 100%"),
+    };
+    [ListingConfig { instrument, risk }]
 }
 
 fn main() -> io::Result<()> {
@@ -37,8 +43,7 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
         house: HOUSE,
         taker_bps: Bps::new(10).expect("10 bps é menos que 100%"),
     };
-    let mut engine =
-        Engine::new(instrument_specs(), fees).expect("instrumentos fixos não se repetem");
+    let mut engine = Engine::new(listings(), fees).expect("instrumentos fixos não se repetem");
     let mut next_seq: u64 = 1;
 
     for line in input.lines() {
@@ -215,8 +220,16 @@ fn render(event: &Event) -> String {
                 RejectReason::OffTick { price, tick } => {
                     format!("preço {} fora do tick {}", price.get(), tick.get())
                 }
-                RejectReason::MarketBuyNeedsProtection => {
-                    "compra a mercado precisa de preço de proteção".to_string()
+                RejectReason::OrderTooLarge { lots, max } => {
+                    format!("{} lots passa do máximo de {}", lots.get(), max.get())
+                }
+                RejectReason::OutsideCollar { bound, edge } => format!(
+                    "preço {} fora do colar (limite {})",
+                    bound.get(),
+                    edge.get()
+                ),
+                RejectReason::NoReferencePrice => {
+                    "ordem a mercado sem contraparte para servir de referência".to_string()
                 }
                 RejectReason::ValueOverflow => "valor da ordem estoura o limite".to_string(),
                 RejectReason::InsufficientFunds {
@@ -355,7 +368,7 @@ mod tests {
              fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10500, taxa 21\n\
              fill TESTE/BRL: taker #3, maker #2, 2 lots @ 10000, taxa 20\n\
              #3 cancelada: 1 lots em TESTE/BRL\n\
-             #4 rejeitada: compra a mercado precisa de preço de proteção\n"
+             #4 rejeitada: ordem a mercado sem contraparte para servir de referência\n"
         );
     }
 
@@ -382,6 +395,21 @@ mod tests {
              #2 descansou: 2 lots em TESTE/BRL\n\
              fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000, taxa 20\n\
              #3 cancelada: 3 lots em TESTE/BRL\n"
+        );
+    }
+
+    #[test]
+    fn fat_finger_and_oversized_orders_are_rejected_and_plain_market_buy_works() {
+        let output = session(
+            "sell TESTE/BRL 10000 2\nbuy TESTE/BRL 100000 1\nbuy TESTE/BRL 10000 1001\nbuy TESTE/BRL mkt 1\n",
+        );
+
+        assert_eq!(
+            output,
+            "#1 descansou: 2 lots em TESTE/BRL\n\
+             #2 rejeitada: preço 100000 fora do colar (limite 11000)\n\
+             #3 rejeitada: 1001 lots passa do máximo de 1000\n\
+             fill TESTE/BRL: taker #4, maker #1, 1 lots @ 10000, taxa 10\n"
         );
     }
 

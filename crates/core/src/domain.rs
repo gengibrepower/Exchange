@@ -456,6 +456,18 @@ impl Order {
         self
     }
 
+    /// Dá a uma ordem a mercado sem proteção a proteção implícita do colar de preço.
+    /// Qualquer outra ordem volta inalterada: só o núcleo decide isso, antes do livro.
+    #[must_use]
+    pub(crate) fn with_implicit_protection(mut self, bound: Price) -> Self {
+        if self.kind == (OrderKind::Market { protection: None }) {
+            self.kind = OrderKind::Market {
+                protection: Some(bound),
+            };
+        }
+        self
+    }
+
     pub fn id(&self) -> OrderId {
         self.id
     }

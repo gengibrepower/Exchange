@@ -70,7 +70,15 @@ pub enum RejectReason {
     },
     DuplicateOrderId,
     HouseCannotTrade,
-    MarketBuyNeedsProtection,
+    OrderTooLarge {
+        lots: Lots,
+        max: Lots,
+    },
+    OutsideCollar {
+        bound: Price,
+        edge: Price,
+    },
+    NoReferencePrice,
     ValueOverflow,
     InsufficientFunds {
         asset: AssetId,
@@ -88,6 +96,21 @@ pub struct FeeSchedule {
     pub taker_bps: Bps,
 }
 
+/// Política de risco pré-trade de um instrumento (seção 4.1). Separada do `Instrument`:
+/// um descreve o produto, a outra quanto se deixa negociar dele.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RiskLimits {
+    pub max_lots: Lots,
+    /// Largura do colar de preço em bps sobre o melhor preço do lado oposto.
+    pub collar: Bps,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ListingConfig {
+    pub instrument: Instrument,
+    pub risk: RiskLimits,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConfigError {
     DuplicateInstrument(InstrumentId),
@@ -95,6 +118,7 @@ pub enum ConfigError {
 
 struct Listing {
     instrument: Instrument,
+    risk: RiskLimits,
     book: OrderBook,
 }
 
@@ -140,14 +164,16 @@ impl Engine {
     /// # Errors
     /// [`ConfigError::DuplicateInstrument`] se o mesmo id aparecer duas vezes.
     pub fn new(
-        instruments: impl IntoIterator<Item = Instrument>,
+        listings: impl IntoIterator<Item = ListingConfig>,
         fees: FeeSchedule,
     ) -> Result<Self, ConfigError> {
+        let configs = listings;
         let mut listings = HashMap::new();
-        for instrument in instruments {
-            let id = instrument.id();
+        for config in configs {
+            let id = config.instrument.id();
             let listing = Listing {
-                instrument,
+                instrument: config.instrument,
+                risk: config.risk,
                 book: OrderBook::new(),
             };
             if listings.insert(id, listing).is_some() {
@@ -208,7 +234,7 @@ impl Engine {
     /// Nunca por entrada: a reserva cobre todo débito da liquidação e a oferta limitada
     /// do ledger impede estouro nos créditos. Se a liquidação falhar, o invariante
     /// quebrou e parar é o certo (fail-stop).
-    fn submit(&mut self, mut order: Order) -> Vec<Event> {
+    fn submit(&mut self, order: Order) -> Vec<Event> {
         let id = order.id();
         let instrument = order.instrument();
         let account = order.account();
@@ -234,6 +260,10 @@ impl Engine {
         if listing.book.contains(id) {
             return reject(RejectReason::DuplicateOrderId);
         }
+        let mut order = match pre_trade_risk(order, &listing.book, listing.risk) {
+            Ok(order) => order,
+            Err(reason) => return reject(reason),
+        };
         if order.transition(OrderStatus::Accepted).is_err() {
             return reject(RejectReason::NotNew(order.status()));
         }
@@ -288,30 +318,12 @@ impl Engine {
             });
         }
 
-        match outcome.leftover {
-            Leftover::None => {}
-            Leftover::Rested(lots) => events.push(Event::Rested {
-                instrument,
-                order: id,
-                lots,
-            }),
-            Leftover::Cancelled(lots) => {
-                release_rest(&mut self.ledger, &mut self.reservations, (instrument, id));
-                events.push(Event::Cancelled {
-                    instrument,
-                    order: id,
-                    lots,
-                });
-            }
-            Leftover::Expired(lots) => {
-                release_rest(&mut self.ledger, &mut self.reservations, (instrument, id));
-                events.push(Event::Expired {
-                    instrument,
-                    order: id,
-                    lots,
-                });
-            }
-        }
+        events.extend(close_leftover(
+            &mut self.ledger,
+            &mut self.reservations,
+            (instrument, id),
+            outcome.leftover,
+        ));
         events
     }
 
@@ -420,6 +432,55 @@ fn settle_fill(
     fee
 }
 
+/// Seção 4.1: tamanho máximo e colar de preço contra o melhor preço do lado oposto. Ordem
+/// a mercado sem proteção ganha a borda do colar como proteção implícita.
+fn pre_trade_risk(order: Order, book: &OrderBook, risk: RiskLimits) -> Result<Order, RejectReason> {
+    if order.total() > risk.max_lots {
+        return Err(RejectReason::OrderTooLarge {
+            lots: order.total(),
+            max: risk.max_lots,
+        });
+    }
+    let side = order.side();
+    let reference = match side {
+        Side::Bid => book.best_ask(),
+        Side::Ask => book.best_bid(),
+    };
+    match (order.price_bound(), reference) {
+        (Some(_), None) => Ok(order),
+        (None, None) => Err(RejectReason::NoReferencePrice),
+        (None, Some(reference)) => {
+            Ok(order.with_implicit_protection(collar_edge(side, reference, risk.collar)))
+        }
+        (Some(bound), Some(reference)) => {
+            let edge = collar_edge(side, reference, risk.collar);
+            let outside = match side {
+                Side::Bid => bound > edge,
+                Side::Ask => bound < edge,
+            };
+            if outside {
+                Err(RejectReason::OutsideCollar { bound, edge })
+            } else {
+                Ok(order)
+            }
+        }
+    }
+}
+
+/// Pior preço que o colar aceita para uma ordem agressiva do lado `side`, dado o melhor
+/// preço do lado oposto: `referência ± ⌈referência × colar / 10.000⌉` (mesma regra de
+/// arredondamento da taxa). Satura em `i64::MAX` na compra e em 1 na venda.
+fn collar_edge(side: Side, reference: Price, collar: Bps) -> Price {
+    let band = collar
+        .fee_on(Amount::new(reference.get()).expect("preço é positivo"))
+        .get();
+    let edge = match side {
+        Side::Bid => reference.get().saturating_add(band),
+        Side::Ask => (reference.get() - band).max(1),
+    };
+    Price::new(edge).expect("saturado em [1, i64::MAX]")
+}
+
 fn reservation_per_lot(
     order: &Order,
     instrument: &Instrument,
@@ -433,7 +494,7 @@ fn reservation_per_lot(
                 .map(|per_lot| (instrument.quote(), per_lot))
                 .ok_or(RejectReason::ValueOverflow)
         }
-        (Side::Bid, None) => Err(RejectReason::MarketBuyNeedsProtection),
+        (Side::Bid, None) => unreachable!("o risco pré-trade dá proteção a toda ordem a mercado"),
         (Side::Ask, _) => Ok((instrument.base(), instrument.lot_size())),
     }
 }
@@ -481,6 +542,41 @@ fn fill_settlement(
     }
 }
 
+/// O evento da sobra do taker e, quando ela não descansa, a devolução do que ainda
+/// estava reservado para ela.
+fn close_leftover(
+    ledger: &mut Ledger,
+    reservations: &mut Reservations,
+    key: (InstrumentId, OrderId),
+    leftover: Leftover,
+) -> Option<Event> {
+    let (instrument, order) = key;
+    match leftover {
+        Leftover::None => None,
+        Leftover::Rested(lots) => Some(Event::Rested {
+            instrument,
+            order,
+            lots,
+        }),
+        Leftover::Cancelled(lots) => {
+            release_rest(ledger, reservations, key);
+            Some(Event::Cancelled {
+                instrument,
+                order,
+                lots,
+            })
+        }
+        Leftover::Expired(lots) => {
+            release_rest(ledger, reservations, key);
+            Some(Event::Expired {
+                instrument,
+                order,
+                lots,
+            })
+        }
+    }
+}
+
 fn consume(reservations: &mut Reservations, key: (InstrumentId, OrderId), amount: Amount) {
     let reservation = reservations
         .get_mut(&key)
@@ -523,6 +619,21 @@ mod tests {
     const PLENTY: i64 = 1_000_000_000;
     const HOUSE: AccountId = AccountId::new(99);
 
+    fn limits(max_lots: i64, collar_bps: u32) -> RiskLimits {
+        RiskLimits {
+            max_lots: lots(max_lots),
+            collar: Bps::new(collar_bps).expect("bps de teste válido"),
+        }
+    }
+
+    // Colar de 100% e tamanho sem limite prático: para os testes que não são de risco.
+    fn wide(instrument: Instrument) -> ListingConfig {
+        ListingConfig {
+            instrument,
+            risk: limits(i64::MAX, 10_000),
+        }
+    }
+
     fn fees(taker_bps: u32) -> FeeSchedule {
         FeeSchedule {
             house: HOUSE,
@@ -562,7 +673,7 @@ mod tests {
     // matching não esbarrarem em reserva.
     fn engine_with(specs: &[Instrument]) -> Engine {
         let mut engine =
-            Engine::new(specs.iter().copied(), fees(0)).expect("ids de teste distintos");
+            Engine::new(specs.iter().copied().map(wide), fees(0)).expect("ids de teste distintos");
         for spec in specs {
             for asset in [spec.base(), spec.quote()] {
                 for account in [ALICE, BOB] {
@@ -630,7 +741,7 @@ mod tests {
     }
 
     fn lean_engine_with_fee(taker_bps: u32) -> Engine {
-        let mut engine = Engine::new([spec_with_lot(TESTE_BRL, 1, 100)], fees(taker_bps))
+        let mut engine = Engine::new([wide(spec_with_lot(TESTE_BRL, 1, 100))], fees(taker_bps))
             .expect("config válida");
         deposit(&mut engine, ALICE, BRL, 1_000);
         deposit(&mut engine, BOB, TESTE, 1_000);
@@ -720,7 +831,7 @@ mod tests {
 
     #[test]
     fn deposit_credits_available() {
-        let mut engine = Engine::new([spec(TESTE_BRL, 1)], fees(0)).expect("config válida");
+        let mut engine = Engine::new([wide(spec(TESTE_BRL, 1))], fees(0)).expect("config válida");
 
         let events = engine.apply(Command::Deposit {
             account: ALICE,
@@ -741,7 +852,7 @@ mod tests {
 
     #[test]
     fn deposit_beyond_supply_is_rejected() {
-        let mut engine = Engine::new([spec(TESTE_BRL, 1)], fees(0)).expect("config válida");
+        let mut engine = Engine::new([wide(spec(TESTE_BRL, 1))], fees(0)).expect("config válida");
         deposit(&mut engine, ALICE, BRL, i64::MAX);
 
         let events = engine.apply(Command::Deposit {
@@ -861,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn market_buy_needs_protection() {
+    fn market_order_without_reference_price_is_rejected() {
         let mut engine = lean_engine();
 
         let events = submit(&mut engine, market_for(ALICE, 1, Side::Bid, 1));
@@ -870,10 +981,157 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
-                reason: RejectReason::MarketBuyNeedsProtection,
+                reason: RejectReason::NoReferencePrice,
             }]
         );
         assert_eq!(engine.balance(ALICE, BRL), balance(1_000, 0));
+    }
+
+    fn price(value: i64) -> Price {
+        Price::new(value).expect("preço de teste válido")
+    }
+
+    fn bps(value: u32) -> Bps {
+        Bps::new(value).expect("bps de teste válido")
+    }
+
+    #[test]
+    fn collar_edge_is_reference_plus_or_minus_the_band() {
+        assert_eq!(collar_edge(Side::Bid, price(100), bps(1_000)), price(110));
+        assert_eq!(collar_edge(Side::Ask, price(100), bps(1_000)), price(90));
+    }
+
+    #[test]
+    fn collar_band_rounds_up_like_the_fee() {
+        assert_eq!(collar_edge(Side::Bid, price(101), bps(1_000)), price(112));
+        assert_eq!(collar_edge(Side::Ask, price(101), bps(1_000)), price(90));
+    }
+
+    #[test]
+    fn zero_collar_edge_is_the_reference_itself() {
+        assert_eq!(collar_edge(Side::Bid, price(100), bps(0)), price(100));
+        assert_eq!(collar_edge(Side::Ask, price(100), bps(0)), price(100));
+    }
+
+    #[test]
+    fn collar_edge_saturates_instead_of_overflowing_or_hitting_zero() {
+        assert_eq!(
+            collar_edge(Side::Bid, price(i64::MAX), bps(1)),
+            price(i64::MAX)
+        );
+        assert_eq!(collar_edge(Side::Ask, price(5), bps(10_000)), price(1));
+    }
+
+    // Instrumento com lot 100, colar de 10% e no máximo 5 lots por ordem.
+    fn guarded_engine() -> Engine {
+        let config = ListingConfig {
+            instrument: spec_with_lot(TESTE_BRL, 1, 100),
+            risk: limits(5, 1_000),
+        };
+        let mut engine = Engine::new([config], fees(0)).expect("config válida");
+        deposit(&mut engine, ALICE, BRL, PLENTY);
+        deposit(&mut engine, BOB, TESTE, PLENTY);
+        engine
+    }
+
+    #[test]
+    fn order_larger_than_the_limit_is_rejected_before_reserving() {
+        let mut engine = guarded_engine();
+
+        let events = submit(&mut engine, order_for(ALICE, 1, Side::Bid, 100, 6));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::OrderTooLarge {
+                    lots: lots(6),
+                    max: lots(5),
+                },
+            }]
+        );
+        assert_eq!(engine.balance(ALICE, BRL), balance(PLENTY, 0));
+    }
+
+    #[test]
+    fn fat_finger_buy_above_the_collar_is_rejected() {
+        let mut engine = guarded_engine();
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 5));
+
+        let events = submit(&mut engine, order_for(ALICE, 2, Side::Bid, 1_000, 1));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(2),
+                reason: RejectReason::OutsideCollar {
+                    bound: price(1_000),
+                    edge: price(110),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn fat_finger_sell_below_the_collar_is_rejected() {
+        let mut engine = guarded_engine();
+        submit(&mut engine, order_for(ALICE, 1, Side::Bid, 100, 5));
+
+        let events = submit(&mut engine, order_for(BOB, 2, Side::Ask, 10, 1));
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Rejected {
+                reason: RejectReason::OutsideCollar { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn passive_order_far_from_the_market_is_fine() {
+        let mut engine = guarded_engine();
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 5));
+
+        let events = submit(&mut engine, order_for(ALICE, 2, Side::Bid, 1, 1));
+
+        assert!(matches!(events.as_slice(), [Event::Rested { .. }]));
+    }
+
+    #[test]
+    fn explicit_protection_outside_the_collar_is_rejected() {
+        let mut engine = guarded_engine();
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 5));
+
+        let events = submit(
+            &mut engine,
+            protected_for(ALICE, 2, Side::Bid, 1, Some(500)),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Rejected {
+                reason: RejectReason::OutsideCollar { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn plain_market_buy_gets_the_collar_as_protection_and_stops_there() {
+        let mut engine = guarded_engine();
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 2));
+        submit(&mut engine, order_for(BOB, 2, Side::Ask, 200, 2));
+
+        let events = submit(&mut engine, market_for(ALICE, 3, Side::Bid, 4));
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Fill { .. }, Event::Cancelled { lots: remainder, .. }] if *remainder == lots(2)
+        ));
+        let book = engine.book(TESTE_BRL).expect("instrumento registrado");
+        assert_eq!(book.best_ask(), Some(price(200)));
+        assert_eq!(engine.balance(ALICE, BRL).reserved, Amount::ZERO);
     }
 
     #[test]
@@ -927,7 +1185,10 @@ mod tests {
 
     #[test]
     fn duplicate_instrument_is_a_config_error() {
-        let result = Engine::new([spec(TESTE_BRL, 1), spec(TESTE_BRL, 5)], fees(0));
+        let result = Engine::new(
+            [wide(spec(TESTE_BRL, 1)), wide(spec(TESTE_BRL, 5))],
+            fees(0),
+        );
 
         assert_eq!(
             result.err(),
