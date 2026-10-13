@@ -1,5 +1,6 @@
 use proptest::prelude::*;
 
+use super::reference::ReferenceBook;
 use super::tests::{market_order, order};
 use super::{Leftover, OrderBook};
 use crate::domain::{AccountId, Lots, Order, OrderId, OrderStatus, Side, TimeInForce};
@@ -88,6 +89,45 @@ fn op_flow() -> impl Strategy<Value = Vec<Op>> {
     })
 }
 
+// Fluxo completo para o oráculo: limite e mercado, GTC/IOC/FOK, e cancelamentos que
+// às vezes acertam ordem descansando, às vezes ordem já executada ou cancelada.
+fn mixed_op_flow() -> impl Strategy<Value = Vec<Op>> {
+    let spec = (
+        prop_oneof![4 => Just(false), 1 => Just(true)],
+        side(),
+        95..=105_i64,
+        1..=10_i64,
+        time_in_force(),
+        is_market(),
+        any::<prop::sample::Index>(),
+    );
+    prop::collection::vec(spec, 1..=80).prop_map(|specs| {
+        let mut next_id = 1;
+        specs
+            .into_iter()
+            .map(|(is_cancel, side, price, lots, tif, is_market, target)| {
+                if is_cancel && next_id > 1 {
+                    return Op::Cancel(OrderId::new(1 + target.index(next_id - 1) as u64));
+                }
+                let id = next_id as u64;
+                next_id += 1;
+                let order = if is_market {
+                    market_order(id, side, lots)
+                } else {
+                    order(id, side, price, lots)
+                };
+                Op::Submit(order.with_time_in_force(tif))
+            })
+            .collect()
+    })
+}
+
+fn sorted_state(orders: impl Iterator<Item = (OrderId, Lots)>) -> Vec<(u64, i64)> {
+    let mut state: Vec<_> = orders.map(|(id, lots)| (id.get(), lots.get())).collect();
+    state.sort_unstable();
+    state
+}
+
 fn index_mirrors_book(book: &OrderBook) -> Result<(), TestCaseError> {
     let mut resting = 0;
     for (side, levels) in [(Side::Bid, &book.bids), (Side::Ask, &book.asks)] {
@@ -103,6 +143,8 @@ fn index_mirrors_book(book: &OrderBook) -> Result<(), TestCaseError> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
     #[test]
     fn book_is_never_crossed(orders in order_flow()) {
         let mut book = OrderBook::new();
@@ -219,6 +261,59 @@ proptest! {
                 available,
                 total
             );
+        }
+    }
+
+    #[test]
+    fn matches_reference_model(ops in mixed_op_flow()) {
+        let mut book = OrderBook::new();
+        let mut reference = ReferenceBook::default();
+        for op in ops {
+            match op {
+                Op::Submit(order) => {
+                    let expected = reference.submit(order.clone());
+                    let actual = book.submit(order);
+                    prop_assert_eq!(actual, expected);
+                }
+                Op::Cancel(id) => {
+                    let expected = reference.cancel(id, AccountId::new(1)).map(|o| o.remaining());
+                    let actual = book.cancel(id, AccountId::new(1)).map(|o| o.remaining());
+                    prop_assert_eq!(actual, expected);
+                }
+            }
+            prop_assert_eq!(
+                sorted_state(book_state(&book).into_iter()),
+                sorted_state(reference.resting().iter().map(|o| (o.id(), o.remaining())))
+            );
+        }
+    }
+
+    // Seção 3.5, "prioridade respeitada", dita com as palavras dela: nos fills de um
+    // taker o preço nunca piora e, no mesmo preço, os makers saem por ordem de chegada.
+    // Nos geradores o Seq de cada ordem é igual ao seu id, então comparar ids basta.
+    #[test]
+    fn fills_respect_price_time_priority(orders in order_flow()) {
+        let mut book = OrderBook::new();
+        for order in orders {
+            let side = order.side();
+            let outcome = book.submit(order);
+            for pair in outcome.fills.windows(2) {
+                let (earlier, later) = (&pair[0], &pair[1]);
+                let price_never_worsens = match side {
+                    Side::Bid => earlier.price <= later.price,
+                    Side::Ask => earlier.price >= later.price,
+                };
+                prop_assert!(price_never_worsens, "preço piorou: {earlier:?} depois {later:?}");
+                if earlier.price == later.price {
+                    prop_assert!(
+                        earlier.maker.get() < later.maker.get(),
+                        "FIFO furado no preço {:?}: {:?} antes de {:?}",
+                        earlier.price,
+                        earlier.maker,
+                        later.maker
+                    );
+                }
+            }
         }
     }
 
