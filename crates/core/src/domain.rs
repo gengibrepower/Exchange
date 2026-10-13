@@ -158,7 +158,7 @@ impl AssetId {
 }
 
 /// Quantia de um ativo em unidades-mínimas (centavos de BRL, unidades de TESTE...).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Amount(i64);
 
 impl Amount {
@@ -176,6 +176,17 @@ impl Amount {
 
     pub fn get(self) -> i64 {
         self.0
+    }
+
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.0.checked_add(rhs.0).map(Self)
+    }
+
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        match self.0.checked_sub(rhs.0) {
+            Some(n) if n >= 0 => Some(Self(n)),
+            _ => None,
+        }
     }
 }
 
@@ -665,6 +676,17 @@ mod tests {
             Price::new(tick).unwrap(),
             Amount::new(lot_size).unwrap(),
         )
+    }
+
+    #[test]
+    fn amount_checked_arithmetic_refuses_overflow_and_negatives() {
+        let ten = Amount::new(10).unwrap();
+        let max = Amount::new(i64::MAX).unwrap();
+
+        assert_eq!(ten.checked_add(ten), Amount::new(20).ok());
+        assert_eq!(max.checked_add(ten), None);
+        assert_eq!(ten.checked_sub(ten), Some(Amount::ZERO));
+        assert_eq!(ten.checked_sub(Amount::new(11).unwrap()), None);
     }
 
     #[test]
