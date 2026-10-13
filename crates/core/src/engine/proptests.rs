@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use super::{Command, Engine, FeeSchedule};
+use super::{Command, Engine, Event, FeeSchedule, ListingConfig, RiskLimits};
 use crate::domain::{
     AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, Order, OrderId, Price, Seq,
     Side, TimeInForce,
@@ -106,22 +106,61 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
     }
 }
 
+// Borda do colar recalculada aqui, em i128 e sem a função do engine, para o teste não
+// confirmar a si mesmo.
+fn collar_edge_reference(reference: Price, collar_bps: u32, direction: i128) -> i128 {
+    let reference = i128::from(reference.get());
+    let band = (reference * i128::from(collar_bps) + 9_999) / 10_000;
+    (reference + direction * band).clamp(1, i128::from(i64::MAX))
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2_000))]
 
     // Seção 3.5 pelo Engine inteiro: conservação de valor (soma de cada ativo, contando a
-    // conta da casa, = depósitos) e reserva consistente (reservado de cada conta = soma das reservas das suas ordens
-    // abertas; reserva existe exatamente para as ordens que estão no livro).
+    // conta da casa, = depósitos) e reserva consistente (reservado de cada conta = soma
+    // das reservas das suas ordens abertas; reserva existe exatamente para as ordens que
+    // estão no livro). E seção 4.1: nenhum fill sai do colar medido antes da ordem.
     #[test]
     fn value_is_conserved_and_reservations_are_consistent(
         taker_bps in prop_oneof![Just(0_u32), Just(1), Just(10), Just(50), Just(9_999), Just(10_000)],
+        collar_bps in prop_oneof![Just(0_u32), Just(500), Just(1_000), Just(10_000)],
+        max_lots in prop_oneof![Just(3_i64), Just(10)],
         ops in prop::collection::vec(op(), 1..=80)
     ) {
         let fees = FeeSchedule { house: HOUSE, taker_bps: Bps::new(taker_bps).expect("até 100%") };
-        let mut engine = Engine::new([spec()], fees).expect("config válida");
+        let risk = RiskLimits {
+            max_lots: Lots::new(max_lots).expect("positivo"),
+            collar: Bps::new(collar_bps).expect("até 100%"),
+        };
+        let listing = ListingConfig { instrument: spec(), risk };
+        let mut engine = Engine::new([listing], fees).expect("config válida");
         let mut next_id = 1;
         for op in ops {
-            engine.apply(command(&op, &mut next_id));
+            let book = engine.book(TESTE_BRL).expect("instrumento registrado");
+            let edge = match &op {
+                Op::Submit { side: Side::Bid, .. } => book
+                    .best_ask()
+                    .map(|reference| (Side::Bid, collar_edge_reference(reference, collar_bps, 1))),
+                Op::Submit { side: Side::Ask, .. } => book
+                    .best_bid()
+                    .map(|reference| (Side::Ask, collar_edge_reference(reference, collar_bps, -1))),
+                _ => None,
+            };
+
+            let events = engine.apply(command(&op, &mut next_id));
+
+            if let Some((side, edge)) = edge {
+                for event in &events {
+                    if let Event::Fill { fill, .. } = event {
+                        let inside = match side {
+                            Side::Bid => i128::from(fill.price.get()) <= edge,
+                            Side::Ask => i128::from(fill.price.get()) >= edge,
+                        };
+                        prop_assert!(inside, "fill {:?} fora do colar {} depois de {:?}", fill, edge, op);
+                    }
+                }
+            }
 
             for asset in ASSETS {
                 let total: i128 = ACCOUNTS
