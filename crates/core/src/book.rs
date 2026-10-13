@@ -224,6 +224,9 @@ impl OrderBook {
 mod proptests;
 
 #[cfg(test)]
+mod reference;
+
+#[cfg(test)]
 mod tests {
     use std::vec;
 
