@@ -59,6 +59,11 @@ impl Price {
         }
     }
 
+    /// Valor de `lots` a este preço, em unidades-mínimas da quote: `preço × lots`.
+    pub fn times(self, lots: Lots) -> Option<Amount> {
+        self.0.checked_mul(lots.0).map(Amount)
+    }
+
     pub fn get(self) -> i64 {
         self.0
     }
@@ -180,6 +185,11 @@ impl Amount {
 
     pub fn checked_add(self, rhs: Self) -> Option<Self> {
         self.0.checked_add(rhs.0).map(Self)
+    }
+
+    /// `self × lots`; usado com o `lot_size` para converter lots em unidades da base.
+    pub fn times(self, lots: Lots) -> Option<Self> {
+        self.0.checked_mul(lots.0).map(Self)
     }
 
     pub fn checked_sub(self, rhs: Self) -> Option<Self> {
@@ -687,6 +697,16 @@ mod tests {
         assert_eq!(max.checked_add(ten), None);
         assert_eq!(ten.checked_sub(ten), Some(Amount::ZERO));
         assert_eq!(ten.checked_sub(Amount::new(11).unwrap()), None);
+    }
+
+    #[test]
+    fn multiplications_by_lots_refuse_overflow() {
+        let lots = Lots::new(3).unwrap();
+
+        assert_eq!(Price::new(100).unwrap().times(lots), Amount::new(300).ok());
+        assert_eq!(Amount::new(7).unwrap().times(lots), Amount::new(21).ok());
+        assert_eq!(Price::new(i64::MAX).unwrap().times(lots), None);
+        assert_eq!(Amount::new(i64::MAX).unwrap().times(lots), None);
     }
 
     #[test]

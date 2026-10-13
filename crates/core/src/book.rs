@@ -49,6 +49,11 @@ impl OrderBook {
         self.index.contains_key(&id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn resting_ids(&self) -> impl Iterator<Item = OrderId> + '_ {
+        self.index.keys().copied()
+    }
+
     /// Espera um taker já aceito; o [`crate::engine::Engine`] aceita antes de chamar.
     /// A sobra segue o time-in-force: GTC limite descansa; IOC e qualquer ordem a mercado
     /// cancelam a sobra; FOK sem liquidez para tudo expira sem tocar no livro.
