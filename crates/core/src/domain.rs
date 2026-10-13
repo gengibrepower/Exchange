@@ -3,6 +3,7 @@ pub enum DomainError {
     NonPositivePrice(i64),
     NegativeLots(i64),
     NegativeAmount(i64),
+    BpsAboveFull(u32),
     SameAsset(AssetId),
     NonPositiveLotSize,
     EmptyOrder,
@@ -17,6 +18,9 @@ impl std::fmt::Display for DomainError {
             Self::NonPositivePrice(value) => write!(f, "preço {value} deve ser positivo"),
             Self::NegativeLots(value) => write!(f, "lots {value} não pode ser negativo"),
             Self::NegativeAmount(value) => write!(f, "quantia {value} não pode ser negativa"),
+            Self::BpsAboveFull(value) => {
+                write!(f, "{value} bps passa de 100% (máximo {})", Bps::FULL)
+            }
             Self::SameAsset(asset) => {
                 write!(
                     f,
@@ -197,6 +201,39 @@ impl Amount {
             Some(n) if n >= 0 => Some(Self(n)),
             _ => None,
         }
+    }
+}
+
+/// Basis points: 1 bp = 0,01%. De 0 a 10.000 (100%).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Bps(u32);
+
+impl Bps {
+    pub const FULL: u32 = 10_000;
+
+    /// # Errors
+    /// [`DomainError::BpsAboveFull`] se `value` passar de 10.000.
+    pub fn new(value: u32) -> Result<Self, DomainError> {
+        if value > Self::FULL {
+            Err(DomainError::BpsAboveFull(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    /// `⌈value × bps / 10.000⌉`: a regra de arredondamento do dinheiro do sistema,
+    /// para cima, a favor da casa. Nunca passa de `value`.
+    ///
+    /// # Panics
+    /// Nunca: com `bps <= 10.000` a taxa não passa de `value`, que cabe em `i64`.
+    pub fn fee_on(self, value: Amount) -> Amount {
+        let full = i128::from(Self::FULL);
+        let fee = (i128::from(value.get()) * i128::from(self.0) + full - 1) / full;
+        Amount(i64::try_from(fee).expect("com bps <= 100% a taxa não passa do valor, que é i64"))
     }
 }
 
@@ -782,6 +819,54 @@ mod tests {
         assert_eq!(Amount::new(7).unwrap().times(lots), Amount::new(21).ok());
         assert_eq!(Price::new(i64::MAX).unwrap().times(lots), None);
         assert_eq!(Amount::new(i64::MAX).unwrap().times(lots), None);
+    }
+
+    fn bps(value: u32) -> Bps {
+        Bps::new(value).unwrap()
+    }
+
+    #[test]
+    fn bps_rejects_more_than_full() {
+        assert_eq!(Bps::new(10_001), Err(DomainError::BpsAboveFull(10_001)));
+        assert_eq!(Bps::new(10_000).map(Bps::get), Ok(10_000));
+    }
+
+    #[test]
+    fn fee_is_exact_when_it_divides() {
+        assert_eq!(
+            bps(50).fee_on(Amount::new(200).unwrap()),
+            Amount::new(1).unwrap()
+        );
+        assert_eq!(
+            bps(100).fee_on(Amount::new(10_000).unwrap()),
+            Amount::new(100).unwrap()
+        );
+    }
+
+    #[test]
+    fn fee_rounds_up_any_fraction() {
+        assert_eq!(
+            bps(10).fee_on(Amount::new(1).unwrap()),
+            Amount::new(1).unwrap()
+        );
+        assert_eq!(
+            bps(50).fee_on(Amount::new(201).unwrap()),
+            Amount::new(2).unwrap()
+        );
+    }
+
+    #[test]
+    fn fee_is_zero_only_for_zero_rate_or_zero_value() {
+        assert_eq!(bps(0).fee_on(Amount::new(1_000).unwrap()), Amount::ZERO);
+        assert_eq!(bps(50).fee_on(Amount::ZERO), Amount::ZERO);
+    }
+
+    #[test]
+    fn full_rate_fee_is_the_whole_value_even_at_the_limit() {
+        let max = Amount::new(i64::MAX).unwrap();
+
+        assert_eq!(bps(10_000).fee_on(max), max);
+        assert!(bps(9_999).fee_on(max) <= max);
     }
 
     #[test]

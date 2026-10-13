@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::book::{CancelError, Leftover, OrderBook};
 use crate::domain::{
-    AccountId, Amount, AssetId, Fill, Instrument, InstrumentId, Lots, Order, OrderId, OrderStatus,
-    Price, Side,
+    AccountId, Amount, AssetId, Bps, Fill, Instrument, InstrumentId, Lots, Order, OrderId,
+    OrderStatus, Price, Side,
 };
 use crate::ledger::{Balance, Ledger, LedgerError, Transfer};
 
@@ -37,6 +37,7 @@ pub enum Event {
     Fill {
         instrument: InstrumentId,
         fill: Fill,
+        fee: Amount,
     },
     Rested {
         instrument: InstrumentId,
@@ -68,6 +69,7 @@ pub enum RejectReason {
         tick: Price,
     },
     DuplicateOrderId,
+    HouseCannotTrade,
     MarketBuyNeedsProtection,
     ValueOverflow,
     InsufficientFunds {
@@ -77,6 +79,13 @@ pub enum RejectReason {
     },
     UnknownOrder,
     NotOwner,
+}
+
+/// Taxa de taker em bps para a conta da casa; maker isento (decisão 7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FeeSchedule {
+    pub house: AccountId,
+    pub taker_bps: Bps,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,31 +100,49 @@ struct Listing {
 
 /// O que uma ordem aberta ainda trava no ledger. Soma, por conta e ativo, igual ao
 /// `reserved` do ledger — é a invariante "reserva consistente" da seção 3.5.
+///
+/// `per_lot` é quanto cada lot da ordem travou: `lot_size` de base para o vendedor;
+/// `limite + taxa de 1 lot` de quote para o comprador. Cada fill consome `lots × per_lot`
+/// e o que não foi gasto (melhoria de preço, taxa que o maker não paga) volta.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Reservation {
     account: AccountId,
     asset: AssetId,
     amount: Amount,
+    per_lot: Amount,
 }
 
-/// As duas pernas de um negócio: base do vendedor para o comprador, quote do comprador
-/// para o vendedor. Taxa entra como terceira perna na PR seguinte.
+/// As três pernas de um negócio (seção 4.2): base do vendedor para o comprador, quote
+/// do comprador para o vendedor e a taxa do comprador para a casa. Se o taker é o
+/// vendedor, a taxa sai do que ele recebe: `quote` vem descontada.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct FillSettlement {
     base: Transfer,
     quote: Transfer,
+    fee: Transfer,
+}
+
+#[derive(Clone, Copy)]
+struct Parties {
+    buyer: AccountId,
+    seller: AccountId,
+    house: AccountId,
 }
 
 pub struct Engine {
     listings: HashMap<InstrumentId, Listing>,
     ledger: Ledger,
     reservations: Reservations,
+    fees: FeeSchedule,
 }
 
 impl Engine {
     /// # Errors
     /// [`ConfigError::DuplicateInstrument`] se o mesmo id aparecer duas vezes.
-    pub fn new(instruments: impl IntoIterator<Item = Instrument>) -> Result<Self, ConfigError> {
+    pub fn new(
+        instruments: impl IntoIterator<Item = Instrument>,
+        fees: FeeSchedule,
+    ) -> Result<Self, ConfigError> {
         let mut listings = HashMap::new();
         for instrument in instruments {
             let id = instrument.id();
@@ -131,6 +158,7 @@ impl Engine {
             listings,
             ledger: Ledger::new(),
             reservations: HashMap::new(),
+            fees,
         })
     }
 
@@ -186,6 +214,10 @@ impl Engine {
         let account = order.account();
         let reject = |reason| vec![Event::Rejected { order: id, reason }];
 
+        if account == self.fees.house {
+            return reject(RejectReason::HouseCannotTrade);
+        }
+
         let Some(listing) = self.listings.get_mut(&instrument) else {
             return reject(RejectReason::UnknownInstrument(instrument));
         };
@@ -205,9 +237,12 @@ impl Engine {
         if order.transition(OrderStatus::Accepted).is_err() {
             return reject(RejectReason::NotNew(order.status()));
         }
-        let (asset, required) = match required_reservation(&order, &spec) {
+        let (asset, per_lot) = match reservation_per_lot(&order, &spec, self.fees.taker_bps) {
             Ok(reservation) => reservation,
             Err(reason) => return reject(reason),
+        };
+        let Some(required) = per_lot.times(order.remaining()) else {
+            return reject(RejectReason::ValueOverflow);
         };
         match self.ledger.reserve(account, asset, required) {
             Ok(()) => {}
@@ -226,29 +261,31 @@ impl Engine {
                 account,
                 asset,
                 amount: required,
+                per_lot,
             },
         );
 
-        let side = order.side();
-        let limit = order.price_bound();
-        let outcome = listing.book.submit(order);
-
         let taker = Taker {
             id,
-            account,
-            side,
-            limit,
+            side: order.side(),
         };
+        let outcome = listing.book.submit(order);
+
         let mut events = Vec::new();
         for fill in outcome.fills {
-            settle_fill(
+            let fee = settle_fill(
                 &mut self.ledger,
                 &mut self.reservations,
                 &spec,
+                self.fees,
                 taker,
                 &fill,
             );
-            events.push(Event::Fill { instrument, fill });
+            events.push(Event::Fill {
+                instrument,
+                fill,
+                fee,
+            });
         }
 
         match outcome.leftover {
@@ -321,102 +358,125 @@ type Reservations = HashMap<(InstrumentId, OrderId), Reservation>;
 #[derive(Clone, Copy)]
 struct Taker {
     id: OrderId,
-    account: AccountId,
     side: Side,
-    limit: Option<Price>,
 }
 
-/// Liquida um fill: as duas pernas no ledger, o abatimento das reservas de comprador e
-/// vendedor e, para comprador taker com limite, a devolução da melhoria de preço.
+/// Liquida um fill: as três pernas no ledger; abate `lots × per_lot` da reserva de
+/// comprador e vendedor; devolve ao comprador o que a reserva cobria e ele não gastou.
+/// Devolve a taxa cobrada.
 fn settle_fill(
     ledger: &mut Ledger,
     reservations: &mut Reservations,
     spec: &Instrument,
+    fees: FeeSchedule,
     taker: Taker,
     fill: &Fill,
-) {
+) -> Amount {
     let instrument = spec.id();
-    let maker_account = reservations[&(instrument, fill.maker)].account;
-    let (buyer, buyer_order, seller, seller_order) = match taker.side {
-        Side::Bid => (taker.account, taker.id, maker_account, fill.maker),
-        Side::Ask => (maker_account, fill.maker, taker.account, taker.id),
+    let (buyer_order, seller_order) = match taker.side {
+        Side::Bid => (taker.id, fill.maker),
+        Side::Ask => (fill.maker, taker.id),
     };
-    let settlement = fill_settlement(spec, fill, buyer, seller);
+    let buyer = reservations[&(instrument, buyer_order)];
+    let seller = reservations[&(instrument, seller_order)];
+    let parties = Parties {
+        buyer: buyer.account,
+        seller: seller.account,
+        house: fees.house,
+    };
+    let value = fill
+        .price
+        .times(fill.lots)
+        .expect("não passa da reserva do comprador, calculada sem estourar");
+    let fee = fees.taker_bps.fee_on(value);
+    let settlement = fill_settlement(spec, fill, parties, fee, taker.side);
     ledger
-        .settle(&[settlement.base, settlement.quote])
-        .expect("reserva cobre o débito e oferta limitada impede estouro");
-    consume(
-        reservations,
-        (instrument, buyer_order),
-        settlement.quote.amount,
-    );
+        .settle(&[settlement.base, settlement.quote, settlement.fee])
+        .expect("reserva cobre os débitos e oferta limitada impede estouro");
+
+    let buyer_consumed = buyer
+        .per_lot
+        .times(fill.lots)
+        .expect("parte da reserva do comprador, calculada sem estourar");
+    let buyer_paid = settlement
+        .quote
+        .amount
+        .checked_add(settlement.fee.amount)
+        .expect("não passa do consumido");
+    let refund = buyer_consumed
+        .checked_sub(buyer_paid)
+        .expect("limite + taxa por lot cobre valor e taxa de qualquer fill");
+    if refund > Amount::ZERO {
+        ledger
+            .release(buyer.account, spec.quote(), refund)
+            .expect("a sobra estava reservada");
+    }
+    consume(reservations, (instrument, buyer_order), buyer_consumed);
     consume(
         reservations,
         (instrument, seller_order),
         settlement.base.amount,
     );
-
-    if taker.side == Side::Bid
-        && let Some(limit) = taker.limit
-    {
-        let reserved = limit.times(fill.lots).expect("cabia na reserva");
-        let improvement = reserved
-            .checked_sub(settlement.quote.amount)
-            .expect("maker cruzou, então não é mais caro que o limite");
-        if improvement > Amount::ZERO {
-            ledger
-                .release(taker.account, spec.quote(), improvement)
-                .expect("melhoria de preço estava reservada");
-            consume(reservations, (instrument, taker.id), improvement);
-        }
-    }
+    fee
 }
 
-fn required_reservation(
+fn reservation_per_lot(
     order: &Order,
     instrument: &Instrument,
+    taker_bps: Bps,
 ) -> Result<(AssetId, Amount), RejectReason> {
     match (order.side(), order.price_bound()) {
-        (Side::Bid, Some(bound)) => bound
-            .times(order.remaining())
-            .map(|amount| (instrument.quote(), amount))
-            .ok_or(RejectReason::ValueOverflow),
+        (Side::Bid, Some(bound)) => {
+            let price = Amount::new(bound.get()).expect("preço é positivo");
+            price
+                .checked_add(taker_bps.fee_on(price))
+                .map(|per_lot| (instrument.quote(), per_lot))
+                .ok_or(RejectReason::ValueOverflow)
+        }
         (Side::Bid, None) => Err(RejectReason::MarketBuyNeedsProtection),
-        (Side::Ask, _) => instrument
-            .lot_size()
-            .times(order.remaining())
-            .map(|amount| (instrument.base(), amount))
-            .ok_or(RejectReason::ValueOverflow),
+        (Side::Ask, _) => Ok((instrument.base(), instrument.lot_size())),
     }
 }
 
-/// As duas transferências que liquidam um fill (seção 4.2, sem a taxa).
 fn fill_settlement(
     instrument: &Instrument,
     fill: &Fill,
-    buyer: AccountId,
-    seller: AccountId,
+    parties: Parties,
+    fee: Amount,
+    taker_side: Side,
 ) -> FillSettlement {
     let base = instrument
         .lot_size()
         .times(fill.lots)
         .expect("já coube na reserva do vendedor, calculada sem estourar");
-    let quote = fill
+    let value = fill
         .price
         .times(fill.lots)
         .expect("não passa da reserva do comprador, calculada sem estourar");
+    let to_seller = match taker_side {
+        Side::Bid => value,
+        Side::Ask => value
+            .checked_sub(fee)
+            .expect("taxa nunca passa do valor (bps <= 100%)"),
+    };
     FillSettlement {
         base: Transfer {
             asset: instrument.base(),
-            from: seller,
-            to: buyer,
+            from: parties.seller,
+            to: parties.buyer,
             amount: base,
         },
         quote: Transfer {
             asset: instrument.quote(),
-            from: buyer,
-            to: seller,
-            amount: quote,
+            from: parties.buyer,
+            to: parties.seller,
+            amount: to_seller,
+        },
+        fee: Transfer {
+            asset: instrument.quote(),
+            from: parties.buyer,
+            to: parties.house,
+            amount: fee,
         },
     }
 }
@@ -461,6 +521,14 @@ mod tests {
     const ALICE: AccountId = AccountId::new(1);
     const BOB: AccountId = AccountId::new(2);
     const PLENTY: i64 = 1_000_000_000;
+    const HOUSE: AccountId = AccountId::new(99);
+
+    fn fees(taker_bps: u32) -> FeeSchedule {
+        FeeSchedule {
+            house: HOUSE,
+            taker_bps: Bps::new(taker_bps).expect("bps de teste válido"),
+        }
+    }
 
     fn amount(value: i64) -> Amount {
         Amount::new(value).expect("quantia de teste válida")
@@ -493,7 +561,8 @@ mod tests {
     // Alice e Bob com saldo de sobra em todo ativo dos instrumentos, para os testes de
     // matching não esbarrarem em reserva.
     fn engine_with(specs: &[Instrument]) -> Engine {
-        let mut engine = Engine::new(specs.iter().copied()).expect("ids de teste distintos");
+        let mut engine =
+            Engine::new(specs.iter().copied(), fees(0)).expect("ids de teste distintos");
         for spec in specs {
             for asset in [spec.base(), spec.quote()] {
                 for account in [ALICE, BOB] {
@@ -557,15 +626,101 @@ mod tests {
 
     // Engine "pobre": Alice tem 1000 BRL, Bob tem 10 lots de TESTE (lot de 100 unidades).
     fn lean_engine() -> Engine {
-        let mut engine = Engine::new([spec_with_lot(TESTE_BRL, 1, 100)]).expect("config válida");
+        lean_engine_with_fee(0)
+    }
+
+    fn lean_engine_with_fee(taker_bps: u32) -> Engine {
+        let mut engine = Engine::new([spec_with_lot(TESTE_BRL, 1, 100)], fees(taker_bps))
+            .expect("config válida");
         deposit(&mut engine, ALICE, BRL, 1_000);
         deposit(&mut engine, BOB, TESTE, 1_000);
         engine
     }
 
+    // Seção 4.2: B leva 2 lots @ 100 de S com taxa de taker t para H.
+    // Com 50 bps, t = ⌈200 × 50 / 10.000⌉ = 1.
+    #[test]
+    fn section_4_2_example_with_taker_fee() {
+        let mut engine = lean_engine_with_fee(50);
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 2));
+
+        let events = submit(&mut engine, order_for(ALICE, 2, Side::Bid, 100, 2));
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Fill { fee, .. }] if *fee == amount(1)
+        ));
+        assert_eq!(engine.balance(ALICE, BRL), balance(799, 0));
+        assert_eq!(engine.balance(ALICE, TESTE), balance(200, 0));
+        assert_eq!(engine.balance(BOB, BRL), balance(200, 0));
+        assert_eq!(engine.balance(HOUSE, BRL), balance(1, 0));
+    }
+
+    #[test]
+    fn buy_reserves_the_fee_of_one_lot_per_lot() {
+        let mut engine = lean_engine_with_fee(50);
+
+        submit(&mut engine, order_for(ALICE, 1, Side::Bid, 100, 3));
+
+        assert_eq!(engine.balance(ALICE, BRL), balance(697, 303));
+    }
+
+    #[test]
+    fn taker_seller_pays_the_fee_out_of_the_proceeds() {
+        let mut engine = lean_engine_with_fee(50);
+        submit(&mut engine, order_for(ALICE, 1, Side::Bid, 100, 2));
+
+        submit(&mut engine, order_for(BOB, 2, Side::Ask, 100, 2));
+
+        assert_eq!(engine.balance(BOB, BRL), balance(199, 0));
+        assert_eq!(engine.balance(HOUSE, BRL), balance(1, 0));
+        assert_eq!(engine.balance(ALICE, BRL), balance(800, 0));
+    }
+
+    #[test]
+    fn maker_buyer_pays_no_fee_and_gets_the_fee_reserve_back() {
+        let mut engine = lean_engine_with_fee(50);
+        submit(&mut engine, order_for(ALICE, 1, Side::Bid, 100, 3));
+
+        submit(&mut engine, order_for(BOB, 2, Side::Ask, 100, 1));
+
+        assert_eq!(engine.balance(ALICE, BRL), balance(698, 202));
+    }
+
+    // ⌈a⌉ + ⌈b⌉ ≥ ⌈a + b⌉: três fills de 1 lot pagam 3 de taxa, embora a taxa do total
+    // seja 1. A reserva por lot cobre exatamente isso.
+    #[test]
+    fn per_fill_rounding_is_covered_by_the_per_lot_reserve() {
+        let mut engine = lean_engine_with_fee(10);
+        for id in 1..=3 {
+            submit(&mut engine, order_for(BOB, id, Side::Ask, 1, 1));
+        }
+
+        let events = submit(&mut engine, order_for(ALICE, 4, Side::Bid, 1, 3));
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(engine.balance(HOUSE, BRL), balance(3, 0));
+        assert_eq!(engine.balance(ALICE, BRL), balance(994, 0));
+    }
+
+    #[test]
+    fn house_account_cannot_trade() {
+        let mut engine = lean_engine_with_fee(50);
+
+        let events = submit(&mut engine, order_for(HOUSE, 1, Side::Bid, 100, 1));
+
+        assert_eq!(
+            events,
+            vec![Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::HouseCannotTrade,
+            }]
+        );
+    }
+
     #[test]
     fn deposit_credits_available() {
-        let mut engine = Engine::new([spec(TESTE_BRL, 1)]).expect("config válida");
+        let mut engine = Engine::new([spec(TESTE_BRL, 1)], fees(0)).expect("config válida");
 
         let events = engine.apply(Command::Deposit {
             account: ALICE,
@@ -586,7 +741,7 @@ mod tests {
 
     #[test]
     fn deposit_beyond_supply_is_rejected() {
-        let mut engine = Engine::new([spec(TESTE_BRL, 1)]).expect("config válida");
+        let mut engine = Engine::new([spec(TESTE_BRL, 1)], fees(0)).expect("config válida");
         deposit(&mut engine, ALICE, BRL, i64::MAX);
 
         let events = engine.apply(Command::Deposit {
@@ -772,7 +927,7 @@ mod tests {
 
     #[test]
     fn duplicate_instrument_is_a_config_error() {
-        let result = Engine::new([spec(TESTE_BRL, 1), spec(TESTE_BRL, 5)]);
+        let result = Engine::new([spec(TESTE_BRL, 1), spec(TESTE_BRL, 5)], fees(0));
 
         assert_eq!(
             result.err(),
@@ -1059,6 +1214,7 @@ mod tests {
                         price: Price::new(100).expect("preço de teste válido"),
                         lots: lots(2),
                     },
+                    fee: Amount::ZERO,
                 },
                 Event::Rested {
                     instrument: TESTE_BRL,
