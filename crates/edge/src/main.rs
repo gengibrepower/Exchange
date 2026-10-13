@@ -2,7 +2,7 @@ mod parse;
 
 use std::io::{self, BufRead, Write};
 
-use exchange_core::domain::{AccountId, InstrumentId, Order, OrderId, Seq};
+use exchange_core::domain::{AccountId, InstrumentId, Order, OrderId, OrderKind, Seq};
 use exchange_core::engine::{Command, Engine, Event, RejectReason};
 
 use crate::parse::{Input, parse_line};
@@ -25,7 +25,7 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
             Ok(Input::Submit {
                 side,
                 symbol,
-                price,
+                kind,
                 lots,
                 time_in_force,
             }) => {
@@ -33,15 +33,15 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                     writeln!(output, "erro: instrumento desconhecido \"{symbol}\"")?;
                     continue;
                 };
-                let order = match Order::new(
-                    OrderId::new(next_seq),
-                    ACCOUNT,
-                    instrument,
-                    side,
-                    price,
-                    lots,
-                    Seq::new(next_seq),
-                ) {
+                let id = OrderId::new(next_seq);
+                let seq = Seq::new(next_seq);
+                let order = match kind {
+                    OrderKind::Limit(price) => {
+                        Order::new(id, ACCOUNT, instrument, side, price, lots, seq)
+                    }
+                    OrderKind::Market => Order::market(id, ACCOUNT, instrument, side, lots, seq),
+                };
+                let order = match order {
                     Ok(order) => order.with_time_in_force(time_in_force),
                     Err(error) => {
                         writeln!(output, "erro: {error}")?;
@@ -208,6 +208,21 @@ mod tests {
              #2 cancelada: 3 lots em TESTE/BRL\n\
              #3 descansou: 2 lots em TESTE/BRL\n\
              #4 expirou: 5 lots em TESTE/BRL\n"
+        );
+    }
+
+    #[test]
+    fn market_order_sweeps_and_never_rests() {
+        let output =
+            session("sell TESTE/BRL 10000 2\nsell TESTE/BRL 10500 2\nbuy TESTE/BRL mkt 5\n");
+
+        assert_eq!(
+            output,
+            "#1 descansou: 2 lots em TESTE/BRL\n\
+             #2 descansou: 2 lots em TESTE/BRL\n\
+             fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000\n\
+             fill TESTE/BRL: taker #3, maker #2, 2 lots @ 10500\n\
+             #3 cancelada: 1 lots em TESTE/BRL\n"
         );
     }
 

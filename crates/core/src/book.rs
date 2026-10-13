@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use crate::domain::{AccountId, Fill, Lots, Order, OrderId, OrderStatus, Price, Side, TimeInForce};
+use crate::domain::{
+    AccountId, Fill, Lots, Order, OrderId, OrderKind, OrderStatus, Price, Side, TimeInForce,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Leftover {
@@ -48,8 +50,8 @@ impl OrderBook {
     }
 
     /// Espera um taker já aceito; o [`crate::engine::Engine`] aceita antes de chamar.
-    /// A sobra segue o time-in-force: GTC descansa, IOC cancela; FOK sem liquidez para
-    /// tudo expira sem tocar no livro.
+    /// A sobra segue o time-in-force: GTC limite descansa; IOC e qualquer ordem a mercado
+    /// cancelam a sobra; FOK sem liquidez para tudo expira sem tocar no livro.
     ///
     /// # Panics
     /// Se o taker não estiver aceito. Fora isso, nunca: makers no livro estão sempre
@@ -76,11 +78,7 @@ impl OrderBook {
                 Side::Ask => self.best_bid(),
             };
             let Some(maker_price) = best else { break };
-            let crosses = match taker.side() {
-                Side::Bid => taker.price() >= maker_price,
-                Side::Ask => taker.price() <= maker_price,
-            };
-            if !crosses {
+            if !taker.crosses(maker_price) {
                 break;
             }
             let opposite = match taker.side() {
@@ -118,18 +116,20 @@ impl OrderBook {
         let leftover = if remaining == Lots::ZERO {
             Leftover::None
         } else {
-            match taker.time_in_force() {
-                TimeInForce::Gtc => {
-                    self.rest(taker);
+            match (taker.time_in_force(), taker.kind()) {
+                (TimeInForce::Fok, _) => {
+                    unreachable!("FOK só executa quando a liquidez cobre tudo")
+                }
+                (TimeInForce::Gtc, OrderKind::Limit(price)) => {
+                    self.rest(taker, price);
                     Leftover::Rested(remaining)
                 }
-                TimeInForce::Ioc => {
+                (TimeInForce::Ioc, _) | (TimeInForce::Gtc, OrderKind::Market) => {
                     taker
                         .transition(OrderStatus::Cancelled)
-                        .expect("sobra de IOC aceita ou parcial pode ser cancelada");
+                        .expect("sobra aceita ou parcial pode ser cancelada");
                     Leftover::Cancelled(remaining)
                 }
-                TimeInForce::Fok => unreachable!("FOK só executa quando a liquidez cobre tudo"),
             }
         };
         MatchOutcome { fills, leftover }
@@ -142,7 +142,7 @@ impl OrderBook {
         match taker.side() {
             Side::Bid => {
                 for (price, level) in &self.asks {
-                    if *price > taker.price() {
+                    if !taker.crosses(*price) {
                         break;
                     }
                     for maker in level {
@@ -155,7 +155,7 @@ impl OrderBook {
             }
             Side::Ask => {
                 for (price, level) in self.bids.iter().rev() {
-                    if *price < taker.price() {
+                    if !taker.crosses(*price) {
                         break;
                     }
                     for maker in level {
@@ -210,13 +210,13 @@ impl OrderBook {
         Ok(order)
     }
 
-    fn rest(&mut self, order: Order) {
-        self.index.insert(order.id(), (order.side(), order.price()));
+    fn rest(&mut self, order: Order, price: Price) {
+        self.index.insert(order.id(), (order.side(), price));
         let side = match order.side() {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
         };
-        side.entry(order.price()).or_default().push_back(order);
+        side.entry(price).or_default().push_back(order);
     }
 }
 
@@ -258,9 +258,9 @@ mod tests {
     #[test]
     fn can_fill_completely_sums_crossing_levels() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 2));
-        book.rest(order(2, Side::Ask, 101, 3));
-        book.rest(order(3, Side::Ask, 102, 10));
+        place(&mut book, order(1, Side::Ask, 100, 2));
+        place(&mut book, order(2, Side::Ask, 101, 3));
+        place(&mut book, order(3, Side::Ask, 102, 10));
 
         assert!(book.can_fill_completely(&order(4, Side::Bid, 101, 5)));
         assert!(!book.can_fill_completely(&order(4, Side::Bid, 101, 6)));
@@ -271,8 +271,8 @@ mod tests {
     #[test]
     fn can_fill_completely_reads_bids_from_highest() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Bid, 100, 2));
-        book.rest(order(2, Side::Bid, 98, 5));
+        place(&mut book, order(1, Side::Bid, 100, 2));
+        place(&mut book, order(2, Side::Bid, 98, 5));
 
         assert!(book.can_fill_completely(&order(3, Side::Ask, 99, 2)));
         assert!(!book.can_fill_completely(&order(3, Side::Ask, 99, 3)));
@@ -289,8 +289,8 @@ mod tests {
     #[test]
     fn fok_with_enough_liquidity_fills_across_levels() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 2));
-        book.rest(order(2, Side::Ask, 101, 3));
+        place(&mut book, order(1, Side::Ask, 100, 2));
+        place(&mut book, order(2, Side::Ask, 101, 3));
 
         let outcome = book.submit(with_tif(order(3, Side::Bid, 101, 5), TimeInForce::Fok));
 
@@ -302,8 +302,8 @@ mod tests {
     #[test]
     fn fok_without_enough_liquidity_expires_and_leaves_book_untouched() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 2));
-        book.rest(order(2, Side::Ask, 105, 10));
+        place(&mut book, order(1, Side::Ask, 100, 2));
+        place(&mut book, order(2, Side::Ask, 105, 10));
         let before = book_state(&book);
 
         let outcome = book.submit(with_tif(order(3, Side::Bid, 101, 5), TimeInForce::Fok));
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn ioc_cancels_remainder_after_partial_fill() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 2));
+        place(&mut book, order(1, Side::Ask, 100, 2));
 
         let outcome = book.submit(with_tif(order(2, Side::Bid, 100, 5), TimeInForce::Ioc));
 
@@ -341,11 +341,109 @@ mod tests {
     #[test]
     fn ioc_fully_filled_leaves_nothing() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Bid, 100, 5));
+        place(&mut book, order(1, Side::Bid, 100, 5));
 
         let outcome = book.submit(with_tif(order(2, Side::Ask, 100, 5), TimeInForce::Ioc));
 
         assert_eq!(outcome.leftover, Leftover::None);
+    }
+
+    fn place(book: &mut OrderBook, order: Order) {
+        let price = order.limit_price().expect("só ordem limite descansa");
+        book.rest(order, price);
+    }
+
+    pub(super) fn market_order(id: u64, side: Side, quantity: i64) -> Order {
+        let mut order = Order::market(
+            OrderId::new(id),
+            AccountId::new(1),
+            InstrumentId::new(1),
+            side,
+            lots(quantity),
+            Seq::new(id),
+        )
+        .expect("ordem de teste válida");
+        order
+            .transition(OrderStatus::Accepted)
+            .expect("ordem nova pode ser aceita");
+        order
+    }
+
+    #[test]
+    fn market_buy_sweeps_levels_at_maker_prices() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Ask, 100, 2));
+        place(&mut book, order(2, Side::Ask, 105, 2));
+
+        let outcome = book.submit(market_order(3, Side::Bid, 3));
+
+        assert_eq!(
+            outcome.fills,
+            vec![
+                Fill {
+                    taker: OrderId::new(3),
+                    maker: OrderId::new(1),
+                    price: price(100),
+                    lots: lots(2),
+                },
+                Fill {
+                    taker: OrderId::new(3),
+                    maker: OrderId::new(2),
+                    price: price(105),
+                    lots: lots(1),
+                },
+            ]
+        );
+        assert_eq!(outcome.leftover, Leftover::None);
+    }
+
+    #[test]
+    fn market_sell_hits_highest_bid_first() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Bid, 98, 2));
+        place(&mut book, order(2, Side::Bid, 100, 2));
+
+        let outcome = book.submit(market_order(3, Side::Ask, 1));
+
+        assert_eq!(outcome.fills[0].maker, OrderId::new(2));
+        assert_eq!(outcome.fills[0].price, price(100));
+    }
+
+    #[test]
+    fn market_remainder_is_cancelled_even_when_gtc() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Ask, 100, 2));
+
+        let outcome = book.submit(market_order(2, Side::Bid, 5));
+
+        assert_eq!(total_filled(&outcome.fills), 2);
+        assert_eq!(outcome.leftover, Leftover::Cancelled(lots(3)));
+        assert_eq!(book.best_bid(), None);
+        assert!(!book.contains(OrderId::new(2)));
+    }
+
+    #[test]
+    fn market_on_empty_book_is_cancelled_entirely() {
+        let mut book = OrderBook::new();
+
+        let outcome = book.submit(market_order(1, Side::Bid, 5));
+
+        assert_eq!(outcome.fills, []);
+        assert_eq!(outcome.leftover, Leftover::Cancelled(lots(5)));
+    }
+
+    #[test]
+    fn market_fok_fills_or_expires_by_total_liquidity() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Ask, 100, 2));
+        place(&mut book, order(2, Side::Ask, 500, 2));
+
+        let too_big = book.submit(with_tif(market_order(3, Side::Bid, 5), TimeInForce::Fok));
+        assert_eq!(too_big.leftover, Leftover::Expired(lots(5)));
+
+        let fits = book.submit(with_tif(market_order(4, Side::Bid, 4), TimeInForce::Fok));
+        assert_eq!(total_filled(&fits.fills), 4);
+        assert_eq!(fits.leftover, Leftover::None);
     }
 
     pub(super) fn order(id: u64, side: Side, price_units: i64, quantity: i64) -> Order {
@@ -368,7 +466,7 @@ mod tests {
     #[test]
     fn outcome_reports_rested_remainder() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 2));
+        place(&mut book, order(1, Side::Ask, 100, 2));
 
         let outcome = book.submit(order(2, Side::Bid, 100, 5));
 
@@ -379,7 +477,7 @@ mod tests {
     #[test]
     fn outcome_reports_nothing_rested_when_fully_filled() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 5));
+        place(&mut book, order(1, Side::Ask, 100, 5));
 
         let outcome = book.submit(order(2, Side::Bid, 100, 5));
 
@@ -391,7 +489,7 @@ mod tests {
     #[test]
     fn cancel_removes_resting_order_and_returns_it_cancelled() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Bid, 100, 5));
+        place(&mut book, order(1, Side::Bid, 100, 5));
 
         let cancelled = book.cancel(OrderId::new(1), OWNER).unwrap();
 
@@ -405,9 +503,9 @@ mod tests {
     #[test]
     fn cancel_keeps_time_priority_of_the_others() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 1));
-        book.rest(order(2, Side::Ask, 100, 1));
-        book.rest(order(3, Side::Ask, 100, 1));
+        place(&mut book, order(1, Side::Ask, 100, 1));
+        place(&mut book, order(2, Side::Ask, 100, 1));
+        place(&mut book, order(3, Side::Ask, 100, 1));
 
         book.cancel(OrderId::new(2), OWNER).unwrap();
 
@@ -417,7 +515,7 @@ mod tests {
     #[test]
     fn cancel_partially_filled_order_returns_what_was_left() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 10));
+        place(&mut book, order(1, Side::Ask, 100, 10));
         book.submit(order(2, Side::Bid, 100, 4));
 
         let cancelled = book.cancel(OrderId::new(1), OWNER).unwrap();
@@ -430,7 +528,7 @@ mod tests {
     #[test]
     fn cancel_unknown_order_changes_nothing() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Bid, 100, 5));
+        place(&mut book, order(1, Side::Bid, 100, 5));
 
         let result = book.cancel(OrderId::new(99), OWNER);
 
@@ -441,7 +539,7 @@ mod tests {
     #[test]
     fn cancel_by_another_account_changes_nothing() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Bid, 100, 5));
+        place(&mut book, order(1, Side::Bid, 100, 5));
 
         let result = book.cancel(OrderId::new(1), AccountId::new(2));
 
@@ -453,7 +551,7 @@ mod tests {
     #[test]
     fn cancel_twice_is_unknown_the_second_time() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Bid, 100, 5));
+        place(&mut book, order(1, Side::Bid, 100, 5));
         book.cancel(OrderId::new(1), OWNER).unwrap();
 
         let result = book.cancel(OrderId::new(1), OWNER);
@@ -464,7 +562,7 @@ mod tests {
     #[test]
     fn fully_filled_maker_leaves_the_index() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 5));
+        place(&mut book, order(1, Side::Ask, 100, 5));
         book.submit(order(2, Side::Bid, 100, 5));
 
         assert!(!book.contains(OrderId::new(1)));
@@ -494,7 +592,7 @@ mod tests {
     #[test]
     fn taker_rests_when_prices_do_not_cross() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 101, 5));
+        place(&mut book, order(1, Side::Ask, 101, 5));
 
         let fills = book.submit(order(2, Side::Bid, 100, 5)).fills;
 
@@ -507,7 +605,7 @@ mod tests {
     #[test]
     fn exact_match_empties_level() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 5));
+        place(&mut book, order(1, Side::Ask, 100, 5));
 
         let fills = book.submit(order(2, Side::Bid, 100, 5)).fills;
 
@@ -529,7 +627,7 @@ mod tests {
     #[test]
     fn partial_fill_keeps_maker_at_front() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 10));
+        place(&mut book, order(1, Side::Ask, 100, 10));
 
         let fills = book.submit(order(2, Side::Bid, 100, 5)).fills;
 
@@ -555,8 +653,8 @@ mod tests {
     #[test]
     fn sweeps_levels_at_maker_price() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 2));
-        book.rest(order(2, Side::Ask, 101, 2));
+        place(&mut book, order(1, Side::Ask, 100, 2));
+        place(&mut book, order(2, Side::Ask, 101, 2));
 
         let fills = book.submit(order(3, Side::Bid, 105, 5)).fills;
 
@@ -586,8 +684,8 @@ mod tests {
     #[test]
     fn same_level_matches_fifo() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Ask, 100, 3));
-        book.rest(order(2, Side::Ask, 100, 3));
+        place(&mut book, order(1, Side::Ask, 100, 3));
+        place(&mut book, order(2, Side::Ask, 100, 3));
 
         let fills = book.submit(order(3, Side::Bid, 100, 3)).fills;
 
@@ -607,8 +705,8 @@ mod tests {
     #[test]
     fn ask_taker_sweeps_bids_from_highest() {
         let mut book = OrderBook::new();
-        book.rest(order(1, Side::Bid, 100, 2));
-        book.rest(order(2, Side::Bid, 101, 2));
+        place(&mut book, order(1, Side::Bid, 100, 2));
+        place(&mut book, order(2, Side::Bid, 101, 2));
 
         let fills = book.submit(order(3, Side::Ask, 95, 5)).fills;
 

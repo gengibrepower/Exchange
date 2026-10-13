@@ -157,6 +157,12 @@ pub enum OrderStatus {
     Expired,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OrderKind {
+    Limit(Price),
+    Market,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TimeInForce {
     #[default]
@@ -188,7 +194,7 @@ pub struct Order {
     account: AccountId,
     instrument: InstrumentId,
     side: Side,
-    price: Price,
+    kind: OrderKind,
     total: Lots,
     remaining: Lots,
     seq: Seq,
@@ -197,6 +203,8 @@ pub struct Order {
 }
 
 impl Order {
+    /// Ordem limite.
+    ///
     /// # Errors
     /// [`DomainError::EmptyOrder`] se `total` for zero.
     pub fn new(
@@ -208,6 +216,41 @@ impl Order {
         total: Lots,
         seq: Seq,
     ) -> Result<Self, DomainError> {
+        Self::build(
+            id,
+            account,
+            instrument,
+            side,
+            OrderKind::Limit(price),
+            total,
+            seq,
+        )
+    }
+
+    /// Ordem a mercado: sem preço, nunca descansa.
+    ///
+    /// # Errors
+    /// [`DomainError::EmptyOrder`] se `total` for zero.
+    pub fn market(
+        id: OrderId,
+        account: AccountId,
+        instrument: InstrumentId,
+        side: Side,
+        total: Lots,
+        seq: Seq,
+    ) -> Result<Self, DomainError> {
+        Self::build(id, account, instrument, side, OrderKind::Market, total, seq)
+    }
+
+    fn build(
+        id: OrderId,
+        account: AccountId,
+        instrument: InstrumentId,
+        side: Side,
+        kind: OrderKind,
+        total: Lots,
+        seq: Seq,
+    ) -> Result<Self, DomainError> {
         if total == Lots::ZERO {
             return Err(DomainError::EmptyOrder);
         }
@@ -216,7 +259,7 @@ impl Order {
             account,
             instrument,
             side,
-            price,
+            kind,
             total,
             remaining: total,
             seq,
@@ -247,8 +290,24 @@ impl Order {
         self.side
     }
 
-    pub fn price(&self) -> Price {
-        self.price
+    pub fn kind(&self) -> OrderKind {
+        self.kind
+    }
+
+    pub fn limit_price(&self) -> Option<Price> {
+        match self.kind {
+            OrderKind::Limit(price) => Some(price),
+            OrderKind::Market => None,
+        }
+    }
+
+    /// Esta ordem, como taker, cruza com um maker parado em `maker_price`?
+    pub fn crosses(&self, maker_price: Price) -> bool {
+        match (self.side, self.kind) {
+            (_, OrderKind::Market) => true,
+            (Side::Bid, OrderKind::Limit(limit)) => maker_price <= limit,
+            (Side::Ask, OrderKind::Limit(limit)) => maker_price >= limit,
+        }
     }
 
     pub fn total(&self) -> Lots {
@@ -395,6 +454,88 @@ mod tests {
             Lots::new(total).unwrap(),
             Seq::new(1),
         )
+    }
+
+    fn limit(side: Side, price: i64) -> Order {
+        Order::new(
+            OrderId::new(1),
+            AccountId::new(1),
+            InstrumentId::new(1),
+            side,
+            Price::new(price).unwrap(),
+            Lots::new(1).unwrap(),
+            Seq::new(1),
+        )
+        .unwrap()
+    }
+
+    fn market(side: Side) -> Order {
+        Order::market(
+            OrderId::new(1),
+            AccountId::new(1),
+            InstrumentId::new(1),
+            side,
+            Lots::new(1).unwrap(),
+            Seq::new(1),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn limit_bid_crosses_asks_at_or_below_its_price() {
+        let bid = limit(Side::Bid, 100);
+
+        assert!(bid.crosses(Price::new(99).unwrap()));
+        assert!(bid.crosses(Price::new(100).unwrap()));
+        assert!(!bid.crosses(Price::new(101).unwrap()));
+    }
+
+    #[test]
+    fn limit_ask_crosses_bids_at_or_above_its_price() {
+        let ask = limit(Side::Ask, 100);
+
+        assert!(ask.crosses(Price::new(101).unwrap()));
+        assert!(ask.crosses(Price::new(100).unwrap()));
+        assert!(!ask.crosses(Price::new(99).unwrap()));
+    }
+
+    #[test]
+    fn market_crosses_any_price_on_both_sides() {
+        for side in [Side::Bid, Side::Ask] {
+            let order = market(side);
+            for price in [1, 100, i64::MAX] {
+                assert!(
+                    order.crosses(Price::new(price).unwrap()),
+                    "{side:?} @ {price}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn market_order_has_no_limit_price() {
+        let order = market(Side::Bid);
+
+        assert_eq!(order.kind(), OrderKind::Market);
+        assert_eq!(order.limit_price(), None);
+        assert_eq!(
+            limit(Side::Bid, 100).limit_price(),
+            Some(Price::new(100).unwrap())
+        );
+    }
+
+    #[test]
+    fn market_order_rejects_zero_lots() {
+        let result = Order::market(
+            OrderId::new(1),
+            AccountId::new(1),
+            InstrumentId::new(1),
+            Side::Bid,
+            Lots::ZERO,
+            Seq::new(1),
+        );
+
+        assert_eq!(result.unwrap_err(), DomainError::EmptyOrder);
     }
 
     #[test]
