@@ -4,32 +4,40 @@ use proptest::prelude::*;
 
 use super::{Command, Engine, Event, FeeSchedule, ListingConfig, RiskLimits};
 use crate::domain::{
-    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, Order, OrderId, Price, Seq,
-    Side, TimeInForce,
+    AccountId, Amount, AssetId, Bps, Fill, Instrument, InstrumentId, Lots, Order, OrderId, Price,
+    Seq, Side, TimeInForce,
 };
 
 const TESTE_BRL: InstrumentId = InstrumentId::new(1);
+const OUTRO_BRL: InstrumentId = InstrumentId::new(2);
+const INSTRUMENTS: [InstrumentId; 2] = [TESTE_BRL, OUTRO_BRL];
 const TESTE: AssetId = AssetId::new(1);
 const BRL: AssetId = AssetId::new(2);
+const OUTRO: AssetId = AssetId::new(3);
 const ACCOUNTS: [AccountId; 2] = [AccountId::new(1), AccountId::new(2)];
 const HOUSE: AccountId = AccountId::new(9);
-const ASSETS: [AssetId; 2] = [TESTE, BRL];
+const ASSETS: [AssetId; 3] = [TESTE, OUTRO, BRL];
+
+// Dois pares que dividem a quote e têm lots diferentes: um erro de "lot do instrumento
+// errado" ou de reserva vazando entre livros aparece nos saldos.
+fn specs() -> [Instrument; 2] {
+    let tick = Price::new(1).expect("tick positivo");
+    let lot = |size| Amount::new(size).expect("lot positivo");
+    [
+        Instrument::new(TESTE_BRL, TESTE, BRL, tick, lot(3)).expect("especificação válida"),
+        Instrument::new(OUTRO_BRL, OUTRO, BRL, tick, lot(7)).expect("especificação válida"),
+    ]
+}
 
 fn spec() -> Instrument {
-    Instrument::new(
-        TESTE_BRL,
-        TESTE,
-        BRL,
-        Price::new(1).expect("tick positivo"),
-        Amount::new(3).expect("lot positivo"),
-    )
-    .expect("especificação válida")
+    specs()[0]
 }
 
 #[derive(Clone, Debug)]
 enum Op {
     Deposit(usize, AssetId, i64),
     Submit {
+        instrument: usize,
         account: usize,
         side: Side,
         price: Option<i64>,
@@ -38,12 +46,14 @@ enum Op {
         tif: TimeInForce,
     },
     Cancel {
+        instrument: usize,
         account: usize,
         target: prop::sample::Index,
     },
 }
 
-fn op() -> impl Strategy<Value = Op> {
+/// Operações sobre os `instruments` primeiros instrumentos de [`INSTRUMENTS`].
+fn op(instruments: usize) -> impl Strategy<Value = Op> {
     let side = prop_oneof![Just(Side::Bid), Just(Side::Ask)];
     let tif = prop_oneof![
         3 => Just(TimeInForce::Gtc),
@@ -53,10 +63,11 @@ fn op() -> impl Strategy<Value = Op> {
     let price = prop_oneof![4 => (95..=105_i64).prop_map(Some), 1 => Just(None)];
     let protection = prop_oneof![Just(None), (95..=105_i64).prop_map(Some)];
     prop_oneof![
-        2 => (0..2_usize, prop_oneof![Just(TESTE), Just(BRL)], 0..=600_i64)
+        2 => (0..2_usize, prop::sample::select(ASSETS.to_vec()), 0..=600_i64)
             .prop_map(|(account, asset, value)| Op::Deposit(account, asset, value)),
-        6 => (0..2_usize, side, price, protection, 1..=10_i64, tif).prop_map(
-            |(account, side, price, protection, lots, tif)| Op::Submit {
+        6 => (0..instruments, 0..2_usize, side, price, protection, 1..=10_i64, tif).prop_map(
+            |(instrument, account, side, price, protection, lots, tif)| Op::Submit {
+                instrument,
                 account,
                 side,
                 price,
@@ -65,8 +76,8 @@ fn op() -> impl Strategy<Value = Op> {
                 tif,
             }
         ),
-        2 => (0..2_usize, any::<prop::sample::Index>())
-            .prop_map(|(account, target)| Op::Cancel { account, target }),
+        2 => (0..instruments, 0..2_usize, any::<prop::sample::Index>())
+            .prop_map(|(instrument, account, target)| Op::Cancel { instrument, account, target }),
     ]
 }
 
@@ -78,6 +89,7 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
             amount: Amount::new(*value).expect("faixa não negativa"),
         },
         Op::Submit {
+            instrument,
             account,
             side,
             price,
@@ -85,24 +97,100 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
             lots,
             tif,
         } => {
+            let instrument = INSTRUMENTS[*instrument];
             let id = *next_id;
             *next_id += 1;
             let lots = Lots::new(*lots).expect("faixa positiva");
             let (order_id, account, seq) = (OrderId::new(id), ACCOUNTS[*account], Seq::new(id));
             let order = if let Some(price) = price {
                 let price = Price::new(*price).expect("faixa positiva");
-                Order::new(order_id, account, TESTE_BRL, *side, price, lots, seq)
+                Order::new(order_id, account, instrument, *side, price, lots, seq)
             } else {
                 let protection = protection.map(|bound| Price::new(bound).expect("faixa positiva"));
-                Order::market(order_id, account, TESTE_BRL, *side, lots, seq, protection)
+                Order::market(order_id, account, instrument, *side, lots, seq, protection)
             };
             Command::Submit(order.expect("ordem válida").with_time_in_force(*tif))
         }
-        Op::Cancel { account, target } => Command::Cancel {
-            instrument: TESTE_BRL,
+        Op::Cancel {
+            instrument,
+            account,
+            target,
+        } => Command::Cancel {
+            instrument: INSTRUMENTS[*instrument],
             account: ACCOUNTS[*account],
             order: OrderId::new(1 + target.index(usize::try_from(*next_id).unwrap()) as u64),
         },
+    }
+}
+
+/// Oráculo de saldos: recalcula, só a partir dos eventos e de quem é dono de cada ordem,
+/// o total (disponível + reservado) que cada conta deveria ter de cada ativo. A taxa é
+/// recalculada aqui com a fórmula própria, sem `fee_on` e sem confiar no valor do evento.
+/// Pega o que a conservação agregada não pega: valor certo na conta errada.
+struct BalanceOracle {
+    totals: HashMap<(AccountId, AssetId), i128>,
+    owners: HashMap<(InstrumentId, OrderId), AccountId>,
+    house: AccountId,
+    taker_bps: u32,
+}
+
+impl BalanceOracle {
+    fn new(house: AccountId, taker_bps: u32) -> Self {
+        Self {
+            totals: HashMap::new(),
+            owners: HashMap::new(),
+            house,
+            taker_bps,
+        }
+    }
+
+    fn record_owner(&mut self, instrument: InstrumentId, order: OrderId, account: AccountId) {
+        self.owners.insert((instrument, order), account);
+    }
+
+    fn owner(&self, instrument: InstrumentId, order: OrderId) -> AccountId {
+        self.owners[&(instrument, order)]
+    }
+
+    fn credit(&mut self, account: AccountId, asset: AssetId, delta: i128) {
+        *self.totals.entry((account, asset)).or_default() += delta;
+    }
+
+    fn deposit(&mut self, account: AccountId, asset: AssetId, amount: Amount) {
+        self.credit(account, asset, i128::from(amount.get()));
+    }
+
+    /// Seção 4.2 do lado de quem confere: o que cada parte de um fill ganha e perde.
+    fn apply_fill(&mut self, spec: &Instrument, fill: &Fill, taker_side: Side) {
+        let instrument = spec.id();
+        let taker = self.owner(instrument, fill.taker);
+        let maker = self.owner(instrument, fill.maker);
+        let (buyer, seller) = match taker_side {
+            Side::Bid => (taker, maker),
+            Side::Ask => (maker, taker),
+        };
+
+        let lots = i128::from(fill.lots.get());
+        let base = lots * i128::from(spec.lot_size().get());
+        let value = lots * i128::from(fill.price.get());
+        let fee = (value * i128::from(self.taker_bps) + 9_999) / 10_000;
+        let (buyer_fee, seller_fee) = match taker_side {
+            Side::Bid => (fee, 0),
+            Side::Ask => (0, fee),
+        };
+
+        self.credit(buyer, spec.base(), base);
+        self.credit(seller, spec.base(), -base);
+        self.credit(buyer, spec.quote(), -value - buyer_fee);
+        self.credit(seller, spec.quote(), value - seller_fee);
+        self.credit(self.house, spec.quote(), fee);
+    }
+
+    fn expected(&self, account: AccountId, asset: AssetId) -> i128 {
+        self.totals
+            .get(&(account, asset))
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -126,7 +214,7 @@ proptest! {
         taker_bps in prop_oneof![Just(0_u32), Just(1), Just(10), Just(50), Just(9_999), Just(10_000)],
         collar_bps in prop_oneof![Just(0_u32), Just(500), Just(1_000), Just(10_000)],
         max_lots in prop_oneof![Just(3_i64), Just(10)],
-        ops in prop::collection::vec(op(), 1..=80)
+        ops in prop::collection::vec(op(1), 1..=80)
     ) {
         let fees = FeeSchedule { house: HOUSE, taker_bps: Bps::new(taker_bps).expect("até 100%") };
         let risk = RiskLimits {
@@ -197,6 +285,61 @@ proptest! {
             resting.sort_unstable();
             reserved.sort_unstable();
             prop_assert_eq!(resting, reserved, "reserva sem ordem no livro, ou o contrário");
+        }
+    }
+
+    #[test]
+    fn balances_match_an_independent_oracle(
+        taker_bps in prop_oneof![Just(0_u32), Just(1), Just(10), Just(50), Just(9_999), Just(10_000)],
+        ops in prop::collection::vec(op(2), 1..=80)
+    ) {
+        let fees = FeeSchedule { house: HOUSE, taker_bps: Bps::new(taker_bps).expect("até 100%") };
+        let risk = RiskLimits {
+            max_lots: Lots::new(10).expect("positivo"),
+            collar: Bps::new(10_000).expect("até 100%"),
+        };
+        let listings = specs().map(|instrument| ListingConfig { instrument, risk });
+        let mut engine = Engine::new(listings, fees).expect("config válida");
+        let mut oracle = BalanceOracle::new(HOUSE, taker_bps);
+        let mut next_id = 1;
+        for op in ops {
+            let taker_side = match &op {
+                Op::Submit { instrument, account, side, .. } => {
+                    let order = OrderId::new(next_id);
+                    oracle.record_owner(INSTRUMENTS[*instrument], order, ACCOUNTS[*account]);
+                    Some(*side)
+                }
+                _ => None,
+            };
+
+            for event in engine.apply(command(&op, &mut next_id)) {
+                match event {
+                    Event::Deposited { account, asset, amount } => {
+                        oracle.deposit(account, asset, amount);
+                    }
+                    Event::Fill { instrument, fill, .. } => {
+                        let spec = engine.instrument(instrument).expect("instrumento registrado");
+                        let side = taker_side.expect("só submissão gera fill");
+                        oracle.apply_fill(spec, &fill, side);
+                    }
+                    _ => {}
+                }
+            }
+
+            for account in ACCOUNTS.into_iter().chain([HOUSE]) {
+                for asset in ASSETS {
+                    let balance = engine.balance(account, asset);
+                    let actual = i128::from(balance.available.get()) + i128::from(balance.reserved.get());
+                    prop_assert_eq!(
+                        actual,
+                        oracle.expected(account, asset),
+                        "saldo de {:?}/{:?} diverge do oráculo depois de {:?}",
+                        account,
+                        asset,
+                        op
+                    );
+                }
+            }
         }
     }
 }
