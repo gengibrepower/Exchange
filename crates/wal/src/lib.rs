@@ -2,6 +2,10 @@
 
 use std::fmt;
 
+mod file;
+
+pub use file::{Recovery, Wal, WalError};
+
 pub const HEADER_LEN: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
