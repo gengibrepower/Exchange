@@ -65,6 +65,7 @@ version = "0.1.0"
 dependencies = [
  "exchange-core",
  "exchange-wal",
+ "proptest",
  "serde",
  "serde_json",
  "tokio",
