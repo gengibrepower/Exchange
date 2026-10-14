@@ -118,6 +118,7 @@ pub enum ConfigError {
     DuplicateInstrument(InstrumentId),
 }
 
+#[derive(PartialEq, Eq, Debug)]
 struct Listing {
     instrument: Instrument,
     risk: RiskLimits,
@@ -155,6 +156,9 @@ struct Parties {
     house: AccountId,
 }
 
+/// Igualdade é estado lógico idêntico (seção 3.5): é o que o replay do log promete
+/// reconstruir, e o que os testes de recuperação comparam.
+#[derive(PartialEq, Eq, Debug)]
 pub struct Engine {
     listings: HashMap<InstrumentId, Listing>,
     ledger: Ledger,
