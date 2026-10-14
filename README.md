@@ -25,9 +25,12 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F0** — modelo de domínio e matching por prioridade preço-tempo: concluída.
 - **F1** — ordens a mercado, execução parcial, GTC/IOC/FOK, cancelamento: concluída.
 - **F2** — contas, reservas, ledger de partidas dobradas com taxa de taker, risco pré-trade (tamanho máximo e colar de preço): concluída.
-- **Próxima: F3** — WAL e recuperação.
+- **F3** — WAL com `fsync` por registro, recuperação no boot e replay determinístico: concluída.
+- **Próxima: F4** — borda de rede: `tokio`, protocolo JSON por TCP, ponte de canais com o núcleo.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
+
+A recuperação é testada injetando crash em cada byte do log, um bit trocado em cada byte e um rabo de zeros: em todos os casos o boot sobe e reconstrói um estado idêntico ao dos comandos que chegaram inteiros ao disco.
 
 ## Uso
 
@@ -66,6 +69,29 @@ BRL: disponível 9999950, reservado 0
 ```
 
 A conta negocia consigo mesma, então só os 50 centavos de taxa saem dela — foram para a conta da casa.
+
+### Persistência
+
+Com `--wal`, cada comando é gravado no log e sincronizado com o disco (`fsync`) antes de ser aplicado e respondido. Ao subir de novo com o mesmo arquivo, o log é reaplicado e o estado volta igual:
+
+```
+$ cargo run -p edge -- --wal exchange.wal
+log: 0 comandos reaplicados, 0 bytes descartados
+deposit BRL 10000000
+depósito: 10000000 BRL
+deposit TESTE 100000
+depósito: 100000 TESTE
+sell TESTE/BRL 10000 5
+#1 descansou: 5 lots em TESTE/BRL
+quit
+
+$ cargo run -p edge -- --wal exchange.wal
+log: 3 comandos reaplicados, 0 bytes descartados
+buy TESTE/BRL 10000 2
+fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20
+```
+
+Cada registro é `[tamanho u32][crc32 u32][comando em postcard]`, com o crc cobrindo tamanho e comando. Um registro cortado por crash é descartado no boot. Um registro íntegro mas inválido interrompe o boot com erro, em vez de seguir com um estado que não corresponde ao log. Sem `--wal`, tudo fica só em memória.
 
 ## Licença
 
