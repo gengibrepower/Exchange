@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 exchange-core = { path = "../core" }
+exchange-wal = { path = "../wal" }
 
 [lints]
 workspace = true
