@@ -27,7 +27,8 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F2** — contas, reservas, ledger de partidas dobradas com taxa de taker, risco pré-trade (tamanho máximo e colar de preço): concluída.
 - **F3** — WAL com `fsync` por registro, recuperação no boot e replay determinístico: concluída.
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
-- **Próxima: F5** — market data: snapshot, incrementos e detecção de buraco por sequência.
+- **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
+- **Próxima: F6** — FIX: sessão (logon, heartbeat, recuperação de queda) e mensagens de aplicação.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -137,8 +138,33 @@ Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
 | `market` | `instrument`, `side`, `lots`, `protection` e `tif` opcionais | ordem a mercado; sem `protection`, vale o colar de preço |
 | `cancel` | `instrument`, `order` | cancela uma ordem descansando |
 | `balance` | — | saldos da conta da sessão |
+| `subscribe` | `instrument`, `feed` (`l1`/`l2`) | assina o feed (não exige login); assinar de novo traz um snapshot novo |
 
-O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `rejected` (com `code` estável e `message` legível), `balances` e `error`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
+O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `rejected` (com `code` estável e `message` legível), `balances` e `error`; a quem assina, envia `snapshot` e depois os incrementos `depth` (quantidade absoluta no preço, `0` quando o nível some), `top` e `trade`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
+
+## Feed de market data
+
+Cada instrumento tem dois fluxos, cada um com sua sequência contígua: **L2** (profundidade: cada nível de preço e os negócios) e **L1** (topo do livro e os negócios). Quem assina recebe um `snapshot` com o `seq` e, depois, só os incrementos seguintes. O núcleo nunca espera assinante: quem fica para trás perde mensagens, vê o salto na sequência e assina de novo para receber um snapshot novo.
+
+O cliente `feed` faz isso e desenha o livro no terminal a cada mudança:
+
+```
+cargo run -p edge --bin feed -- [--connect <endereço:porta>] [--instrument <símbolo>] [--feed l1|l2] [--plain]
+```
+
+Com o servidor rodando e outra conexão negociando:
+
+```
+TESTE/BRL  L2  seq 5
+        preço     lots
+venda   10100        2
+venda   10000        3
+------ spread 100 ------
+compra   9900        3
+último negócio: 2 lots @ 10000
+```
+
+Num buraco, ele avisa (`buraco na sequência: esperava 6, veio 9 — pedindo snapshot novo`) e segue com o livro reconstruído. `--plain` imprime cada redesenho em sequência em vez de limpar a tela.
 
 ## Licença
 

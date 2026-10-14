@@ -232,7 +232,7 @@ async fn balances(core: &CoreHandle, account: AccountId) -> Result<ServerMessage
     for (name, asset) in ASSETS {
         let balance = core.balance(account, asset).await?;
         balances.push(AssetBalance {
-            asset: name,
+            asset: name.to_string(),
             available: balance.available,
             reserved: balance.reserved,
         });

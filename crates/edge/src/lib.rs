@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod core_thread;
+pub mod feed_client;
 pub mod market;
 pub mod market_data;
 pub mod protocol;
