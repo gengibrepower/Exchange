@@ -3,6 +3,8 @@ use exchange_core::domain::{
 };
 use exchange_core::engine::{Engine, FeeSchedule, ListingConfig, RiskLimits};
 
+use crate::market_data::MarketData;
+
 pub const INSTRUMENTS: [(&str, InstrumentId); 1] = [("TESTE/BRL", InstrumentId::new(1))];
 pub const HOUSE: AccountId = AccountId::new(0);
 pub const TESTE: AssetId = AssetId::new(1);
@@ -32,6 +34,11 @@ pub fn new_engine() -> Engine {
         taker_bps: Bps::new(10).expect("10 bps é menos que 100%"),
     };
     Engine::new(listings(), fees).expect("instrumentos fixos não se repetem")
+}
+
+/// O feed de market data com todos os instrumentos do mercado registrados, vazios.
+pub fn new_market_data() -> MarketData {
+    MarketData::new(INSTRUMENTS.iter().map(|&(_, instrument)| instrument))
 }
 
 pub fn asset_id(name: &str) -> Option<AssetId> {

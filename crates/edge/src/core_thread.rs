@@ -7,11 +7,12 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::thread::{self, JoinHandle};
 
-use exchange_core::domain::{AccountId, AssetId};
+use exchange_core::domain::{AccountId, AssetId, InstrumentId};
 use exchange_core::engine::Event;
 use exchange_core::ledger::Balance;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::market_data::{Feed, MarketData, Snapshot, Update};
 use crate::sequencer::{Intent, Sequencer, SequencerError};
 
 /// Um pedido com o endereço de volta: o núcleo responde pelo `oneshot` e nunca espera
@@ -27,6 +28,13 @@ enum Request {
         account: AccountId,
         asset: AssetId,
         reply: oneshot::Sender<Balance>,
+    },
+    /// Pela mesma fila dos comandos: o snapshot no `seq` N reflete exatamente tudo que
+    /// entrou antes dele, e os incrementos seguintes começam em N + 1.
+    Snapshot {
+        instrument: InstrumentId,
+        feed: Feed,
+        reply: oneshot::Sender<Option<Snapshot>>,
     },
 }
 
@@ -50,6 +58,7 @@ impl std::error::Error for CoreError {}
 #[derive(Clone)]
 pub struct CoreHandle {
     requests: mpsc::Sender<Request>,
+    updates: broadcast::Sender<Update>,
 }
 
 impl CoreHandle {
@@ -80,10 +89,42 @@ impl CoreHandle {
             .map_err(|_| CoreError::Stopped)?;
         response.await.map_err(|_| CoreError::Stopped)
     }
+
+    /// Passa a receber todos os incrementos publicados daqui em diante. Assine **antes** de
+    /// pedir o snapshot: o que chegar com `seq` já coberto por ele é descartado pelo
+    /// [`crate::market_data::LocalBook`], e nada fica de fora.
+    ///
+    /// Quem não acompanha perde mensagens (`Lagged`) em vez de segurar o núcleo; o buraco
+    /// aparece na sequência e se resolve com um snapshot novo.
+    pub fn subscribe(&self) -> broadcast::Receiver<Update> {
+        self.updates.subscribe()
+    }
+
+    /// `None` se o instrumento não existe.
+    ///
+    /// # Errors
+    /// [`CoreError::Stopped`] se o núcleo parou antes de receber ou de responder.
+    pub async fn snapshot(
+        &self,
+        instrument: InstrumentId,
+        feed: Feed,
+    ) -> Result<Option<Snapshot>, CoreError> {
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .send(Request::Snapshot {
+                instrument,
+                feed,
+                reply,
+            })
+            .await
+            .map_err(|_| CoreError::Stopped)?;
+        response.await.map_err(|_| CoreError::Stopped)
+    }
 }
 
-/// Move o `sequencer` para uma thread dedicada. A fila aceita até `capacity` pedidos
-/// pendentes; cheia, quem envia espera.
+/// Move o `sequencer` e o feed `market_data` para uma thread dedicada. A fila aceita até
+/// `queue` pedidos pendentes; cheia, quem envia espera. O feed guarda até `feed`
+/// incrementos para quem está atrasado; além disso, o atrasado perde mensagens.
 ///
 /// A thread termina quando todos os [`CoreHandle`] somem, devolvendo o `Sequencer`, ou ao
 /// primeiro erro do `Sequencer` (fail-stop), devolvendo o erro.
@@ -92,24 +133,37 @@ impl CoreHandle {
 /// Se o sistema operacional não conseguir criar a thread.
 pub fn spawn_core(
     sequencer: Sequencer,
-    capacity: NonZeroUsize,
+    market_data: MarketData,
+    queue: NonZeroUsize,
+    feed: NonZeroUsize,
 ) -> io::Result<(CoreHandle, JoinHandle<Result<Sequencer, SequencerError>>)> {
-    let (requests, receiver) = mpsc::channel(capacity.get());
+    let (requests, receiver) = mpsc::channel(queue.get());
+    let (updates, _) = broadcast::channel(feed.get());
+    let publisher = updates.clone();
     let thread = thread::Builder::new()
         .name("nucleo".to_string())
-        .spawn(move || run_core(sequencer, receiver))?;
-    Ok((CoreHandle { requests }, thread))
+        .spawn(move || run_core(sequencer, market_data, receiver, &publisher))?;
+    Ok((CoreHandle { requests, updates }, thread))
 }
 
-/// O laço do single writer: um pedido por vez, na ordem da fila.
+/// O laço do single writer: um pedido por vez, na ordem da fila. O feed é alimentado no
+/// mesmo laço, com os mesmos eventos, logo depois de cada comando: núcleo e feed nunca
+/// divergem.
 fn run_core(
     mut sequencer: Sequencer,
+    mut market_data: MarketData,
     mut requests: mpsc::Receiver<Request>,
+    updates: &broadcast::Sender<Update>,
 ) -> Result<Sequencer, SequencerError> {
     while let Some(request) = requests.blocking_recv() {
         match request {
             Request::Submit { intent, reply } => {
                 let events = sequencer.submit(intent)?;
+                for update in market_data.apply(&events) {
+                    // Sem assinante, o send falha; com assinante atrasado, ele perde
+                    // mensagens. Em nenhum caso o núcleo espera.
+                    let _ = updates.send(update);
+                }
                 // Cliente que já foi embora: o comando aconteceu (está no log e aplicado),
                 // só a resposta não tem para onde ir. O núcleo não espera ninguém.
                 let _ = reply.send(events);
@@ -121,6 +175,13 @@ fn run_core(
             } => {
                 let _ = reply.send(sequencer.balance(account, asset));
             }
+            Request::Snapshot {
+                instrument,
+                feed,
+                reply,
+            } => {
+                let _ = reply.send(market_data.snapshot(instrument, feed));
+            }
         }
     }
     Ok(sequencer)
@@ -131,7 +192,8 @@ mod tests {
     use exchange_core::domain::{Amount, Lots, OrderId, OrderKind, Price, Side, TimeInForce};
 
     use super::*;
-    use crate::market::{BRL, INSTRUMENTS, TESTE};
+    use crate::market::{BRL, INSTRUMENTS, TESTE, new_market_data};
+    use crate::market_data::{Gap, LocalBook};
     use crate::test_support::TempPath;
 
     const ALICE: AccountId = AccountId::new(1);
@@ -189,7 +251,13 @@ mod tests {
             cancel(ALICE, OrderId::new(1)),
         ];
         let mut direct = Sequencer::in_memory();
-        let (handle, thread) = spawn_core(Sequencer::in_memory(), capacity(4)).unwrap();
+        let (handle, thread) = spawn_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            capacity(4),
+            capacity(1024),
+        )
+        .unwrap();
 
         for intent in intents {
             let expected = direct.submit(intent).unwrap();
@@ -248,7 +316,8 @@ mod tests {
     async fn concurrent_sessions_are_all_answered_and_the_log_replays_to_the_same_state() {
         let path = TempPath::new("concurrent");
         let (sequencer, _) = Sequencer::open(&path.0).unwrap();
-        let (handle, thread) = spawn_core(sequencer, capacity(8)).unwrap();
+        let (handle, thread) =
+            spawn_core(sequencer, new_market_data(), capacity(8), capacity(1024)).unwrap();
 
         let sessions: Vec<_> = (0..8)
             .map(|session| tokio::spawn(trade(handle.clone(), session)))
@@ -267,7 +336,13 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_reply_does_not_stop_the_core() {
-        let (handle, thread) = spawn_core(Sequencer::in_memory(), capacity(4)).unwrap();
+        let (handle, thread) = spawn_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            capacity(4),
+            capacity(1024),
+        )
+        .unwrap();
         let (reply, response) = oneshot::channel();
         drop(response);
 
@@ -287,7 +362,13 @@ mod tests {
 
     #[tokio::test]
     async fn sequencer_error_stops_the_core_and_every_handle_sees_it() {
-        let (handle, thread) = spawn_core(Sequencer::exhausted(), capacity(4)).unwrap();
+        let (handle, thread) = spawn_core(
+            Sequencer::exhausted(),
+            new_market_data(),
+            capacity(4),
+            capacity(1024),
+        )
+        .unwrap();
         let other = handle.clone();
 
         assert_eq!(
@@ -310,13 +391,159 @@ mod tests {
     #[tokio::test]
     async fn core_that_vanishes_before_answering_is_reported_as_stopped() {
         let (requests, mut receiver) = mpsc::channel(1);
+        let (updates, _) = broadcast::channel(1);
         let core = thread::spawn(move || drop(receiver.blocking_recv()));
-        let handle = CoreHandle { requests };
+        let handle = CoreHandle { requests, updates };
 
         assert_eq!(
             handle.submit(fund(ALICE, BRL, 1)).await,
             Err(CoreError::Stopped)
         );
         core.join().unwrap();
+    }
+
+    const TESTE_BRL: InstrumentId = INSTRUMENTS[0].1;
+
+    fn drain(receiver: &mut broadcast::Receiver<Update>) -> Vec<Update> {
+        let mut updates = Vec::new();
+        while let Ok(update) = receiver.try_recv() {
+            updates.push(update);
+        }
+        updates
+    }
+
+    async fn snapshot(handle: &CoreHandle) -> Snapshot {
+        handle
+            .snapshot(TESTE_BRL, Feed::L2)
+            .await
+            .unwrap()
+            .expect("o instrumento existe")
+    }
+
+    #[tokio::test]
+    async fn subscriber_receives_exactly_what_the_producer_produces() {
+        let intents = [
+            fund(ALICE, BRL, 1_000_000),
+            fund(ALICE, TESTE, 10_000),
+            limit(ALICE, Side::Ask, 10_000, 5),
+            limit(ALICE, Side::Bid, 10_000, 2),
+            cancel(ALICE, OrderId::new(1)),
+        ];
+        let mut direct = Sequencer::in_memory();
+        let mut producer = new_market_data();
+        let (handle, thread) = spawn_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            capacity(4),
+            capacity(1024),
+        )
+        .unwrap();
+        let mut receiver = handle.subscribe();
+
+        let mut expected = Vec::new();
+        for intent in intents {
+            expected.extend(producer.apply(&direct.submit(intent).unwrap()));
+            handle.submit(intent).await.unwrap();
+        }
+
+        assert_eq!(drain(&mut receiver), expected);
+        shut_down(handle, thread);
+    }
+
+    // Seção 4.3 com concorrência real: assina, pede o snapshot enquanto outras sessões
+    // negociam, aplica tudo que chegou e termina com o livro do produtor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subscribe_then_snapshot_rebuilds_the_book_under_concurrent_trading() {
+        let (handle, thread) = spawn_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            capacity(8),
+            capacity(65_536),
+        )
+        .unwrap();
+        trade(handle.clone(), 100).await;
+
+        let mut receiver = handle.subscribe();
+        let sessions: Vec<_> = (0..4)
+            .map(|session| tokio::spawn(trade(handle.clone(), session)))
+            .collect();
+        let mut local = LocalBook::from_snapshot(&snapshot(&handle).await);
+        for session in sessions {
+            session.await.unwrap();
+        }
+
+        for update in drain(&mut receiver) {
+            local.apply(&update).unwrap();
+        }
+        assert_eq!(local.snapshot(), snapshot(&handle).await);
+        shut_down(handle, thread);
+    }
+
+    // O mecanismo inteiro da seção 4.3: quem não lê perde mensagens sem segurar o núcleo,
+    // vê o buraco na sequência e se recupera com um snapshot novo.
+    #[tokio::test]
+    async fn slow_subscriber_loses_updates_sees_the_gap_and_recovers() {
+        let (handle, thread) = spawn_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            capacity(4),
+            capacity(4),
+        )
+        .unwrap();
+        for intent in [fund(ALICE, BRL, 1_000_000), fund(ALICE, TESTE, 10_000)] {
+            handle.submit(intent).await.unwrap();
+        }
+        let mut receiver = handle.subscribe();
+        let mut local = LocalBook::from_snapshot(&snapshot(&handle).await);
+
+        for step in 0..30 {
+            let accepted = handle
+                .submit(limit(ALICE, Side::Ask, 10_000 + 10 * step, 1))
+                .await;
+            assert!(
+                accepted.is_ok(),
+                "o núcleo atendeu mesmo com o assinante parado"
+            );
+        }
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let survivor = receiver.try_recv().unwrap();
+        let before = local.clone();
+        assert!(matches!(local.apply(&survivor), Err(Gap { .. })));
+        assert_eq!(local, before);
+
+        let mut local = LocalBook::from_snapshot(&snapshot(&handle).await);
+        for update in drain(&mut receiver) {
+            local.apply(&update).unwrap();
+        }
+        handle
+            .submit(limit(ALICE, Side::Ask, 10_500, 1))
+            .await
+            .unwrap();
+        for update in drain(&mut receiver) {
+            local.apply(&update).unwrap();
+        }
+        assert_eq!(local.snapshot(), snapshot(&handle).await);
+        shut_down(handle, thread);
+    }
+
+    #[tokio::test]
+    async fn snapshot_of_an_unknown_instrument_is_none() {
+        let (handle, thread) = spawn_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            capacity(4),
+            capacity(4),
+        )
+        .unwrap();
+
+        assert_eq!(
+            handle.snapshot(InstrumentId::new(99), Feed::L1).await,
+            Ok(None)
+        );
+        shut_down(handle, thread);
     }
 }

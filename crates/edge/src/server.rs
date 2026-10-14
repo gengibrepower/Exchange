@@ -257,6 +257,7 @@ mod tests {
 
     use super::*;
     use crate::core_thread::spawn_core;
+    use crate::market::new_market_data;
     use crate::sequencer::Sequencer;
 
     const PATIENCE: Duration = Duration::from_secs(5);
@@ -271,7 +272,13 @@ mod tests {
     }
 
     async fn start_with(sequencer: Sequencer, limits: Limits) -> SocketAddr {
-        let (core, _thread) = spawn_core(sequencer, NonZeroUsize::new(16).unwrap()).unwrap();
+        let (core, _thread) = spawn_core(
+            sequencer,
+            new_market_data(),
+            NonZeroUsize::new(16).unwrap(),
+            NonZeroUsize::new(1024).unwrap(),
+        )
+        .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(serve(listener, core, limits));

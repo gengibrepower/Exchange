@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use edge::core_thread::spawn_core;
+use edge::market::new_market_data;
 use edge::sequencer::Sequencer;
 use edge::server::{Limits, serve};
 use tokio::net::TcpListener;
@@ -20,6 +21,10 @@ const USAGE: &str = "uso: server [--listen <endereço:porta>] [--wal <caminho>]"
 const DEFAULT_LISTEN: &str = "127.0.0.1:7000";
 
 const QUEUE: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 não é zero");
+
+// Incrementos guardados para assinantes atrasados; quem ficar mais para trás que isso perde
+// mensagens, vê o buraco na sequência e pede um snapshot novo.
+const FEED: NonZeroUsize = NonZeroUsize::new(4096).expect("4096 não é zero");
 
 const LIMITS: Limits = Limits {
     max_connections: NonZeroUsize::new(1024).expect("1024 não é zero"),
@@ -69,10 +74,15 @@ async fn main() -> ExitCode {
 
 async fn run() -> io::Result<()> {
     let args = parse_args(std::env::args_os().skip(1)).map_err(io::Error::other)?;
+    let mut market_data = new_market_data();
     let sequencer = match &args.wal {
         None => Sequencer::in_memory(),
         Some(path) => {
-            let (sequencer, report) = Sequencer::open(path).map_err(io::Error::other)?;
+            // O feed também é estado derivado do log: vê o replay para voltar com o livro.
+            let (sequencer, report) = Sequencer::open_observed(path, |events| {
+                market_data.apply(events);
+            })
+            .map_err(io::Error::other)?;
             eprintln!(
                 "log: {} comandos reaplicados, {} bytes descartados",
                 report.replayed, report.discarded
@@ -80,7 +90,7 @@ async fn run() -> io::Result<()> {
             sequencer
         }
     };
-    let (core, core_thread) = spawn_core(sequencer, QUEUE)?;
+    let (core, core_thread) = spawn_core(sequencer, market_data, QUEUE, FEED)?;
 
     // O join da thread do núcleo bloqueia; ele mora numa thread comum e avisa por um
     // oneshot, para o runtime nunca ficar preso esperando.

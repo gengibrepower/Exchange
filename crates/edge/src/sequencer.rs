@@ -150,9 +150,23 @@ impl Sequencer {
     /// [`SequencerError::Wal`] se o arquivo não puder ser aberto ou recuperado;
     /// [`SequencerError::Replay`] se um registro íntegro não puder ser reaplicado.
     pub fn open(path: &Path) -> Result<(Self, BootReport), SequencerError> {
+        Self::open_observed(path, |_| {})
+    }
+
+    /// Como [`Sequencer::open`], entregando a `observer` os eventos de cada comando
+    /// reaplicado, na ordem. É o que deixa quem deriva estado de eventos — o feed de market
+    /// data — chegar ao mesmo lugar que o engine depois de um reinício.
+    ///
+    /// # Errors
+    /// Os mesmos de [`Sequencer::open`].
+    pub fn open_observed(
+        path: &Path,
+        observer: impl FnMut(&[Event]),
+    ) -> Result<(Self, BootReport), SequencerError> {
         let recovery = Wal::open(path)?;
         let mut engine = market::new_engine();
-        let counters = replay(&mut engine, &recovery.records).map_err(SequencerError::Replay)?;
+        let counters =
+            replay(&mut engine, &recovery.records, observer).map_err(SequencerError::Replay)?;
         let report = BootReport {
             replayed: recovery.records.len(),
             discarded: recovery.discarded,
@@ -262,9 +276,14 @@ fn check_seq(expected: u64, found: Seq) -> Result<u64, ReplayError> {
     expected.checked_add(1).ok_or(ReplayError::SeqExhausted)
 }
 
-/// Reaplica o log no engine, sem imprimir: esses eventos já foram respondidos na sessão
-/// que os gravou. Os contadores saem do próprio log, nada é guardado à parte.
-fn replay(engine: &mut Engine, records: &[Vec<u8>]) -> Result<Counters, ReplayError> {
+/// Reaplica o log no engine. Os eventos vão só para o `observer`: para os clientes, eles já
+/// foram respondidos na sessão que os gravou. Os contadores saem do próprio log, nada é
+/// guardado à parte.
+fn replay(
+    engine: &mut Engine,
+    records: &[Vec<u8>],
+    mut observer: impl FnMut(&[Event]),
+) -> Result<Counters, ReplayError> {
     let mut counters = Counters::FRESH;
     for bytes in records {
         let record = LogRecord::from_bytes(bytes)?;
@@ -274,7 +293,7 @@ fn replay(engine: &mut Engine, records: &[Vec<u8>]) -> Result<Counters, ReplayEr
             let after = request.id.get().saturating_add(1);
             counters.next_order_id = counters.next_order_id.max(after);
         }
-        engine.apply(command);
+        observer(&engine.apply(command));
     }
     Ok(counters)
 }
@@ -287,6 +306,7 @@ mod tests {
 
     use super::*;
     use crate::market::{BRL, TESTE};
+    use crate::market_data::{Feed, MarketData, Quote};
     use crate::test_support::TempPath;
 
     const ACCOUNT: AccountId = AccountId::new(1);
@@ -303,14 +323,16 @@ mod tests {
 
     #[test]
     fn replay_accepts_a_contiguous_log() {
-        let counters = replay(&mut market::new_engine(), &[deposit(1), deposit(2)]).unwrap();
+        let counters =
+            replay(&mut market::new_engine(), &[deposit(1), deposit(2)], |_| {}).unwrap();
 
         assert_eq!(counters.next_seq, 3);
     }
 
     #[test]
     fn replay_rejects_a_gap_in_seq() {
-        let error = replay(&mut market::new_engine(), &[deposit(1), deposit(3)]).unwrap_err();
+        let error =
+            replay(&mut market::new_engine(), &[deposit(1), deposit(3)], |_| {}).unwrap_err();
 
         assert_eq!(
             error,
@@ -323,7 +345,8 @@ mod tests {
 
     #[test]
     fn replay_rejects_a_repeated_seq() {
-        let error = replay(&mut market::new_engine(), &[deposit(1), deposit(1)]).unwrap_err();
+        let error =
+            replay(&mut market::new_engine(), &[deposit(1), deposit(1)], |_| {}).unwrap_err();
 
         assert_eq!(
             error,
@@ -521,5 +544,50 @@ mod tests {
         let state = boot_from(&path, &bytes);
 
         assert_eq!(state, *recorded.expected.last().unwrap());
+    }
+
+    // Sem o observador, o feed voltaria vazio de um reinício enquanto o engine voltaria
+    // com o livro cheio — e o primeiro fill contra uma ordem restaurada derrubaria o feed.
+    #[test]
+    fn replay_observer_rebuilds_the_feed_after_a_restart() {
+        let path = TempPath::new("feed-restart");
+        {
+            let (mut sequencer, _) = Sequencer::open(&path.0).unwrap();
+            for intent in [
+                fund(BRL, 100_000_000),
+                fund(TESTE, 100_000),
+                limit(Side::Ask, 10_000, 5, TimeInForce::Gtc),
+                limit(Side::Ask, 10_100, 2, TimeInForce::Gtc),
+                limit(Side::Bid, 9_900, 3, TimeInForce::Gtc),
+            ] {
+                sequencer.submit(intent).unwrap();
+            }
+        }
+
+        let mut feed = market::new_market_data();
+        let (mut sequencer, _) = Sequencer::open_observed(&path.0, |events| {
+            feed.apply(events);
+        })
+        .unwrap();
+        assert_feed_matches_engine(&feed, &sequencer);
+
+        let events = sequencer
+            .submit(limit(Side::Bid, 10_000, 2, TimeInForce::Gtc))
+            .unwrap();
+        feed.apply(&events);
+        assert_feed_matches_engine(&feed, &sequencer);
+    }
+
+    fn assert_feed_matches_engine(feed: &MarketData, sequencer: &Sequencer) {
+        let snapshot = feed.snapshot(TESTE_BRL, Feed::L2).unwrap();
+        let book = sequencer.engine().book(TESTE_BRL).unwrap();
+        let depth = |side| {
+            book.depth(side)
+                .into_iter()
+                .map(|(price, lots)| Quote { price, lots })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(snapshot.bids, depth(Side::Bid));
+        assert_eq!(snapshot.asks, depth(Side::Ask));
     }
 }
