@@ -27,6 +27,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F2** — contas, reservas, ledger de partidas dobradas com taxa de taker, risco pré-trade (tamanho máximo e colar de preço): concluída.
 - **F3** — WAL com `fsync` por registro, recuperação no boot e replay determinístico: concluída.
 - **Próxima: F4** — borda de rede: `tokio`, protocolo JSON por TCP, ponte de canais com o núcleo.
+- **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
 

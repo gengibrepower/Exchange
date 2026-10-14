@@ -190,7 +190,9 @@ de valor deve fechar contando a conta da casa.
 - Traduz mensagem de rede → comando interno (entrada) e evento → mensagem de resposta
   (saída).
 - É a **única** superfície que toca entrada não-confiável. Sanitiza tudo antes de passar
-  pro núcleo. Atribui aqui o número de sequência de chegada e o timestamp de parede.
+  pro núcleo. Atribui aqui o timestamp de parede. O número de sequência é atribuído pela
+  thread do núcleo, na ordem em que os comandos saem do canal — é a única ordem total
+  entre sessões concorrentes, e é a ordem de escrita no log (decisão 8).
 - **Fase 1: protocolo próprio em JSON** (`serde_json`) — legível, testável com `netcat`,
   separa erro de parser de erro de lógica. Fase tardia: FIX.
 
@@ -248,6 +250,7 @@ de valor deve fechar contando a conta da casa.
 | Testes de propriedade | `proptest` | Milhares de sequências afirmando invariantes |
 | Benchmark | `criterion` | Throughput/latência com rigor estatístico |
 | Observabilidade | `tracing` | Logs estruturados na borda |
+| Cliente de terminal (F8) | `ratatui` + `crossterm` (a confirmar na F8) | Interface no terminal, sem frontend web |
 
 Nota sobre `unsafe`: objetivo é **zero `unsafe`** no núcleo. Se aparecer, é sinal de que
 algo está sendo forçado.
@@ -356,10 +359,11 @@ legal, que não é exigida de um projeto de estudo.**
 - Feed de market data (snapshot + incremental + sequência).
 - Gateway com protocolo próprio JSON → FIX.
 - Testes de propriedade + simulação + benchmark.
+- Cliente de terminal (TUI), depois das fases centrais (F8).
 
 **Fora (explicitamente, para proteger o escopo)**
 - Integração com dinheiro/pagamento real, KYC real.
-- UI web além do mínimo de demonstração.
+- UI web, inclusive como demonstração: clientes e demos ficam no terminal (decisão 13).
 - Ativos com característica de valor mobiliário.
 - Liquidação on-chain / blockchain.
 - Micro-otimização de latência extrema (só depois de correto).
@@ -409,6 +413,10 @@ legal, que não é exigida de um projeto de estudo.**
     comando de query determinístico e/ou endpoint HTTP de status alimentado pelo stream
     de market data. `tracing` para logs.
 12. **Métricas / definição de pronto**: ver seção 12.
+13. **Interface**: nenhuma UI web. O cliente interativo é uma TUI (interface de terminal),
+    construída só depois das fases F0–F7 (F8), como crate separada que fala com o
+    servidor exclusivamente pelo protocolo da borda — nunca toca o núcleo. Antes dela,
+    a interação é pelo CLI e por clientes de linha de comando.
 
 ---
 
@@ -438,3 +446,8 @@ Cada fase só é concluída quando o critério é atingido — evita refazer par
 - **F7 — endurecimento**: benchmark, snapshots, stop orders, múltiplos instrumentos.
   *Pronto quando*: benchmark reporta throughput/latência (referência: matching > 100k
   ordens/s single-thread, p99 medido); snapshots reduzem tempo de boot.
+- **F8 — cliente de terminal (TUI)**: crate cliente que conecta ao servidor pelo
+  protocolo da borda: livro ao vivo pelo feed da F5, negócios recentes, saldos, envio e
+  cancelamento de ordens. Nunca acessa o núcleo direto (decisão 13). *Pronto quando*:
+  com o servidor rodando, a TUI mostra o livro mudando enquanto outro cliente negocia, e
+  envia e cancela ordens recebendo as respostas na tela.
