@@ -2,12 +2,16 @@
 //! fronteira entre mensagens é convenção nossa: uma por linha, com teto de tamanho.
 
 use std::io;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
 use exchange_core::domain::AccountId;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::core_thread::{CoreError, CoreHandle};
 use crate::market::{ASSETS, HOUSE};
@@ -17,15 +21,88 @@ use crate::protocol::{self, AssetBalance, ClientMessage, Inbound, ServerMessage}
 /// cliente não fazer o servidor acumular memória sem fim (seção 6).
 pub const MAX_LINE: usize = 4096;
 
-/// Aceita conexões para sempre; cada uma vira uma task com sua cópia do handle do núcleo.
+/// Defesas contra exaustão de recursos (seção 6), além do teto de linha.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Sessões simultâneas; acima disso a conexão recebe "servidor cheio" e fecha.
+    pub max_connections: NonZeroUsize,
+    /// Tempo máximo para uma linha inteira chegar. Vale por linha, não por byte: um cliente
+    /// que pinga um byte de vez em quando também é encerrado.
+    pub idle_timeout: Duration,
+}
+
+/// O que fazer quando o `accept` falha.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AcceptFailure {
+    /// O problema era daquela conexão; aceita a próxima.
+    Skip,
+    /// Falta recurso agora; tentar de novo na hora só giraria a CPU no mesmo erro.
+    Pause(Duration),
+    /// O socket de escuta quebrou; o servidor para (fail-stop).
+    Fatal,
+}
+
+pub const RESOURCE_PAUSE: Duration = Duration::from_millis(100);
+
+// Códigos de erro do Linux que o `std` ainda não expõe como `io::ErrorKind` próprio.
+const ENOMEM: i32 = 12;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ENOBUFS: i32 = 105;
+
+pub fn classify(error: &io::Error) -> AcceptFailure {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    ) {
+        return AcceptFailure::Skip;
+    }
+    match error.raw_os_error() {
+        Some(ENOMEM | ENFILE | EMFILE | ENOBUFS) => AcceptFailure::Pause(RESOURCE_PAUSE),
+        _ => AcceptFailure::Fatal,
+    }
+}
+
+/// Aceita conexões para sempre; cada uma vira uma task com sua cópia do handle do núcleo e
+/// uma vaga do limite de conexões, devolvida quando a sessão termina.
 ///
 /// # Errors
-/// Se o `accept` falhar.
-pub async fn serve(listener: TcpListener, core: CoreHandle) -> io::Result<()> {
+/// Se o `accept` falhar de um jeito que [`classify`] considera fatal.
+pub async fn serve(listener: TcpListener, core: CoreHandle, limits: Limits) -> io::Result<()> {
+    let slots = Arc::new(Semaphore::new(
+        limits.max_connections.get().min(Semaphore::MAX_PERMITS),
+    ));
     loop {
-        let (stream, _) = listener.accept().await?;
-        tokio::spawn(session(stream, core.clone()));
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => match classify(&error) {
+                AcceptFailure::Skip => continue,
+                AcceptFailure::Pause(pause) => {
+                    tokio::time::sleep(pause).await;
+                    continue;
+                }
+                AcceptFailure::Fatal => return Err(error),
+            },
+        };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            tokio::spawn(refuse(stream));
+            continue;
+        };
+        let core = core.clone();
+        tokio::spawn(async move {
+            session(stream, core, limits.idle_timeout).await;
+            drop(slot);
+        });
     }
+}
+
+async fn refuse(mut stream: TcpStream) {
+    // Quem não coube só precisa saber o motivo; se nem isso chegar, não há o que fazer.
+    let _ = stream
+        .write_all(error("servidor cheio").to_line().as_bytes())
+        .await;
 }
 
 /// Estado da sessão: antes do login só `login` é aceito; depois, tudo menos outro login,
@@ -91,20 +168,22 @@ async fn balances(core: &CoreHandle, account: AccountId) -> Result<ServerMessage
     Ok(ServerMessage::Balances { balances })
 }
 
-async fn session(stream: TcpStream, core: CoreHandle) {
+async fn session(stream: TcpStream, core: CoreHandle, idle_timeout: Duration) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut state = Session::AwaitingLogin;
     let mut line = Vec::new();
     loop {
         line.clear();
-        let (replies, keep_open) = match read_line(&mut reader, &mut line).await {
-            Err(_) | Ok(Read::Closed) => return,
-            Ok(Read::TooLong) => (
+        let read = tokio::time::timeout(idle_timeout, read_line(&mut reader, &mut line)).await;
+        let (replies, keep_open) = match read {
+            Err(_idle) => (vec![error("sessão ociosa")], false),
+            Ok(Err(_) | Ok(Read::Closed)) => return,
+            Ok(Ok(Read::TooLong)) => (
                 vec![error(format!("linha passa de {MAX_LINE} bytes"))],
                 false,
             ),
-            Ok(Read::Line) => handle(&line, &mut state, &core).await,
+            Ok(Ok(Read::Line)) => handle(&line, &mut state, &core).await,
         };
         if write(&mut writer, &replies).await.is_err() || !keep_open {
             return;
@@ -171,6 +250,7 @@ async fn write(
 mod tests {
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -181,11 +261,20 @@ mod tests {
 
     const PATIENCE: Duration = Duration::from_secs(5);
 
+    const ROOMY: Limits = Limits {
+        max_connections: NonZeroUsize::new(64).unwrap(),
+        idle_timeout: PATIENCE,
+    };
+
     async fn start(sequencer: Sequencer) -> SocketAddr {
+        start_with(sequencer, ROOMY).await
+    }
+
+    async fn start_with(sequencer: Sequencer, limits: Limits) -> SocketAddr {
         let (core, _thread) = spawn_core(sequencer, NonZeroUsize::new(16).unwrap()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, core));
+        tokio::spawn(serve(listener, core, limits));
         address
     }
 
@@ -470,5 +559,164 @@ mod tests {
             r#"{"type":"error","message":"o núcleo parou"}"#
         );
         assert!(client.closed().await);
+    }
+
+    #[test]
+    fn accept_failures_are_classified() {
+        use io::ErrorKind::{ConnectionAborted, ConnectionReset, Interrupted, InvalidInput};
+
+        for kind in [ConnectionAborted, ConnectionReset, Interrupted] {
+            assert_eq!(
+                classify(&io::Error::from(kind)),
+                AcceptFailure::Skip,
+                "{kind:?}"
+            );
+        }
+        for code in [EMFILE, ENFILE, ENOBUFS, ENOMEM] {
+            assert_eq!(
+                classify(&io::Error::from_raw_os_error(code)),
+                AcceptFailure::Pause(RESOURCE_PAUSE),
+                "errno {code}"
+            );
+        }
+        assert_eq!(
+            classify(&io::Error::from(InvalidInput)),
+            AcceptFailure::Fatal
+        );
+        let bad_descriptor = 9;
+        assert_eq!(
+            classify(&io::Error::from_raw_os_error(bad_descriptor)),
+            AcceptFailure::Fatal
+        );
+    }
+
+    #[tokio::test]
+    async fn connections_beyond_the_limit_are_told_and_closed() {
+        let limits = Limits {
+            max_connections: NonZeroUsize::new(2).unwrap(),
+            ..ROOMY
+        };
+        let address = start_with(Sequencer::in_memory(), limits).await;
+        let first = Client::login(address, 1).await;
+        let _second = Client::login(address, 2).await;
+
+        let mut third = Client::connect(address).await;
+        assert_eq!(
+            third.recv().await,
+            r#"{"type":"error","message":"servidor cheio"}"#
+        );
+        assert!(third.closed().await);
+
+        drop(first);
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let mut retry = Client::connect(address).await;
+            retry.send(r#"{"type":"login","account":3}"#).await;
+            if retry.recv().await == r#"{"type":"logged_in","account":3}"# {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "a vaga não voltou");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    const BRIEF: Limits = Limits {
+        idle_timeout: Duration::from_millis(150),
+        ..ROOMY
+    };
+
+    #[tokio::test]
+    async fn idle_session_is_told_and_closed() {
+        let address = start_with(Sequencer::in_memory(), BRIEF).await;
+        let mut client = Client::login(address, 1).await;
+
+        assert_eq!(
+            client.recv().await,
+            r#"{"type":"error","message":"sessão ociosa"}"#
+        );
+        assert!(client.closed().await);
+    }
+
+    #[tokio::test]
+    async fn line_trickled_slower_than_the_timeout_is_cut() {
+        let address = start_with(Sequencer::in_memory(), BRIEF).await;
+        let mut client = Client::login(address, 1).await;
+
+        for piece in [&b"{\"type\""[..], b":\"bal", b"ance\"}"] {
+            client.send_raw(piece).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+
+        assert_eq!(
+            client.recv().await,
+            r#"{"type":"error","message":"sessão ociosa"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn active_session_outlives_the_timeout() {
+        let address = start_with(Sequencer::in_memory(), BRIEF).await;
+        let mut client = Client::login(address, 1).await;
+
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            client.send(r#"{"type":"balance"}"#).await;
+            assert!(client.recv().await.starts_with(r#"{"type":"balances""#));
+        }
+    }
+
+    // Critério da F4, "borda não bloqueia núcleo", no caso mais direto: um cliente que só
+    // escreve e nunca lê enche os buffers do socket e prende a própria sessão na escrita.
+    // Ninguém mais pode sentir isso.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_that_never_reads_holds_back_only_itself() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut hog = Client::login(address, 9).await;
+        let written = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&written);
+        let flood = tokio::spawn(async move {
+            let burst = b"{\"type\":\"balance\"}\n".repeat(256);
+            while hog.writer.write_all(&burst).await.is_ok() {
+                counter.fetch_add(burst.len(), Ordering::Relaxed);
+            }
+        });
+
+        let deadline = tokio::time::Instant::now() + PATIENCE * 2;
+        let mut last = usize::MAX;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let now = written.load(Ordering::Relaxed);
+            if now == last {
+                break;
+            }
+            last = now;
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "o cliente nunca travou"
+            );
+        }
+
+        let mut alice = Client::login(address, 1).await;
+        let mut bob = Client::login(address, 2).await;
+        alice.fund().await;
+        bob.fund().await;
+        alice
+            .send(
+                r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":1}"#,
+            )
+            .await;
+        alice.recv().await;
+        bob.send(
+            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":1}"#,
+        )
+        .await;
+        assert!(bob.recv().await.starts_with(r#"{"type":"fill""#));
+
+        assert!(
+            !flood.is_finished(),
+            "o cliente que não lê continua travado"
+        );
+        assert_eq!(written.load(Ordering::Relaxed), last);
+        flood.abort();
     }
 }

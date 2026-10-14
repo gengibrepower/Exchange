@@ -26,7 +26,8 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F1** — ordens a mercado, execução parcial, GTC/IOC/FOK, cancelamento: concluída.
 - **F2** — contas, reservas, ledger de partidas dobradas com taxa de taker, risco pré-trade (tamanho máximo e colar de preço): concluída.
 - **F3** — WAL com `fsync` por registro, recuperação no boot e replay determinístico: concluída.
-- **Próxima: F4** — borda de rede: `tokio`, protocolo JSON por TCP, ponte de canais com o núcleo.
+- **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
+- **Próxima: F5** — market data: snapshot, incrementos e detecção de buraco por sequência.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -93,6 +94,51 @@ fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20
 ```
 
 Cada registro é `[tamanho u32][crc32 u32][comando em postcard]`, com o crc cobrindo tamanho e comando. Um registro cortado por crash é descartado no boot. Um registro íntegro mas inválido interrompe o boot com erro, em vez de seguir com um estado que não corresponde ao log. Sem `--wal`, tudo fica só em memória.
+
+## Servidor
+
+```
+cargo run -p edge --bin server -- [--listen <endereço:porta>] [--wal <caminho>]
+```
+
+Escuta em `127.0.0.1:7000` por padrão — só a própria máquina; para expor na rede, passe `--listen` explicitamente. Com `--wal`, persiste e retoma como o CLI. Cada linha enviada é uma mensagem JSON; cada resposta também. Qualquer cliente TCP serve, como `socat` ou `nc`:
+
+```
+$ socat - TCP:127.0.0.1:7000
+{"type":"login","account":1}
+{"type":"logged_in","account":1}
+{"type":"deposit","asset":"TESTE","amount":100000}
+{"type":"deposited","asset":"TESTE","amount":100000}
+{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":5}
+{"type":"rested","instrument":"TESTE/BRL","order":1,"lots":5}
+```
+
+Em outro terminal, outra conta compra parte dessa oferta:
+
+```
+$ socat - TCP:127.0.0.1:7000
+{"type":"login","account":2}
+{"type":"logged_in","account":2}
+{"type":"deposit","asset":"BRL","amount":10000000}
+{"type":"deposited","asset":"BRL","amount":10000000}
+{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2}
+{"type":"fill","instrument":"TESTE/BRL","taker":2,"maker":1,"lots":2,"price":10000,"fee":20}
+{"type":"balance"}
+{"type":"balances","balances":[{"asset":"TESTE","available":200,"reserved":0},{"asset":"BRL","available":9979980,"reserved":0}]}
+```
+
+Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
+
+| `type` | Campos | Efeito |
+|---|---|---|
+| `login` | `account` | primeira mensagem da conexão; a conta da casa (`0`) é recusada |
+| `deposit` | `asset`, `amount` | credita a conta da sessão |
+| `limit` | `instrument`, `side` (`buy`/`sell`), `price`, `lots`, `tif` opcional (`gtc`/`ioc`/`fok`) | ordem limite |
+| `market` | `instrument`, `side`, `lots`, `protection` e `tif` opcionais | ordem a mercado; sem `protection`, vale o colar de preço |
+| `cancel` | `instrument`, `order` | cancela uma ordem descansando |
+| `balance` | — | saldos da conta da sessão |
+
+O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `rejected` (com `code` estável e `message` legível), `balances` e `error`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
 
 ## Licença
 
