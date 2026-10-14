@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DomainError {
     NonPositivePrice(i64),
@@ -49,7 +51,8 @@ impl std::fmt::Display for DomainError {
 
 impl std::error::Error for DomainError {}
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
 pub struct Price(i64);
 
 impl Price {
@@ -73,7 +76,22 @@ impl Price {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+impl TryFrom<i64> for Price {
+    type Error = DomainError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Price> for i64 {
+    fn from(value: Price) -> Self {
+        value.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
 pub struct Lots(i64);
 
 impl Lots {
@@ -101,7 +119,22 @@ impl Lots {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+impl TryFrom<i64> for Lots {
+    type Error = DomainError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Lots> for i64 {
+    fn from(value: Lots) -> Self {
+        value.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct OrderId(u64);
 
 impl OrderId {
@@ -114,7 +147,8 @@ impl OrderId {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Seq(u64);
 
 impl Seq {
@@ -127,7 +161,8 @@ impl Seq {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct AccountId(u64);
 
 impl AccountId {
@@ -140,7 +175,8 @@ impl AccountId {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct InstrumentId(u32);
 
 impl InstrumentId {
@@ -153,7 +189,8 @@ impl InstrumentId {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct AssetId(u32);
 
 impl AssetId {
@@ -167,7 +204,8 @@ impl AssetId {
 }
 
 /// Quantia de um ativo em unidades-mínimas (centavos de BRL, unidades de TESTE...).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
 pub struct Amount(i64);
 
 impl Amount {
@@ -201,6 +239,20 @@ impl Amount {
             Some(n) if n >= 0 => Some(Self(n)),
             _ => None,
         }
+    }
+}
+
+impl TryFrom<i64> for Amount {
+    type Error = DomainError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Amount> for i64 {
+    fn from(value: Amount) -> Self {
+        value.0
     }
 }
 
@@ -309,7 +361,7 @@ pub struct Fill {
     pub lots: Lots,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Side {
     Bid,
     Ask,
@@ -326,7 +378,7 @@ pub enum OrderStatus {
     Expired,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum OrderKind {
     Limit(Price),
     /// Sem preço próprio; `protection` é o pior preço aceitável (máximo na compra,
@@ -336,7 +388,7 @@ pub enum OrderKind {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum TimeInForce {
     #[default]
     Gtc,
@@ -363,7 +415,7 @@ impl OrderStatus {
 
 /// O que o cliente pediu: dado puro, sem estado de execução. É isto que viaja no
 /// comando e vai para o log; o `Order` com status e restante só existe dentro do núcleo.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub id: OrderId,
     pub account: AccountId,
