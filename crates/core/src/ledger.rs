@@ -49,8 +49,8 @@ pub enum LedgerError {
 /// A oferta total de cada ativo nunca passa de `i64::MAX`. Como nenhum saldo é maior que
 /// a soma de todos, nenhum crédito pode estourar — o que deixa a liquidação infalível
 /// quando a reserva cobre os débitos.
-#[derive(Default)]
-#[cfg_attr(test, derive(Clone, PartialEq, Eq, Debug))]
+#[derive(Default, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub struct Ledger {
     balances: HashMap<(AccountId, AssetId), Balance>,
     supply: HashMap<AssetId, Amount>,

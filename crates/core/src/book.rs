@@ -24,7 +24,7 @@ pub enum CancelError {
     NotOwner,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq, Debug)]
 #[cfg_attr(test, derive(Clone))]
 pub struct OrderBook {
     bids: BTreeMap<Price, VecDeque<Order>>,

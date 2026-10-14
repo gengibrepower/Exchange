@@ -427,7 +427,7 @@ pub struct OrderRequest {
     pub time_in_force: TimeInForce,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Order {
     id: OrderId,
     account: AccountId,
