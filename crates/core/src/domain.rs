@@ -361,6 +361,20 @@ impl OrderStatus {
     }
 }
 
+/// O que o cliente pediu: dado puro, sem estado de execução. É isto que viaja no
+/// comando e vai para o log; o `Order` com status e restante só existe dentro do núcleo.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OrderRequest {
+    pub id: OrderId,
+    pub account: AccountId,
+    pub instrument: InstrumentId,
+    pub side: Side,
+    pub kind: OrderKind,
+    pub total: Lots,
+    pub seq: Seq,
+    pub time_in_force: TimeInForce,
+}
+
 #[derive(Clone, Debug)]
 pub struct Order {
     id: OrderId,
@@ -376,82 +390,31 @@ pub struct Order {
 }
 
 impl Order {
-    /// Ordem limite.
+    /// A única porta de entrada de uma ordem no núcleo: nasce `New`, com tudo restante.
     ///
     /// # Errors
-    /// [`DomainError::EmptyOrder`] se `total` for zero.
-    pub fn new(
-        id: OrderId,
-        account: AccountId,
-        instrument: InstrumentId,
-        side: Side,
-        price: Price,
-        total: Lots,
-        seq: Seq,
-    ) -> Result<Self, DomainError> {
-        Self::build(
-            id,
-            account,
-            instrument,
-            side,
-            OrderKind::Limit(price),
-            total,
-            seq,
-        )
-    }
-
-    /// Ordem a mercado: sem preço, nunca descansa; opcionalmente travada por `protection`.
-    ///
-    /// # Errors
-    /// [`DomainError::EmptyOrder`] se `total` for zero.
-    pub fn market(
-        id: OrderId,
-        account: AccountId,
-        instrument: InstrumentId,
-        side: Side,
-        total: Lots,
-        seq: Seq,
-        protection: Option<Price>,
-    ) -> Result<Self, DomainError> {
-        Self::build(
-            id,
-            account,
-            instrument,
-            side,
-            OrderKind::Market { protection },
-            total,
-            seq,
-        )
-    }
-
-    fn build(
-        id: OrderId,
-        account: AccountId,
-        instrument: InstrumentId,
-        side: Side,
-        kind: OrderKind,
-        total: Lots,
-        seq: Seq,
-    ) -> Result<Self, DomainError> {
-        if total == Lots::ZERO {
+    /// [`DomainError::EmptyOrder`] se `request.total` for zero.
+    pub(crate) fn from_request(request: OrderRequest) -> Result<Self, DomainError> {
+        if request.total == Lots::ZERO {
             return Err(DomainError::EmptyOrder);
         }
         Ok(Self {
-            id,
-            account,
-            instrument,
-            side,
-            kind,
-            total,
-            remaining: total,
-            seq,
+            id: request.id,
+            account: request.account,
+            instrument: request.instrument,
+            side: request.side,
+            kind: request.kind,
+            total: request.total,
+            remaining: request.total,
+            seq: request.seq,
             status: OrderStatus::New,
-            time_in_force: TimeInForce::default(),
+            time_in_force: request.time_in_force,
         })
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn with_time_in_force(mut self, time_in_force: TimeInForce) -> Self {
+    pub(crate) fn with_time_in_force(mut self, time_in_force: TimeInForce) -> Self {
         self.time_in_force = time_in_force;
         self
     }
@@ -662,42 +625,34 @@ mod tests {
         OrderStatus::Expired,
     ];
 
+    fn request(side: Side, kind: OrderKind, total: Lots) -> OrderRequest {
+        OrderRequest {
+            id: OrderId::new(1),
+            account: AccountId::new(1),
+            instrument: InstrumentId::new(1),
+            side,
+            kind,
+            total,
+            seq: Seq::new(1),
+            time_in_force: TimeInForce::Gtc,
+        }
+    }
+
     fn order_with_total(total: i64) -> Result<Order, DomainError> {
-        Order::new(
-            OrderId::new(1),
-            AccountId::new(1),
-            InstrumentId::new(1),
-            Side::Bid,
-            Price::new(10_000).unwrap(),
-            Lots::new(total).unwrap(),
-            Seq::new(1),
-        )
+        let kind = OrderKind::Limit(Price::new(10_000).unwrap());
+        Order::from_request(request(Side::Bid, kind, Lots::new(total).unwrap()))
     }
 
     fn limit(side: Side, price: i64) -> Order {
-        Order::new(
-            OrderId::new(1),
-            AccountId::new(1),
-            InstrumentId::new(1),
-            side,
-            Price::new(price).unwrap(),
-            Lots::new(1).unwrap(),
-            Seq::new(1),
-        )
-        .unwrap()
+        let kind = OrderKind::Limit(Price::new(price).unwrap());
+        Order::from_request(request(side, kind, Lots::new(1).unwrap())).unwrap()
     }
 
     fn protected(side: Side, protection: Option<i64>) -> Order {
-        Order::market(
-            OrderId::new(1),
-            AccountId::new(1),
-            InstrumentId::new(1),
-            side,
-            Lots::new(1).unwrap(),
-            Seq::new(1),
-            protection.map(|bound| Price::new(bound).unwrap()),
-        )
-        .unwrap()
+        let kind = OrderKind::Market {
+            protection: protection.map(|bound| Price::new(bound).unwrap()),
+        };
+        Order::from_request(request(side, kind, Lots::new(1).unwrap())).unwrap()
     }
 
     fn market(side: Side) -> Order {
@@ -781,15 +736,8 @@ mod tests {
 
     #[test]
     fn market_order_rejects_zero_lots() {
-        let result = Order::market(
-            OrderId::new(1),
-            AccountId::new(1),
-            InstrumentId::new(1),
-            Side::Bid,
-            Lots::ZERO,
-            Seq::new(1),
-            None,
-        );
+        let kind = OrderKind::Market { protection: None };
+        let result = Order::from_request(request(Side::Bid, kind, Lots::ZERO));
 
         assert_eq!(result.unwrap_err(), DomainError::EmptyOrder);
     }
@@ -942,13 +890,19 @@ mod tests {
     }
 
     #[test]
-    fn new_order_defaults_to_gtc() {
-        let order = order_with_total(5).unwrap();
+    fn order_keeps_the_requested_time_in_force() {
+        let kind = OrderKind::Limit(Price::new(10_000).unwrap());
+        let fok = OrderRequest {
+            time_in_force: TimeInForce::Fok,
+            ..request(Side::Bid, kind, Lots::new(5).unwrap())
+        };
 
-        assert_eq!(order.time_in_force(), TimeInForce::Gtc);
+        let order = Order::from_request(fok).unwrap();
+
+        assert_eq!(order.time_in_force(), TimeInForce::Fok);
         assert_eq!(
-            order.with_time_in_force(TimeInForce::Fok).time_in_force(),
-            TimeInForce::Fok
+            order.with_time_in_force(TimeInForce::Ioc).time_in_force(),
+            TimeInForce::Ioc
         );
     }
 
