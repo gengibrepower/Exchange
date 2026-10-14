@@ -7,7 +7,7 @@ use crate::domain::{
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Leftover {
     None,
-    Rested(Lots),
+    Rested { price: Price, lots: Lots },
     Cancelled(Lots),
     Expired(Lots),
 }
@@ -47,6 +47,37 @@ impl OrderBook {
 
     pub fn contains(&self, id: OrderId) -> bool {
         self.index.contains_key(&id)
+    }
+
+    /// Profundidade de um lado (Nível 2, seção 4.3): cada preço com a soma do que ainda
+    /// resta nas ordens dele, do melhor para o pior — compras do maior preço para o menor,
+    /// vendas do menor para o maior.
+    ///
+    /// # Panics
+    /// Nunca com o livro alimentado pelo [`crate::engine::Engine`]: toda ordem em repouso tem
+    /// reserva, a reserva é limitada pela oferta do ativo, e por isso a soma de um nível
+    /// cabe em `i64`.
+    pub fn depth(&self, side: Side) -> Vec<(Price, Lots)> {
+        let total = |level: &VecDeque<Order>| {
+            level
+                .iter()
+                .map(Order::remaining)
+                .try_fold(Lots::ZERO, Lots::checked_add)
+                .expect("reservas limitam a soma de um nível a i64")
+        };
+        match side {
+            Side::Bid => self
+                .bids
+                .iter()
+                .rev()
+                .map(|(price, level)| (*price, total(level)))
+                .collect(),
+            Side::Ask => self
+                .asks
+                .iter()
+                .map(|(price, level)| (*price, total(level)))
+                .collect(),
+        }
     }
 
     #[cfg(test)]
@@ -127,7 +158,10 @@ impl OrderBook {
                 }
                 (TimeInForce::Gtc, OrderKind::Limit(price)) => {
                     self.rest(taker, price);
-                    Leftover::Rested(remaining)
+                    Leftover::Rested {
+                        price,
+                        lots: remaining,
+                    }
                 }
                 (TimeInForce::Ioc, _) | (TimeInForce::Gtc, OrderKind::Market { .. }) => {
                     taker
@@ -506,6 +540,51 @@ mod tests {
         order
     }
 
+    fn levels(pairs: &[(i64, i64)]) -> Vec<(Price, Lots)> {
+        pairs
+            .iter()
+            .map(|&(units, quantity)| (price(units), lots(quantity)))
+            .collect()
+    }
+
+    #[test]
+    fn empty_book_has_no_depth() {
+        let book = OrderBook::new();
+
+        assert_eq!(book.depth(Side::Bid), vec![]);
+        assert_eq!(book.depth(Side::Ask), vec![]);
+    }
+
+    #[test]
+    fn depth_sums_each_price_best_first_on_both_sides() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Bid, 99, 2));
+        place(&mut book, order(2, Side::Bid, 100, 3));
+        place(&mut book, order(3, Side::Bid, 99, 4));
+        place(&mut book, order(4, Side::Ask, 102, 1));
+        place(&mut book, order(5, Side::Ask, 101, 5));
+        place(&mut book, order(6, Side::Ask, 102, 6));
+
+        assert_eq!(book.depth(Side::Bid), levels(&[(100, 3), (99, 6)]));
+        assert_eq!(book.depth(Side::Ask), levels(&[(101, 5), (102, 7)]));
+    }
+
+    #[test]
+    fn depth_follows_partial_fills_and_cancels() {
+        let mut book = OrderBook::new();
+        place(&mut book, order(1, Side::Ask, 101, 5));
+        place(&mut book, order(2, Side::Ask, 101, 2));
+        place(&mut book, order(3, Side::Ask, 103, 4));
+
+        book.submit(order(4, Side::Bid, 101, 6));
+        assert_eq!(book.depth(Side::Ask), levels(&[(101, 1), (103, 4)]));
+
+        book.cancel(OrderId::new(2), AccountId::new(1))
+            .expect("ordem descansando");
+        assert_eq!(book.depth(Side::Ask), levels(&[(103, 4)]));
+        assert_eq!(book.depth(Side::Bid), vec![]);
+    }
+
     #[test]
     fn outcome_reports_rested_remainder() {
         let mut book = OrderBook::new();
@@ -514,7 +593,13 @@ mod tests {
         let outcome = book.submit(order(2, Side::Bid, 100, 5));
 
         assert_eq!(outcome.fills.len(), 1);
-        assert_eq!(outcome.leftover, Leftover::Rested(lots(3)));
+        assert_eq!(
+            outcome.leftover,
+            Leftover::Rested {
+                price: price(100),
+                lots: lots(3)
+            }
+        );
     }
 
     #[test]
