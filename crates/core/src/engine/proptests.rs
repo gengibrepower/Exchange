@@ -4,8 +4,8 @@ use proptest::prelude::*;
 
 use super::{Command, Engine, Event, FeeSchedule, ListingConfig, RiskLimits};
 use crate::domain::{
-    AccountId, Amount, AssetId, Bps, Fill, Instrument, InstrumentId, Lots, Order, OrderId, Price,
-    Seq, Side, TimeInForce,
+    AccountId, Amount, AssetId, Bps, Fill, Instrument, InstrumentId, Lots, OrderId, OrderKind,
+    OrderRequest, Price, Seq, Side, TimeInForce,
 };
 
 const TESTE_BRL: InstrumentId = InstrumentId::new(1);
@@ -101,15 +101,22 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
             let id = *next_id;
             *next_id += 1;
             let lots = Lots::new(*lots).expect("faixa positiva");
-            let (order_id, account, seq) = (OrderId::new(id), ACCOUNTS[*account], Seq::new(id));
-            let order = if let Some(price) = price {
-                let price = Price::new(*price).expect("faixa positiva");
-                Order::new(order_id, account, instrument, *side, price, lots, seq)
-            } else {
-                let protection = protection.map(|bound| Price::new(bound).expect("faixa positiva"));
-                Order::market(order_id, account, instrument, *side, lots, seq, protection)
+            let kind = match price {
+                Some(price) => OrderKind::Limit(Price::new(*price).expect("faixa positiva")),
+                None => OrderKind::Market {
+                    protection: protection.map(|bound| Price::new(bound).expect("faixa positiva")),
+                },
             };
-            Command::Submit(order.expect("ordem válida").with_time_in_force(*tif))
+            Command::Submit(OrderRequest {
+                id: OrderId::new(id),
+                account: ACCOUNTS[*account],
+                instrument,
+                side: *side,
+                kind,
+                total: lots,
+                seq: Seq::new(id),
+                time_in_force: *tif,
+            })
         }
         Op::Cancel {
             instrument,

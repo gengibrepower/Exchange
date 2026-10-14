@@ -3,18 +3,18 @@ use std::collections::HashMap;
 use crate::book::{CancelError, Leftover, OrderBook};
 use crate::domain::{
     AccountId, Amount, AssetId, Bps, Fill, Instrument, InstrumentId, Lots, Order, OrderId,
-    OrderStatus, Price, Side,
+    OrderRequest, OrderStatus, Price, Side,
 };
 use crate::ledger::{Balance, Ledger, LedgerError, Transfer};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Command {
     Deposit {
         account: AccountId,
         asset: AssetId,
         amount: Amount,
     },
-    Submit(Order),
+    Submit(OrderRequest),
     Cancel {
         instrument: InstrumentId,
         account: AccountId,
@@ -63,7 +63,7 @@ pub enum Event {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RejectReason {
     UnknownInstrument(InstrumentId),
-    NotNew(OrderStatus),
+    EmptyOrder,
     OffTick {
         price: Price,
         tick: Price,
@@ -233,12 +233,19 @@ impl Engine {
     /// # Panics
     /// Nunca por entrada: a reserva cobre todo débito da liquidação e a oferta limitada
     /// do ledger impede estouro nos créditos. Se a liquidação falhar, o invariante
-    /// quebrou e parar é o certo (fail-stop).
-    fn submit(&mut self, order: Order) -> Vec<Event> {
-        let id = order.id();
-        let instrument = order.instrument();
-        let account = order.account();
+    /// quebrou e parar é o certo (fail-stop). O aceite também não falha: a ordem acabou
+    /// de nascer do pedido e só pode estar em `New`.
+    fn submit(&mut self, request: OrderRequest) -> Vec<Event> {
+        let OrderRequest {
+            id,
+            account,
+            instrument,
+            ..
+        } = request;
         let reject = |reason| vec![Event::Rejected { order: id, reason }];
+        let Ok(order) = Order::from_request(request) else {
+            return reject(RejectReason::EmptyOrder);
+        };
 
         if account == self.fees.house {
             return reject(RejectReason::HouseCannotTrade);
@@ -264,9 +271,9 @@ impl Engine {
             Ok(order) => order,
             Err(reason) => return reject(reason),
         };
-        if order.transition(OrderStatus::Accepted).is_err() {
-            return reject(RejectReason::NotNew(order.status()));
-        }
+        order
+            .transition(OrderStatus::Accepted)
+            .expect("ordem recém-construída está em New, e New → Accepted é legal");
         let (asset, per_lot) = match reservation_per_lot(&order, &spec, self.fees.taker_bps) {
             Ok(reservation) => reservation,
             Err(reason) => return reject(reason),
@@ -608,7 +615,7 @@ mod proptests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Seq, TimeInForce};
+    use crate::domain::{OrderKind, Seq, TimeInForce};
 
     const TESTE_BRL: InstrumentId = InstrumentId::new(1);
     const OUTRO_BRL: InstrumentId = InstrumentId::new(2);
@@ -695,20 +702,38 @@ mod tests {
         }
     }
 
-    fn order_for(account: AccountId, id: u64, side: Side, price: i64, quantity: i64) -> Order {
-        Order::new(
-            OrderId::new(id),
+    fn request(
+        account: AccountId,
+        id: u64,
+        instrument: InstrumentId,
+        side: Side,
+        kind: OrderKind,
+        quantity: i64,
+    ) -> OrderRequest {
+        OrderRequest {
+            id: OrderId::new(id),
             account,
-            TESTE_BRL,
+            instrument,
             side,
-            Price::new(price).expect("preço de teste válido"),
-            lots(quantity),
-            Seq::new(id),
-        )
-        .expect("ordem de teste válida")
+            kind,
+            total: lots(quantity),
+            seq: Seq::new(id),
+            time_in_force: TimeInForce::Gtc,
+        }
     }
 
-    fn market_for(account: AccountId, id: u64, side: Side, quantity: i64) -> Order {
+    fn order_for(
+        account: AccountId,
+        id: u64,
+        side: Side,
+        price: i64,
+        quantity: i64,
+    ) -> OrderRequest {
+        let kind = OrderKind::Limit(Price::new(price).expect("preço de teste válido"));
+        request(account, id, TESTE_BRL, side, kind, quantity)
+    }
+
+    fn market_for(account: AccountId, id: u64, side: Side, quantity: i64) -> OrderRequest {
         protected_for(account, id, side, quantity, None)
     }
 
@@ -718,20 +743,20 @@ mod tests {
         side: Side,
         quantity: i64,
         protection: Option<i64>,
-    ) -> Order {
-        Order::market(
-            OrderId::new(id),
+    ) -> OrderRequest {
+        let protection =
+            protection.map(|bound| Price::new(bound).expect("proteção de teste válida"));
+        request(
             account,
+            id,
             TESTE_BRL,
             side,
-            lots(quantity),
-            Seq::new(id),
-            protection.map(|bound| Price::new(bound).expect("proteção de teste válida")),
+            OrderKind::Market { protection },
+            quantity,
         )
-        .expect("ordem de teste válida")
     }
 
-    fn submit(engine: &mut Engine, order: Order) -> Vec<Event> {
+    fn submit(engine: &mut Engine, order: OrderRequest) -> Vec<Event> {
         engine.apply(Command::Submit(order))
     }
 
@@ -960,13 +985,19 @@ mod tests {
 
         submit(
             &mut engine,
-            order_for(ALICE, 2, Side::Bid, 100, 3).with_time_in_force(TimeInForce::Ioc),
+            OrderRequest {
+                time_in_force: TimeInForce::Ioc,
+                ..order_for(ALICE, 2, Side::Bid, 100, 3)
+            },
         );
         assert_eq!(engine.balance(ALICE, BRL), balance(900, 0));
 
         submit(
             &mut engine,
-            order_for(ALICE, 3, Side::Bid, 100, 5).with_time_in_force(TimeInForce::Fok),
+            OrderRequest {
+                time_in_force: TimeInForce::Fok,
+                ..order_for(ALICE, 3, Side::Bid, 100, 5)
+            },
         );
         assert_eq!(engine.balance(ALICE, BRL), balance(900, 0));
     }
@@ -1249,17 +1280,15 @@ mod tests {
         assert!(matches!(events.as_slice(), [Event::Fill { .. }]));
     }
 
-    fn order(id: u64, instrument: InstrumentId, side: Side, price: i64, lots: i64) -> Order {
-        Order::new(
-            OrderId::new(id),
-            AccountId::new(1),
-            instrument,
-            side,
-            Price::new(price).expect("preço de teste válido"),
-            Lots::new(lots).expect("lots de teste válidos"),
-            Seq::new(id),
-        )
-        .expect("ordem de teste válida")
+    fn order(
+        id: u64,
+        instrument: InstrumentId,
+        side: Side,
+        price: i64,
+        quantity: i64,
+    ) -> OrderRequest {
+        let kind = OrderKind::Limit(Price::new(price).expect("preço de teste válido"));
+        request(AccountId::new(1), id, instrument, side, kind, quantity)
     }
 
     fn lots(value: i64) -> Lots {
@@ -1283,20 +1312,16 @@ mod tests {
     }
 
     #[test]
-    fn order_not_new_is_rejected() {
+    fn empty_order_is_rejected_before_the_book() {
         let mut engine = engine(&[TESTE_BRL]);
-        let mut accepted = order(1, TESTE_BRL, Side::Bid, 100, 5);
-        accepted
-            .transition(OrderStatus::Accepted)
-            .expect("ordem nova pode ser aceita");
 
-        let events = engine.apply(Command::Submit(accepted));
+        let events = engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Bid, 100, 0)));
 
         assert_eq!(
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
-                reason: RejectReason::NotNew(OrderStatus::Accepted),
+                reason: RejectReason::EmptyOrder,
             }]
         );
         let book = engine.book(TESTE_BRL).expect("instrumento registrado");
@@ -1402,7 +1427,10 @@ mod tests {
     fn ioc_remainder_emits_cancelled_after_fills() {
         let mut engine = engine(&[TESTE_BRL]);
         engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 100, 2)));
-        let ioc = order(2, TESTE_BRL, Side::Bid, 100, 5).with_time_in_force(TimeInForce::Ioc);
+        let ioc = OrderRequest {
+            time_in_force: TimeInForce::Ioc,
+            ..order(2, TESTE_BRL, Side::Bid, 100, 5)
+        };
 
         let events = engine.apply(Command::Submit(ioc));
 
@@ -1423,7 +1451,10 @@ mod tests {
     fn fok_without_liquidity_emits_only_expired() {
         let mut engine = engine(&[TESTE_BRL]);
         engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 100, 2)));
-        let fok = order(2, TESTE_BRL, Side::Bid, 100, 5).with_time_in_force(TimeInForce::Fok);
+        let fok = OrderRequest {
+            time_in_force: TimeInForce::Fok,
+            ..order(2, TESTE_BRL, Side::Bid, 100, 5)
+        };
 
         let events = engine.apply(Command::Submit(fok));
 

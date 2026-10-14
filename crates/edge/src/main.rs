@@ -3,8 +3,8 @@ mod parse;
 use std::io::{self, BufRead, Write};
 
 use exchange_core::domain::{
-    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, Order, OrderId, OrderKind,
-    Price, Seq,
+    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, OrderId, OrderRequest, Price,
+    Seq,
 };
 use exchange_core::engine::{
     Command, Engine, Event, FeeSchedule, ListingConfig, RejectReason, RiskLimits,
@@ -61,25 +61,18 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                     writeln!(output, "erro: instrumento desconhecido \"{symbol}\"")?;
                     continue;
                 };
-                let id = OrderId::new(next_seq);
-                let seq = Seq::new(next_seq);
-                let order = match kind {
-                    OrderKind::Limit(price) => {
-                        Order::new(id, ACCOUNT, instrument, side, price, lots, seq)
-                    }
-                    OrderKind::Market { protection } => {
-                        Order::market(id, ACCOUNT, instrument, side, lots, seq, protection)
-                    }
-                };
-                let order = match order {
-                    Ok(order) => order.with_time_in_force(time_in_force),
-                    Err(error) => {
-                        writeln!(output, "erro: {error}")?;
-                        continue;
-                    }
+                let request = OrderRequest {
+                    id: OrderId::new(next_seq),
+                    account: ACCOUNT,
+                    instrument,
+                    side,
+                    kind,
+                    total: lots,
+                    seq: Seq::new(next_seq),
+                    time_in_force,
                 };
                 next_seq += 1;
-                Command::Submit(order)
+                Command::Submit(request)
             }
             Ok(Input::Deposit {
                 asset: name,
@@ -216,7 +209,7 @@ fn render(event: &Event) -> String {
         Event::Rejected { order, reason } => {
             let reason = match reason {
                 RejectReason::UnknownInstrument(_) => "instrumento desconhecido".to_string(),
-                RejectReason::NotNew(status) => format!("ordem já estava em {status:?}"),
+                RejectReason::EmptyOrder => "ordem precisa de pelo menos 1 lot".to_string(),
                 RejectReason::OffTick { price, tick } => {
                     format!("preço {} fora do tick {}", price.get(), tick.get())
                 }
@@ -311,16 +304,24 @@ mod tests {
 
     #[test]
     fn invalid_input_reports_error_and_does_not_consume_seq() {
-        let output = session(
-            "buy TESTE/BRL abc 5\nbuy TESTE/BRL 100 0\nbuy BTC/BRL 100 1\nsell TESTE/BRL 10000 1\n",
-        );
+        let output = session("buy TESTE/BRL abc 5\nbuy BTC/BRL 100 1\nsell TESTE/BRL 10000 1\n");
 
         assert_eq!(
             output,
             "erro: número inválido \"abc\"\n\
-             erro: ordem precisa de pelo menos 1 lot\n\
              erro: instrumento desconhecido \"BTC/BRL\"\n\
              #1 descansou: 1 lots em TESTE/BRL\n"
+        );
+    }
+
+    #[test]
+    fn zero_lots_is_rejected_by_the_core_and_consumes_seq() {
+        let output = session("buy TESTE/BRL 100 0\nsell TESTE/BRL 10000 1\n");
+
+        assert_eq!(
+            output,
+            "#1 rejeitada: ordem precisa de pelo menos 1 lot\n\
+             #2 descansou: 1 lots em TESTE/BRL\n"
         );
     }
 

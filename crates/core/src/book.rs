@@ -236,7 +236,7 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::domain::{Fill, InstrumentId, OrderStatus, Seq};
+    use crate::domain::{Fill, InstrumentId, OrderRequest, OrderStatus, Seq};
 
     pub(super) fn price(units_per_lot: i64) -> Price {
         Price::new(units_per_lot).expect("preço de teste válido")
@@ -371,20 +371,14 @@ mod tests {
         quantity: i64,
         protection: Option<i64>,
     ) -> Order {
-        let mut order = Order::market(
-            OrderId::new(id),
-            AccountId::new(1),
-            InstrumentId::new(1),
+        accepted(
+            id,
             side,
-            lots(quantity),
-            Seq::new(id),
-            protection.map(price),
+            OrderKind::Market {
+                protection: protection.map(price),
+            },
+            quantity,
         )
-        .expect("ordem de teste válida");
-        order
-            .transition(OrderStatus::Accepted)
-            .expect("ordem nova pode ser aceita");
-        order
     }
 
     #[test]
@@ -491,16 +485,21 @@ mod tests {
     }
 
     pub(super) fn order(id: u64, side: Side, price_units: i64, quantity: i64) -> Order {
-        let mut order = Order::new(
-            OrderId::new(id),
-            AccountId::new(1),
-            InstrumentId::new(1),
+        accepted(id, side, OrderKind::Limit(price(price_units)), quantity)
+    }
+
+    fn accepted(id: u64, side: Side, kind: OrderKind, quantity: i64) -> Order {
+        let request = OrderRequest {
+            id: OrderId::new(id),
+            account: AccountId::new(1),
+            instrument: InstrumentId::new(1),
             side,
-            price(price_units),
-            lots(quantity),
-            Seq::new(id),
-        )
-        .expect("ordem de teste válida");
+            kind,
+            total: lots(quantity),
+            seq: Seq::new(id),
+            time_in_force: TimeInForce::Gtc,
+        };
+        let mut order = Order::from_request(request).expect("ordem de teste válida");
         order
             .transition(OrderStatus::Accepted)
             .expect("ordem nova pode ser aceita");
