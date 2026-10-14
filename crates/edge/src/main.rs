@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use edge::market::{ASSETS, asset_id, asset_name, instrument_id, symbol};
+use edge::protocol::reject_message;
 use edge::sequencer::{Intent, Sequencer};
 use exchange_core::domain::AccountId;
-use exchange_core::engine::{Event, RejectReason};
+use exchange_core::engine::Event;
 
 use crate::parse::{Input, parse_line};
 
@@ -184,40 +185,7 @@ fn render(event: &Event) -> String {
             symbol(*instrument)
         ),
         Event::Rejected { order, reason } => {
-            let reason = match reason {
-                RejectReason::UnknownInstrument(_) => "instrumento desconhecido".to_string(),
-                RejectReason::EmptyOrder => "ordem precisa de pelo menos 1 lot".to_string(),
-                RejectReason::OffTick { price, tick } => {
-                    format!("preço {} fora do tick {}", price.get(), tick.get())
-                }
-                RejectReason::OrderTooLarge { lots, max } => {
-                    format!("{} lots passa do máximo de {}", lots.get(), max.get())
-                }
-                RejectReason::OutsideCollar { bound, edge } => format!(
-                    "preço {} fora do colar (limite {})",
-                    bound.get(),
-                    edge.get()
-                ),
-                RejectReason::NoReferencePrice => {
-                    "ordem a mercado sem contraparte para servir de referência".to_string()
-                }
-                RejectReason::ValueOverflow => "valor da ordem estoura o limite".to_string(),
-                RejectReason::InsufficientFunds {
-                    asset,
-                    available,
-                    required,
-                } => format!(
-                    "saldo insuficiente em {}: disponível {}, necessário {}",
-                    asset_name(*asset),
-                    available.get(),
-                    required.get()
-                ),
-                RejectReason::DuplicateOrderId => "id de ordem já em uso".to_string(),
-                RejectReason::HouseCannotTrade => "a conta da casa não negocia".to_string(),
-                RejectReason::UnknownOrder => "ordem não está no livro".to_string(),
-                RejectReason::NotOwner => "ordem pertence a outra conta".to_string(),
-            };
-            format!("#{} rejeitada: {reason}", order.get())
+            format!("#{} rejeitada: {}", order.get(), reject_message(reason))
         }
     }
 }
