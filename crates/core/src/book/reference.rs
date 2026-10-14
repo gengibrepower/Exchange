@@ -55,9 +55,14 @@ impl ReferenceBook {
         let remaining = taker.remaining();
         let leftover = if remaining == Lots::ZERO {
             Leftover::None
-        } else if taker.time_in_force() == TimeInForce::Gtc && taker.limit_price().is_some() {
+        } else if let Some(price) = taker.limit_price()
+            && taker.time_in_force() == TimeInForce::Gtc
+        {
             self.resting.push(taker);
-            Leftover::Rested(remaining)
+            Leftover::Rested {
+                price,
+                lots: remaining,
+            }
         } else {
             taker
                 .transition(OrderStatus::Cancelled)

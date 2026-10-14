@@ -41,9 +41,13 @@ pub enum Event {
         fill: Fill,
         fee: Amount,
     },
+    /// A sobra de uma ordem limite que ficou no livro; lado e preço deixam quem só consome
+    /// eventos (o feed de market data, seção 4.3) reconstruir o livro sem olhar o engine.
     Rested {
         instrument: InstrumentId,
         order: OrderId,
+        side: Side,
+        price: Price,
         lots: Lots,
     },
     Cancelled {
@@ -335,6 +339,7 @@ impl Engine {
             &mut self.ledger,
             &mut self.reservations,
             (instrument, id),
+            taker.side,
             outcome.leftover,
         ));
         events
@@ -561,14 +566,17 @@ fn close_leftover(
     ledger: &mut Ledger,
     reservations: &mut Reservations,
     key: (InstrumentId, OrderId),
+    side: Side,
     leftover: Leftover,
 ) -> Option<Event> {
     let (instrument, order) = key;
     match leftover {
         Leftover::None => None,
-        Leftover::Rested(lots) => Some(Event::Rested {
+        Leftover::Rested { price, lots } => Some(Event::Rested {
             instrument,
             order,
+            side,
+            price,
             lots,
         }),
         Leftover::Cancelled(lots) => {
@@ -1487,11 +1495,31 @@ mod tests {
             vec![Event::Rested {
                 instrument: TESTE_BRL,
                 order: OrderId::new(1),
+                side: Side::Bid,
+                price: Price::new(100).expect("preço de teste válido"),
                 lots: lots(5),
             }]
         );
         let book = engine.book(TESTE_BRL).expect("instrumento registrado");
         assert_eq!(book.best_bid(), Price::new(100).ok());
+    }
+
+    #[test]
+    fn rested_sell_carries_its_side_and_limit_price() {
+        let mut engine = engine(&[TESTE_BRL]);
+
+        let events = engine.apply(Command::Submit(order(1, TESTE_BRL, Side::Ask, 120, 4)));
+
+        assert_eq!(
+            events,
+            vec![Event::Rested {
+                instrument: TESTE_BRL,
+                order: OrderId::new(1),
+                side: Side::Ask,
+                price: Price::new(120).expect("preço de teste válido"),
+                lots: lots(4),
+            }]
+        );
     }
 
     #[test]
@@ -1517,6 +1545,8 @@ mod tests {
                 Event::Rested {
                     instrument: TESTE_BRL,
                     order: OrderId::new(2),
+                    side: Side::Bid,
+                    price: Price::new(100).expect("preço de teste válido"),
                     lots: lots(3),
                 },
             ]

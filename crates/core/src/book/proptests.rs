@@ -145,6 +145,37 @@ fn index_mirrors_book(book: &OrderBook) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// Oráculo da profundidade: agrupa as ordens em repouso por preço somando em `i64` puro,
+/// sem passar pelo `depth`, e compara.
+fn depth_mirrors_book(book: &OrderBook) -> Result<(), TestCaseError> {
+    for (side, levels) in [(Side::Bid, &book.bids), (Side::Ask, &book.asks)] {
+        let mut expected: Vec<(i64, i64)> = levels
+            .iter()
+            .map(|(price, level)| {
+                (
+                    price.get(),
+                    level.iter().map(|order| order.remaining().get()).sum(),
+                )
+            })
+            .collect();
+        if side == Side::Bid {
+            expected.reverse();
+        }
+        let depth: Vec<(i64, i64)> = book
+            .depth(side)
+            .into_iter()
+            .map(|(price, lots)| (price.get(), lots.get()))
+            .collect();
+        prop_assert_eq!(&depth, &expected, "profundidade de {:?}", side);
+        prop_assert!(
+            depth.iter().all(|&(_, lots)| lots > 0),
+            "nível zerado em {:?}",
+            side
+        );
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2_000))]
 
@@ -209,7 +240,7 @@ proptest! {
             let filled: i64 = outcome.fills.iter().map(|fill| fill.lots.get()).sum();
             let left = match outcome.leftover {
                 Leftover::None => 0,
-                Leftover::Rested(lots) | Leftover::Cancelled(lots) | Leftover::Expired(lots) => {
+                Leftover::Rested { lots, .. } | Leftover::Cancelled(lots) | Leftover::Expired(lots) => {
                     lots.get()
                 }
             };
@@ -339,6 +370,7 @@ proptest! {
                 }
             }
             index_mirrors_book(&book)?;
+            depth_mirrors_book(&book)?;
             prop_assert!(book.bids.values().all(|level| !level.is_empty()));
             prop_assert!(book.asks.values().all(|level| !level.is_empty()));
             if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {

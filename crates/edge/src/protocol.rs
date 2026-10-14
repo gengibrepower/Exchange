@@ -281,6 +281,7 @@ impl From<&Event> for ServerMessage {
                 instrument,
                 order,
                 lots,
+                ..
             } => Self::Rested {
                 instrument: symbol(instrument),
                 order,
@@ -642,6 +643,8 @@ mod tests {
             line(&Event::Rested {
                 instrument: TESTE_BRL,
                 order: OrderId::new(1),
+                side: CoreSide::Bid,
+                price: price(10_000),
                 lots: lots(5)
             }),
             "{\"type\":\"rested\",\"instrument\":\"TESTE/BRL\",\"order\":1,\"lots\":5}\n"

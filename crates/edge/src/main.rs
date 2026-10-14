@@ -158,6 +158,7 @@ fn render(event: &Event) -> String {
             instrument,
             order,
             lots,
+            ..
         } => format!(
             "#{} descansou: {} lots em {}",
             order.get(),

@@ -111,6 +111,10 @@ impl Lots {
         self.0
     }
 
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.0.checked_add(rhs.0).map(Self)
+    }
+
     pub fn checked_sub(self, rhs: Self) -> Option<Self> {
         match self.0.checked_sub(rhs.0) {
             Some(n) if n >= 0 => Some(Self(n)),
