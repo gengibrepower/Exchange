@@ -12,9 +12,10 @@ use exchange_core::engine::{Event, RejectReason};
 use serde::{Deserialize, Serialize};
 
 use crate::market::{asset_id, asset_name, instrument_id, symbol};
+use crate::market_data::{Body, Feed as CoreFeed, Quote, Snapshot, Update};
 use crate::sequencer::Intent;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     Buy,
@@ -26,6 +27,40 @@ impl From<Side> for CoreSide {
         match side {
             Side::Buy => Self::Bid,
             Side::Sell => Self::Ask,
+        }
+    }
+}
+
+impl From<CoreSide> for Side {
+    fn from(side: CoreSide) -> Self {
+        match side {
+            CoreSide::Bid => Self::Buy,
+            CoreSide::Ask => Self::Sell,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Feed {
+    L1,
+    L2,
+}
+
+impl From<Feed> for CoreFeed {
+    fn from(feed: Feed) -> Self {
+        match feed {
+            Feed::L1 => Self::L1,
+            Feed::L2 => Self::L2,
+        }
+    }
+}
+
+impl From<CoreFeed> for Feed {
+    fn from(feed: CoreFeed) -> Self {
+        match feed {
+            CoreFeed::L1 => Self::L1,
+            CoreFeed::L2 => Self::L2,
         }
     }
 }
@@ -86,6 +121,12 @@ pub enum ClientMessage {
     /// Variante com chaves vazias, não unitária: só assim o `deny_unknown_fields` vale
     /// para ela, e `{"type":"balance","account":1}` é erro em vez de ter o campo ignorado.
     Balance {},
+    /// Pública: vale antes do login. Assinar de novo o mesmo fluxo devolve um snapshot novo,
+    /// que é como o cliente se recupera de um buraco na sequência.
+    Subscribe {
+        instrument: String,
+        feed: Feed,
+    },
 }
 
 /// O que a sessão faz com uma mensagem já validada e com nomes traduzidos em ids.
@@ -94,6 +135,10 @@ pub enum Inbound {
     Login(AccountId),
     Balance,
     Submit(Intent),
+    Subscribe {
+        instrument: InstrumentId,
+        feed: CoreFeed,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -133,6 +178,10 @@ impl ClientMessage {
         let intent = match self {
             Self::Login { account } => return Ok(Inbound::Login(account)),
             Self::Balance {} => return Ok(Inbound::Balance),
+            Self::Subscribe { instrument, feed } => {
+                let (instrument, feed) = subscription(instrument, feed)?;
+                return Ok(Inbound::Subscribe { instrument, feed });
+            }
             Self::Deposit { asset, amount } => Intent::Deposit {
                 account,
                 asset: known_asset(asset)?,
@@ -176,12 +225,38 @@ impl ClientMessage {
     }
 }
 
+/// O alvo de uma assinatura, sem precisar de conta: o feed é público.
+///
+/// # Errors
+/// [`ProtocolError::UnknownInstrument`] se o instrumento não existir.
+pub fn subscription(
+    instrument: String,
+    feed: Feed,
+) -> Result<(InstrumentId, CoreFeed), ProtocolError> {
+    Ok((known_instrument(instrument)?, feed.into()))
+}
+
 fn known_instrument(name: String) -> Result<InstrumentId, ProtocolError> {
     instrument_id(&name).ok_or(ProtocolError::UnknownInstrument(name))
 }
 
 fn known_asset(name: String) -> Result<AssetId, ProtocolError> {
     asset_id(&name).ok_or(ProtocolError::UnknownAsset(name))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+pub struct Level {
+    pub price: Price,
+    pub lots: Lots,
+}
+
+impl From<Quote> for Level {
+    fn from(quote: Quote) -> Self {
+        Self {
+            price: quote.price,
+            lots: quote.lots,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
@@ -241,6 +316,82 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+    Snapshot {
+        instrument: &'static str,
+        feed: Feed,
+        seq: u64,
+        bids: Vec<Level>,
+        asks: Vec<Level>,
+    },
+    /// Nível 2: quantidade absoluta no preço; zero quer dizer que o nível sumiu.
+    Depth {
+        instrument: &'static str,
+        feed: Feed,
+        seq: u64,
+        side: Side,
+        price: Price,
+        lots: Lots,
+    },
+    /// Nível 1: o topo do livro, `null` no lado vazio.
+    Top {
+        instrument: &'static str,
+        feed: Feed,
+        seq: u64,
+        bid: Option<Level>,
+        ask: Option<Level>,
+    },
+    Trade {
+        instrument: &'static str,
+        feed: Feed,
+        seq: u64,
+        price: Price,
+        lots: Lots,
+    },
+}
+
+impl From<&Snapshot> for ServerMessage {
+    fn from(snapshot: &Snapshot) -> Self {
+        let levels = |quotes: &[Quote]| quotes.iter().copied().map(Level::from).collect();
+        Self::Snapshot {
+            instrument: symbol(snapshot.instrument),
+            feed: snapshot.feed.into(),
+            seq: snapshot.seq,
+            bids: levels(&snapshot.bids),
+            asks: levels(&snapshot.asks),
+        }
+    }
+}
+
+impl From<&Update> for ServerMessage {
+    fn from(update: &Update) -> Self {
+        let instrument = symbol(update.instrument);
+        let feed = update.feed.into();
+        let seq = update.seq;
+        match update.body {
+            Body::Level { side, price, lots } => Self::Depth {
+                instrument,
+                feed,
+                seq,
+                side: side.into(),
+                price,
+                lots,
+            },
+            Body::Top { bid, ask } => Self::Top {
+                instrument,
+                feed,
+                seq,
+                bid: bid.map(Level::from),
+                ask: ask.map(Level::from),
+            },
+            Body::Trade { price, lots } => Self::Trade {
+                instrument,
+                feed,
+                seq,
+                price,
+                lots,
+            },
+        }
+    }
 }
 
 impl ServerMessage {
@@ -721,5 +872,99 @@ mod tests {
 
         assert_eq!(line.matches('\n').count(), 1);
         assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn subscribe_is_decoded_and_resolved_without_an_account() {
+        let line = r#"{"type":"subscribe","instrument":"TESTE/BRL","feed":"l2"}"#;
+
+        assert_eq!(
+            decode(line),
+            Ok(ClientMessage::Subscribe {
+                instrument: "TESTE/BRL".to_string(),
+                feed: Feed::L2
+            })
+        );
+        assert_eq!(
+            subscription("TESTE/BRL".to_string(), Feed::L1),
+            Ok((TESTE_BRL, CoreFeed::L1))
+        );
+        assert_eq!(
+            resolved(line),
+            Ok(Inbound::Subscribe {
+                instrument: TESTE_BRL,
+                feed: CoreFeed::L2
+            })
+        );
+        malformed(r#"{"type":"subscribe","instrument":"TESTE/BRL","feed":"l3"}"#);
+        malformed(r#"{"type":"subscribe","instrument":"TESTE/BRL"}"#);
+    }
+
+    #[test]
+    fn feed_messages_serialize_as_documented() {
+        let snapshot = Snapshot {
+            instrument: TESTE_BRL,
+            feed: CoreFeed::L2,
+            seq: 41,
+            bids: vec![Quote {
+                price: price(9_900),
+                lots: lots(3),
+            }],
+            asks: vec![],
+        };
+        assert_eq!(
+            ServerMessage::from(&snapshot).to_line(),
+            "{\"type\":\"snapshot\",\"instrument\":\"TESTE/BRL\",\"feed\":\"l2\",\"seq\":41,\
+             \"bids\":[{\"price\":9900,\"lots\":3}],\"asks\":[]}\n"
+        );
+        let update = |seq, feed, body| Update {
+            instrument: TESTE_BRL,
+            feed,
+            seq,
+            body,
+        };
+        assert_eq!(
+            ServerMessage::from(&update(
+                42,
+                CoreFeed::L2,
+                Body::Level {
+                    side: CoreSide::Ask,
+                    price: price(10_000),
+                    lots: Lots::ZERO
+                }
+            ))
+            .to_line(),
+            "{\"type\":\"depth\",\"instrument\":\"TESTE/BRL\",\"feed\":\"l2\",\"seq\":42,\
+             \"side\":\"sell\",\"price\":10000,\"lots\":0}\n"
+        );
+        assert_eq!(
+            ServerMessage::from(&update(
+                7,
+                CoreFeed::L1,
+                Body::Top {
+                    bid: Some(Quote {
+                        price: price(9_900),
+                        lots: lots(3)
+                    }),
+                    ask: None
+                }
+            ))
+            .to_line(),
+            "{\"type\":\"top\",\"instrument\":\"TESTE/BRL\",\"feed\":\"l1\",\"seq\":7,\
+             \"bid\":{\"price\":9900,\"lots\":3},\"ask\":null}\n"
+        );
+        assert_eq!(
+            ServerMessage::from(&update(
+                43,
+                CoreFeed::L2,
+                Body::Trade {
+                    price: price(10_000),
+                    lots: lots(2)
+                }
+            ))
+            .to_line(),
+            "{\"type\":\"trade\",\"instrument\":\"TESTE/BRL\",\"feed\":\"l2\",\"seq\":43,\
+             \"price\":10000,\"lots\":2}\n"
+        );
     }
 }

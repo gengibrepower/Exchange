@@ -1,20 +1,24 @@
 //! Servidor TCP da borda (seção 4.4). O TCP entrega um fluxo de bytes sem fronteiras; a
 //! fronteira entre mensagens é convenção nossa: uma por linha, com teto de tamanho.
 
+use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use exchange_core::domain::AccountId;
+use exchange_core::domain::{AccountId, InstrumentId};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::time::Instant;
 
 use crate::core_thread::{CoreError, CoreHandle};
 use crate::market::{ASSETS, HOUSE};
+use crate::market_data::{Feed, Update};
 use crate::protocol::{self, AssetBalance, ClientMessage, Inbound, ServerMessage};
 
 /// Linha maior que isso sem `\n` não é protocolo: é erro e a conexão fecha, para um
@@ -27,7 +31,8 @@ pub struct Limits {
     /// Sessões simultâneas; acima disso a conexão recebe "servidor cheio" e fecha.
     pub max_connections: NonZeroUsize,
     /// Tempo máximo para uma linha inteira chegar. Vale por linha, não por byte: um cliente
-    /// que pinga um byte de vez em quando também é encerrado.
+    /// que pinga um byte de vez em quando também é encerrado. Sessão que assina o feed fica
+    /// isenta: ela só escuta, e o sinal de vida certo é o heartbeat da sessão FIX (F6).
     pub idle_timeout: Duration,
 }
 
@@ -120,10 +125,20 @@ pub enum Session {
 /// [`CoreError::Stopped`] se o núcleo parou: a sessão deve ser encerrada.
 pub async fn respond(
     state: &mut Session,
+    subscriptions: &mut Subscriptions,
     message: ClientMessage,
     core: &CoreHandle,
 ) -> Result<Vec<ServerMessage>, CoreError> {
     let Session::Active(account) = *state else {
+        let message = match message {
+            ClientMessage::Subscribe { instrument, feed } => {
+                return match protocol::subscription(instrument, feed) {
+                    Ok((instrument, feed)) => subscriptions.subscribe(core, instrument, feed).await,
+                    Err(problem) => Ok(vec![error(problem.to_string())]),
+                };
+            }
+            other => other,
+        };
         let ClientMessage::Login { account } = message else {
             return Ok(vec![error("faça login primeiro")]);
         };
@@ -146,6 +161,63 @@ pub async fn respond(
             .iter()
             .map(ServerMessage::from)
             .collect()),
+        Ok(Inbound::Subscribe { instrument, feed }) => {
+            subscriptions.subscribe(core, instrument, feed).await
+        }
+    }
+}
+
+/// O que a sessão assinou e o último `seq` já entregue em cada fluxo. Um único receptor do
+/// `broadcast` serve todos os fluxos; a filtragem é daqui.
+#[derive(Default)]
+pub struct Subscriptions {
+    receiver: Option<broadcast::Receiver<Update>>,
+    delivered: HashMap<(InstrumentId, Feed), u64>,
+}
+
+impl Subscriptions {
+    pub fn is_active(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    /// Assina **antes** de pedir o snapshot (seção 4.3): nada que aconteça entre os dois fica
+    /// de fora, e o que o snapshot já cobre é filtrado por `forward`.
+    async fn subscribe(
+        &mut self,
+        core: &CoreHandle,
+        instrument: InstrumentId,
+        feed: Feed,
+    ) -> Result<Vec<ServerMessage>, CoreError> {
+        if self.receiver.is_none() {
+            self.receiver = Some(core.subscribe());
+        }
+        let Some(snapshot) = core.snapshot(instrument, feed).await? else {
+            return Ok(vec![error("instrumento desconhecido")]);
+        };
+        self.delivered.insert((instrument, feed), snapshot.seq);
+        Ok(vec![ServerMessage::from(&snapshot)])
+    }
+
+    /// Decide se o incremento vai para este cliente: só de fluxo assinado e só com `seq`
+    /// além do último entregue, que passa a ser este. Um salto de sequência (o assinante
+    /// ficou para trás e perdeu mensagens) passa adiante: o buraco tem que ficar visível
+    /// para o cliente pedir um snapshot novo.
+    pub fn forward(&mut self, update: &Update) -> bool {
+        let Some(delivered) = self.delivered.get_mut(&(update.instrument, update.feed)) else {
+            return false;
+        };
+        if update.seq <= *delivered {
+            return false;
+        }
+        *delivered = update.seq;
+        true
+    }
+
+    async fn next(&mut self) -> Result<Update, RecvError> {
+        match &mut self.receiver {
+            Some(receiver) => receiver.recv().await,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -172,18 +244,38 @@ async fn session(stream: TcpStream, core: CoreHandle, idle_timeout: Duration) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut state = Session::AwaitingLogin;
+    let mut subscriptions = Subscriptions::default();
+    // A linha só é limpa depois de completa: se o select! cancelar a leitura no meio para
+    // entregar um incremento, os bytes já lidos ficam aqui e a próxima leitura continua.
     let mut line = Vec::new();
+    let mut deadline = Instant::now() + idle_timeout;
     loop {
-        line.clear();
-        let read = tokio::time::timeout(idle_timeout, read_line(&mut reader, &mut line)).await;
-        let (replies, keep_open) = match read {
-            Err(_idle) => (vec![error("sessão ociosa")], false),
-            Ok(Err(_) | Ok(Read::Closed)) => return,
-            Ok(Ok(Read::TooLong)) => (
-                vec![error(format!("linha passa de {MAX_LINE} bytes"))],
-                false,
-            ),
-            Ok(Ok(Read::Line)) => handle(&line, &mut state, &core).await,
+        let (replies, keep_open) = tokio::select! {
+            read = read_line(&mut reader, &mut line) => match read {
+                Err(_) | Ok(Read::Closed) => return,
+                Ok(Read::TooLong) => (
+                    vec![error(format!("linha passa de {MAX_LINE} bytes"))],
+                    false,
+                ),
+                Ok(Read::Line) => {
+                    let outcome = handle(&line, &mut state, &mut subscriptions, &core).await;
+                    line.clear();
+                    deadline = Instant::now() + idle_timeout;
+                    outcome
+                }
+            },
+            update = subscriptions.next(), if subscriptions.is_active() => match update {
+                Ok(update) if subscriptions.forward(&update) => {
+                    (vec![ServerMessage::from(&update)], true)
+                }
+                // Ficou para trás: as mensagens perdidas aparecem como salto de sequência
+                // no próximo incremento, e o cliente pede um snapshot novo.
+                Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => (vec![error(CoreError::Stopped.to_string())], false),
+            },
+            () = tokio::time::sleep_until(deadline), if !subscriptions.is_active() => {
+                (vec![error("sessão ociosa")], false)
+            }
         };
         if write(&mut writer, &replies).await.is_err() || !keep_open {
             return;
@@ -191,7 +283,12 @@ async fn session(stream: TcpStream, core: CoreHandle, idle_timeout: Duration) {
     }
 }
 
-async fn handle(line: &[u8], state: &mut Session, core: &CoreHandle) -> (Vec<ServerMessage>, bool) {
+async fn handle(
+    line: &[u8],
+    state: &mut Session,
+    subscriptions: &mut Subscriptions,
+    core: &CoreHandle,
+) -> (Vec<ServerMessage>, bool) {
     let Ok(text) = std::str::from_utf8(line) else {
         return (vec![error("linha não é UTF-8")], true);
     };
@@ -202,7 +299,7 @@ async fn handle(line: &[u8], state: &mut Session, core: &CoreHandle) -> (Vec<Ser
         Ok(message) => message,
         Err(problem) => return (vec![error(problem.to_string())], true),
     };
-    match respond(state, message, core).await {
+    match respond(state, subscriptions, message, core).await {
         Ok(replies) => (replies, true),
         Err(stopped) => (vec![error(stopped.to_string())], false),
     }
@@ -214,15 +311,18 @@ enum Read {
     TooLong,
 }
 
-/// Lê até `\n` sem nunca guardar mais que `MAX_LINE + 1` bytes. A linha sai sem o `\n` (e
-/// sem um `\r` antes dele, para clientes que mandam CRLF).
+/// Lê até `\n` sem nunca guardar mais que `MAX_LINE + 1` bytes, contando o que já estava
+/// em `line` de leituras canceladas. Pode ser cancelada a qualquer momento: o que foi lido
+/// fica em `line`. A linha sai sem o `\n` (e sem um `\r` antes dele, para clientes que
+/// mandam CRLF).
 async fn read_line(
     reader: &mut (impl AsyncBufRead + Unpin),
     line: &mut Vec<u8>,
 ) -> io::Result<Read> {
-    let limit = u64::try_from(MAX_LINE + 1).expect("teto pequeno cabe em u64");
+    let budget = (MAX_LINE + 1).saturating_sub(line.len());
+    let limit = u64::try_from(budget).expect("teto pequeno cabe em u64");
     let read = reader.take(limit).read_until(b'\n', line).await?;
-    if read == 0 {
+    if read == 0 && line.is_empty() {
         return Ok(Read::Closed);
     }
     if line.last() == Some(&b'\n') {
@@ -257,7 +357,7 @@ mod tests {
 
     use super::*;
     use crate::core_thread::spawn_core;
-    use crate::market::new_market_data;
+    use crate::market::{INSTRUMENTS, new_market_data};
     use crate::sequencer::Sequencer;
 
     const PATIENCE: Duration = Duration::from_secs(5);
@@ -725,5 +825,228 @@ mod tests {
         );
         assert_eq!(written.load(Ordering::Relaxed), last);
         flood.abort();
+    }
+
+    fn feed_update(feed: Feed, seq: u64) -> Update {
+        Update {
+            instrument: INSTRUMENTS[0].1,
+            feed,
+            seq,
+            body: crate::market_data::Body::Trade {
+                price: exchange_core::domain::Price::new(10_000).unwrap(),
+                lots: exchange_core::domain::Lots::new(1).unwrap(),
+            },
+        }
+    }
+
+    fn subscribed_at(feed: Feed, seq: u64) -> Subscriptions {
+        let mut subscriptions = Subscriptions::default();
+        subscriptions
+            .delivered
+            .insert((INSTRUMENTS[0].1, feed), seq);
+        subscriptions
+    }
+
+    #[test]
+    fn forward_skips_streams_that_were_not_subscribed() {
+        let mut subscriptions = subscribed_at(Feed::L2, 5);
+
+        assert!(!subscriptions.forward(&feed_update(Feed::L1, 6)));
+        assert!(!subscriptions.forward(&Update {
+            instrument: exchange_core::domain::InstrumentId::new(99),
+            ..feed_update(Feed::L2, 6)
+        }));
+    }
+
+    #[test]
+    fn forward_skips_what_was_already_delivered() {
+        let mut subscriptions = subscribed_at(Feed::L2, 5);
+
+        assert!(!subscriptions.forward(&feed_update(Feed::L2, 4)));
+        assert!(!subscriptions.forward(&feed_update(Feed::L2, 5)));
+        assert!(subscriptions.forward(&feed_update(Feed::L2, 6)));
+        assert!(!subscriptions.forward(&feed_update(Feed::L2, 6)));
+        assert!(subscriptions.forward(&feed_update(Feed::L2, 7)));
+    }
+
+    #[test]
+    fn forward_lets_a_sequence_jump_through() {
+        let mut subscriptions = subscribed_at(Feed::L2, 5);
+
+        assert!(subscriptions.forward(&feed_update(Feed::L2, 9)));
+        assert!(!subscriptions.forward(&feed_update(Feed::L2, 8)));
+    }
+
+    const FEED_SELL: &str =
+        r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":5}"#;
+    const FEED_BUY: &str =
+        r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":2}"#;
+
+    async fn subscriber(address: SocketAddr, feed: &str) -> Client {
+        let mut client = Client::connect(address).await;
+        client
+            .send(&format!(
+                r#"{{"type":"subscribe","instrument":"TESTE/BRL","feed":"{feed}"}}"#
+            ))
+            .await;
+        client
+    }
+
+    // O critério da F5 visto da rede: snapshot, depois os incrementos causados por outro
+    // cliente, sem login, na sequência certa.
+    #[tokio::test]
+    async fn subscriber_gets_a_snapshot_then_the_book_changes_live() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut seller = Client::login(address, 1).await;
+        seller.fund().await;
+        seller.send(FEED_SELL).await;
+        seller.recv().await;
+
+        let mut watcher = subscriber(address, "l2").await;
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"snapshot","instrument":"TESTE/BRL","feed":"l2","seq":1,"bids":[],"asks":[{"price":10000,"lots":5}]}"#
+        );
+
+        let mut buyer = Client::login(address, 2).await;
+        buyer.fund().await;
+        buyer.send(FEED_BUY).await;
+        buyer.recv().await;
+
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"trade","instrument":"TESTE/BRL","feed":"l2","seq":2,"price":10000,"lots":2}"#
+        );
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"depth","instrument":"TESTE/BRL","feed":"l2","seq":3,"side":"sell","price":10000,"lots":3}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn l1_subscriber_sees_top_and_trades_but_no_depth() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut watcher = subscriber(address, "l1").await;
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"snapshot","instrument":"TESTE/BRL","feed":"l1","seq":0,"bids":[],"asks":[]}"#
+        );
+        let mut trader = Client::login(address, 1).await;
+        trader.fund().await;
+
+        trader.send(FEED_SELL).await;
+        trader.recv().await;
+        trader.send(FEED_BUY).await;
+        trader.recv().await;
+
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"top","instrument":"TESTE/BRL","feed":"l1","seq":1,"bid":null,"ask":{"price":10000,"lots":5}}"#
+        );
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"trade","instrument":"TESTE/BRL","feed":"l1","seq":2,"price":10000,"lots":2}"#
+        );
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"top","instrument":"TESTE/BRL","feed":"l1","seq":3,"bid":null,"ask":{"price":10000,"lots":3}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_to_an_unknown_instrument_is_an_error() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut client = Client::connect(address).await;
+
+        client
+            .send(r#"{"type":"subscribe","instrument":"BTC/BRL","feed":"l2"}"#)
+            .await;
+
+        assert_eq!(
+            client.recv().await,
+            r#"{"type":"error","message":"instrumento desconhecido \"BTC/BRL\""}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_again_brings_a_fresh_snapshot() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut watcher = subscriber(address, "l2").await;
+        watcher.recv().await;
+        let mut trader = Client::login(address, 1).await;
+        trader.fund().await;
+        trader.send(FEED_SELL).await;
+        trader.recv().await;
+        watcher.recv().await;
+
+        watcher
+            .send(r#"{"type":"subscribe","instrument":"TESTE/BRL","feed":"l2"}"#)
+            .await;
+
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"snapshot","instrument":"TESTE/BRL","feed":"l2","seq":1,"bids":[],"asks":[{"price":10000,"lots":5}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_is_not_cut_for_being_quiet() {
+        let address = start_with(Sequencer::in_memory(), BRIEF).await;
+        let mut watcher = subscriber(address, "l2").await;
+        watcher.recv().await;
+
+        tokio::time::sleep(BRIEF.idle_timeout * 3).await;
+        let mut trader = Client::login(address, 1).await;
+        trader.fund().await;
+        trader.send(FEED_SELL).await;
+
+        assert!(watcher.recv().await.starts_with(r#"{"type":"depth""#));
+    }
+
+    // Cancelamento seguro: o select! interrompe a leitura de uma linha pela metade para
+    // entregar incrementos, e a linha tem que continuar inteira de onde parou.
+    #[tokio::test]
+    async fn half_a_line_survives_feed_updates_arriving_in_between() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut watcher = subscriber(address, "l2").await;
+        watcher.recv().await;
+        let mut trader = Client::login(address, 1).await;
+        trader.fund().await;
+
+        watcher.send_raw(br#"{"type":"subscr"#).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trader.send(FEED_SELL).await;
+        trader.recv().await;
+        assert!(watcher.recv().await.starts_with(r#"{"type":"depth""#));
+        watcher
+            .send_raw(b"ibe\",\"instrument\":\"TESTE/BRL\",\"feed\":\"l2\"}\n")
+            .await;
+
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"snapshot","instrument":"TESTE/BRL","feed":"l2","seq":1,"bids":[],"asks":[{"price":10000,"lots":5}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn line_limit_counts_bytes_from_interrupted_reads() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut watcher = subscriber(address, "l2").await;
+        watcher.recv().await;
+        let mut trader = Client::login(address, 1).await;
+        trader.fund().await;
+
+        watcher.send_raw(&vec![b' '; MAX_LINE - 10]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trader.send(FEED_SELL).await;
+        trader.recv().await;
+        assert!(watcher.recv().await.starts_with(r#"{"type":"depth""#));
+        watcher.send_raw(&[b' '; 11]).await;
+
+        assert_eq!(
+            watcher.recv().await,
+            format!(r#"{{"type":"error","message":"linha passa de {MAX_LINE} bytes"}}"#)
+        );
+        assert!(watcher.closed().await);
     }
 }
