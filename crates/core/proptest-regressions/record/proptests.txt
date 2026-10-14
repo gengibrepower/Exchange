@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5560b4608e5dde1e7d3d32a9f5b4964b37a2dc0ee2f1b7a1ab77fb33b5028d35 # shrinks to seq = 0, command = Deposit { account: AccountId(0), asset: AssetId(0), amount: Amount(0) }

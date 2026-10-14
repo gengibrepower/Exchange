@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::book::{CancelError, Leftover, OrderBook};
 use crate::domain::{
     AccountId, Amount, AssetId, Bps, Fill, Instrument, InstrumentId, Lots, Order, OrderId,
@@ -7,7 +9,7 @@ use crate::domain::{
 };
 use crate::ledger::{Balance, Ledger, LedgerError, Transfer};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Command {
     Deposit {
         account: AccountId,
