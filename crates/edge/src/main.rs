@@ -1,6 +1,9 @@
 mod parse;
 
+use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use exchange_core::domain::{
     AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, OrderId, OrderRequest, Price,
@@ -9,6 +12,8 @@ use exchange_core::domain::{
 use exchange_core::engine::{
     Command, Engine, Event, FeeSchedule, ListingConfig, RejectReason, RiskLimits,
 };
+use exchange_core::record::{LogRecord, RecordError};
+use exchange_wal::Wal;
 
 use crate::parse::{Input, parse_line};
 
@@ -33,18 +38,94 @@ fn listings() -> [ListingConfig; 1] {
     [ListingConfig { instrument, risk }]
 }
 
-fn main() -> io::Result<()> {
-    run(io::stdin().lock(), &mut io::stdout().lock())
+const USAGE: &str = "uso: edge [--wal <caminho>]";
+
+fn main() -> ExitCode {
+    let result = parse_args(std::env::args_os().skip(1))
+        .map_err(io::Error::other)
+        .and_then(|wal| run(io::stdin().lock(), &mut io::stdout().lock(), wal.as_deref()));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("erro: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
-fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
+fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Option<PathBuf>, &'static str> {
+    match (args.next(), args.next(), args.next()) {
+        (None, _, _) => Ok(None),
+        (Some(flag), Some(path), None) if flag == "--wal" => Ok(Some(PathBuf::from(path))),
+        _ => Err(USAGE),
+    }
+}
+
+/// Próximos números a atribuir. O `seq` avança a cada comando gravado e é a posição no
+/// log, que também dá a prioridade FIFO (decisão 8); o id de ordem só avança em ordens e
+/// é o `#n` que o usuário vê.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Counters {
+    next_seq: u64,
+    next_order_id: u64,
+}
+
+impl Counters {
+    const FRESH: Self = Self {
+        next_seq: 1,
+        next_order_id: 1,
+    };
+}
+
+/// Reaplica o log no engine, sem imprimir: esses eventos já foram respondidos na sessão
+/// que os gravou. Os contadores saem do próprio log, nada é guardado à parte.
+fn replay(engine: &mut Engine, records: &[Vec<u8>]) -> Result<Counters, RecordError> {
+    let mut counters = Counters::FRESH;
+    for bytes in records {
+        let record = LogRecord::from_bytes(bytes)?;
+        let command = record.command();
+        if let Command::Submit(request) = command {
+            let after = request.id.get().saturating_add(1);
+            counters.next_order_id = counters.next_order_id.max(after);
+        }
+        counters.next_seq = record.seq().get().saturating_add(1);
+        engine.apply(command);
+    }
+    Ok(counters)
+}
+
+/// Sem WAL, começa do zero em memória. Com WAL, abre (cortando rabo rasgado) e reaplica
+/// o log antes de aceitar qualquer comando novo.
+fn boot(
+    engine: &mut Engine,
+    wal_path: Option<&Path>,
+    output: &mut impl Write,
+) -> io::Result<(Option<Wal>, Counters)> {
+    let Some(path) = wal_path else {
+        return Ok((None, Counters::FRESH));
+    };
+    let recovery = Wal::open(path).map_err(io::Error::other)?;
+    // Rabo rasgado o open já cortou; um quadro íntegro que não decodifica é bug ou
+    // formato incompatível, e seguir sem ele quebraria o replay. Fail-stop.
+    let counters = replay(engine, &recovery.records)
+        .map_err(|error| io::Error::other(format!("log inválido: {error}")))?;
+    writeln!(
+        output,
+        "log: {} comandos reaplicados, {} bytes descartados",
+        recovery.records.len(),
+        recovery.discarded
+    )?;
+    Ok((Some(recovery.wal), counters))
+}
+
+fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) -> io::Result<()> {
     // Taxa de taker de 10 bps (0,1%) para a casa: pequena, mas exercita o caminho (decisão 7).
     let fees = FeeSchedule {
         house: HOUSE,
         taker_bps: Bps::new(10).expect("10 bps é menos que 100%"),
     };
     let mut engine = Engine::new(listings(), fees).expect("instrumentos fixos não se repetem");
-    let mut next_seq: u64 = 1;
+    let (mut wal, mut counters) = boot(&mut engine, wal_path, output)?;
 
     for line in input.lines() {
         let line = line?;
@@ -62,16 +143,16 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                     continue;
                 };
                 let request = OrderRequest {
-                    id: OrderId::new(next_seq),
+                    id: OrderId::new(counters.next_order_id),
                     account: ACCOUNT,
                     instrument,
                     side,
                     kind,
                     total: lots,
-                    seq: Seq::new(next_seq),
+                    seq: Seq::new(counters.next_seq),
                     time_in_force,
                 };
-                next_seq += 1;
+                counters.next_order_id += 1;
                 Command::Submit(request)
             }
             Ok(Input::Deposit {
@@ -117,6 +198,15 @@ fn run(input: impl BufRead, output: &mut impl Write) -> io::Result<()> {
                 continue;
             }
         };
+
+        let seq = Seq::new(counters.next_seq);
+        counters.next_seq += 1;
+        if let Some(wal) = wal.as_mut() {
+            // Durável antes de aplicar e de responder (seção 4.6). Falhou, para: o comando
+            // não é aplicado e o WAL fica envenenado.
+            let record = LogRecord::new(seq, command);
+            wal.append(&record.to_bytes()).map_err(io::Error::other)?;
+        }
 
         for event in engine.apply(command) {
             writeln!(output, "{}", render(&event))?;
@@ -253,7 +343,7 @@ mod tests {
 
     fn raw_session(input: &str) -> String {
         let mut output = Vec::new();
-        run(input.as_bytes(), &mut output).expect("I/O em memória não falha");
+        run(input.as_bytes(), &mut output, None).expect("I/O em memória não falha");
         String::from_utf8(output).expect("saída é UTF-8")
     }
 
@@ -303,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_input_reports_error_and_does_not_consume_seq() {
+    fn invalid_input_reports_error_and_does_not_consume_an_order_id() {
         let output = session("buy TESTE/BRL abc 5\nbuy BTC/BRL 100 1\nsell TESTE/BRL 10000 1\n");
 
         assert_eq!(
@@ -315,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_lots_is_rejected_by_the_core_and_consumes_seq() {
+    fn zero_lots_is_rejected_by_the_core_and_consumes_an_order_id() {
         let output = session("buy TESTE/BRL 100 0\nsell TESTE/BRL 10000 1\n");
 
         assert_eq!(
@@ -374,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn off_tick_price_is_rejected_by_the_core_and_consumes_seq() {
+    fn off_tick_price_is_rejected_by_the_core_and_consumes_an_order_id() {
         let output = session("buy TESTE/BRL 10005 1\nbuy TESTE/BRL 10010 1\n");
 
         assert_eq!(
@@ -426,5 +516,142 @@ mod tests {
         let output = session("quit\nsell TESTE/BRL 10000 1\n");
 
         assert_eq!(output, "");
+    }
+
+    mod wal {
+        use std::fs::{self, OpenOptions};
+
+        use super::*;
+
+        /// Caminho temporário que se apaga no fim do teste, inclusive se ele falhar.
+        struct TempPath(PathBuf);
+
+        impl TempPath {
+            fn new(name: &str) -> Self {
+                let file = format!("exchange-edge-{}-{name}", std::process::id());
+                let path = std::env::temp_dir().join(file);
+                remove_if_present(&path);
+                Self(path)
+            }
+        }
+
+        impl Drop for TempPath {
+            fn drop(&mut self) {
+                remove_if_present(&self.0);
+            }
+        }
+
+        fn remove_if_present(path: &Path) {
+            match fs::remove_file(path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    panic!("não deu para limpar {}: {error}", path.display())
+                }
+                _ => {}
+            }
+        }
+
+        fn wal_session(path: &TempPath, input: &str) -> io::Result<String> {
+            let mut output = Vec::new();
+            run(input.as_bytes(), &mut output, Some(&path.0))?;
+            Ok(String::from_utf8(output).expect("saída é UTF-8"))
+        }
+
+        fn last_lines(output: &str, count: usize) -> Vec<&str> {
+            let lines: Vec<&str> = output.lines().collect();
+            lines[lines.len() - count..].to_vec()
+        }
+
+        #[test]
+        fn fresh_log_boots_empty() {
+            let path = TempPath::new("fresh");
+
+            let output = wal_session(&path, "").unwrap();
+
+            assert_eq!(output, "log: 0 comandos reaplicados, 0 bytes descartados\n");
+        }
+
+        // O critério da F3 em miniatura: o estado depois de reiniciar é o mesmo de uma
+        // sessão que nunca caiu.
+        #[test]
+        fn restart_rebuilds_the_same_state_as_an_uninterrupted_session() {
+            let path = TempPath::new("restart");
+            let history = "sell TESTE/BRL 10000 5\nbuy TESTE/BRL 10100 2\nbuy TESTE/BRL 9000 1\n";
+            let uninterrupted = raw_session(&format!("{FUNDING}{history}balance\n"));
+
+            wal_session(&path, &format!("{FUNDING}{history}")).unwrap();
+            let restarted = wal_session(&path, "balance\n").unwrap();
+
+            assert_eq!(
+                restarted.lines().next(),
+                Some("log: 5 comandos reaplicados, 0 bytes descartados")
+            );
+            assert_eq!(last_lines(&restarted, 2), last_lines(&uninterrupted, 2));
+        }
+
+        #[test]
+        fn resting_orders_survive_restart_and_still_match() {
+            let path = TempPath::new("book");
+            wal_session(&path, &format!("{FUNDING}sell TESTE/BRL 10000 5\n")).unwrap();
+
+            let output = wal_session(&path, "buy TESTE/BRL 10000 2\n").unwrap();
+
+            assert_eq!(
+                last_lines(&output, 1),
+                ["fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20"]
+            );
+        }
+
+        #[test]
+        fn order_ids_continue_after_restart() {
+            let path = TempPath::new("ids");
+            wal_session(&path, &format!("{FUNDING}sell TESTE/BRL 10000 1\n")).unwrap();
+            wal_session(&path, "cancel TESTE/BRL 1\n").unwrap();
+
+            let output = wal_session(&path, "sell TESTE/BRL 10000 1\n").unwrap();
+
+            assert_eq!(
+                last_lines(&output, 1),
+                ["#2 descansou: 1 lots em TESTE/BRL"]
+            );
+        }
+
+        #[test]
+        fn torn_tail_is_cut_and_reported_on_boot() {
+            let path = TempPath::new("torn");
+            wal_session(&path, FUNDING).unwrap();
+            let mut raw = OpenOptions::new().append(true).open(&path.0).unwrap();
+            raw.write_all(&[50, 0, 0]).unwrap();
+
+            let output = wal_session(&path, "").unwrap();
+
+            assert_eq!(output, "log: 2 comandos reaplicados, 3 bytes descartados\n");
+        }
+
+        #[test]
+        fn intact_frame_that_is_not_a_record_fails_the_boot() {
+            let path = TempPath::new("invalid");
+            Wal::open(&path.0).unwrap().wal.append(b"lixo").unwrap();
+
+            let error = wal_session(&path, "").unwrap_err();
+
+            assert!(error.to_string().starts_with("log inválido:"), "{error}");
+        }
+
+        #[test]
+        fn args_select_the_wal_path() {
+            let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+
+            assert_eq!(parse_args(args(&[]).into_iter()), Ok(None));
+            assert_eq!(
+                parse_args(args(&["--wal", "x.wal"]).into_iter()),
+                Ok(Some(PathBuf::from("x.wal")))
+            );
+            assert_eq!(parse_args(args(&["--wal"]).into_iter()), Err(USAGE));
+            assert_eq!(parse_args(args(&["-w", "x.wal"]).into_iter()), Err(USAGE));
+            assert_eq!(
+                parse_args(args(&["--wal", "x.wal", "extra"]).into_iter()),
+                Err(USAGE)
+            );
+        }
     }
 }
