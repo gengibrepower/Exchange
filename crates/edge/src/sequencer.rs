@@ -229,6 +229,20 @@ impl Sequencer {
     pub fn balance(&self, account: AccountId, asset: AssetId) -> Balance {
         self.engine.balance(account, asset)
     }
+
+    #[cfg(test)]
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// Um sequencer cujo próximo `seq` já está no limite: o próximo `submit` falha. Só
+    /// para exercitar o fail-stop de quem o usa.
+    #[cfg(test)]
+    pub(crate) fn exhausted() -> Self {
+        let mut sequencer = Self::in_memory();
+        sequencer.counters.next_seq = u64::MAX;
+        sequencer
+    }
 }
 
 fn next(counter: u64) -> Result<u64, SequencerError> {
@@ -268,43 +282,15 @@ fn replay(engine: &mut Engine, records: &[Vec<u8>]) -> Result<Counters, ReplayEr
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io;
-    use std::path::PathBuf;
 
     use exchange_core::domain::Price;
 
     use super::*;
     use crate::market::{BRL, TESTE};
+    use crate::test_support::TempPath;
 
     const ACCOUNT: AccountId = AccountId::new(1);
     const TESTE_BRL: InstrumentId = market::INSTRUMENTS[0].1;
-
-    /// Caminho temporário que se apaga no fim do teste, inclusive se ele falhar.
-    struct TempPath(PathBuf);
-
-    impl TempPath {
-        fn new(name: &str) -> Self {
-            let file = format!("exchange-sequencer-{}-{name}", std::process::id());
-            let path = std::env::temp_dir().join(file);
-            remove_if_present(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for TempPath {
-        fn drop(&mut self) {
-            remove_if_present(&self.0);
-        }
-    }
-
-    fn remove_if_present(path: &Path) {
-        match fs::remove_file(path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                panic!("não deu para limpar {}: {error}", path.display())
-            }
-            _ => {}
-        }
-    }
 
     fn deposit(seq: u64) -> Vec<u8> {
         let command = Command::Deposit {
