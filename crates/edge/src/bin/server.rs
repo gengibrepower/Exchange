@@ -5,10 +5,11 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
+use std::time::Duration;
 
 use edge::core_thread::spawn_core;
 use edge::sequencer::Sequencer;
-use edge::server::serve;
+use edge::server::{Limits, serve};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -19,6 +20,11 @@ const USAGE: &str = "uso: server [--listen <endereço:porta>] [--wal <caminho>]"
 const DEFAULT_LISTEN: &str = "127.0.0.1:7000";
 
 const QUEUE: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 não é zero");
+
+const LIMITS: Limits = Limits {
+    max_connections: NonZeroUsize::new(1024).expect("1024 não é zero"),
+    idle_timeout: Duration::from_mins(5),
+};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -87,7 +93,7 @@ async fn run() -> io::Result<()> {
     eprintln!("ouvindo em {}", listener.local_addr()?);
 
     tokio::select! {
-        served = serve(listener, core) => served,
+        served = serve(listener, core, LIMITS) => served,
         outcome = core_stopped => Err(io::Error::other(match outcome {
             Ok(Ok(Err(error))) => format!("o núcleo parou: {error}"),
             Ok(Err(_)) => "o núcleo entrou em pânico".to_string(),
