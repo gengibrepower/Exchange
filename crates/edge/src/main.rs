@@ -1,43 +1,18 @@
 mod parse;
 
 use std::ffi::OsString;
-use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use exchange_core::domain::{
-    AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, OrderId, OrderRequest, Price,
-    Seq,
-};
-use exchange_core::engine::{
-    Command, Engine, Event, FeeSchedule, ListingConfig, RejectReason, RiskLimits,
-};
-use exchange_core::record::{LogRecord, RecordError};
-use exchange_wal::Wal;
+use edge::market::{ASSETS, asset_id, asset_name, instrument_id, symbol};
+use edge::sequencer::{Intent, Sequencer};
+use exchange_core::domain::AccountId;
+use exchange_core::engine::{Event, RejectReason};
 
 use crate::parse::{Input, parse_line};
 
-const INSTRUMENTS: [(&str, InstrumentId); 1] = [("TESTE/BRL", InstrumentId::new(1))];
 const ACCOUNT: AccountId = AccountId::new(1);
-const HOUSE: AccountId = AccountId::new(0);
-const TESTE: AssetId = AssetId::new(1);
-const BRL: AssetId = AssetId::new(2);
-const ASSETS: [(&str, AssetId); 2] = [("TESTE", TESTE), ("BRL", BRL)];
-
-// TESTE/BRL: preço em centavos por lot, tick de 10 centavos, 1 lot = 100 unidades de TESTE.
-// Risco: no máximo 1.000 lots por ordem e colar de 10% sobre o melhor preço oposto.
-fn listings() -> [ListingConfig; 1] {
-    let tick = Price::new(10).expect("tick fixo é positivo");
-    let lot_size = Amount::new(100).expect("lot fixo é positivo");
-    let instrument = Instrument::new(INSTRUMENTS[0].1, TESTE, BRL, tick, lot_size)
-        .expect("especificação fixa é válida");
-    let risk = RiskLimits {
-        max_lots: Lots::new(1_000).expect("limite fixo é válido"),
-        collar: Bps::new(1_000).expect("10% é menos que 100%"),
-    };
-    [ListingConfig { instrument, risk }]
-}
 
 const USAGE: &str = "uso: edge [--wal <caminho>]";
 
@@ -62,120 +37,27 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Option<PathBuf
     }
 }
 
-/// Próximos números a atribuir. O `seq` avança a cada comando gravado e é a posição no
-/// log, que também dá a prioridade FIFO (decisão 8); o id de ordem só avança em ordens e
-/// é o `#n` que o usuário vê.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Counters {
-    next_seq: u64,
-    next_order_id: u64,
-}
-
-impl Counters {
-    const FRESH: Self = Self {
-        next_seq: 1,
-        next_order_id: 1,
-    };
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-enum ReplayError {
-    Record(RecordError),
-    /// Todo comando aplicado é gravado com o próximo `seq`, então o log é contíguo a
-    /// partir de 1: buraco ou repetição é bug, nunca crash.
-    UnexpectedSeq {
-        expected: u64,
-        found: u64,
-    },
-    SeqExhausted,
-}
-
-impl fmt::Display for ReplayError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Record(error) => write!(f, "{error}"),
-            Self::UnexpectedSeq { expected, found } => {
-                write!(f, "seq {found} onde se esperava {expected}")
-            }
-            Self::SeqExhausted => write!(f, "seq chegou ao limite de u64"),
-        }
-    }
-}
-
-impl From<RecordError> for ReplayError {
-    fn from(error: RecordError) -> Self {
-        Self::Record(error)
-    }
-}
-
-/// Confere que `found` é exatamente o `seq` esperado e devolve o próximo esperado.
-fn check_seq(expected: u64, found: Seq) -> Result<u64, ReplayError> {
-    if found.get() != expected {
-        return Err(ReplayError::UnexpectedSeq {
-            expected,
-            found: found.get(),
-        });
-    }
-    expected.checked_add(1).ok_or(ReplayError::SeqExhausted)
-}
-
-/// Reaplica o log no engine, sem imprimir: esses eventos já foram respondidos na sessão
-/// que os gravou. Os contadores saem do próprio log, nada é guardado à parte.
-fn replay(engine: &mut Engine, records: &[Vec<u8>]) -> Result<Counters, ReplayError> {
-    let mut counters = Counters::FRESH;
-    for bytes in records {
-        let record = LogRecord::from_bytes(bytes)?;
-        counters.next_seq = check_seq(counters.next_seq, record.seq())?;
-        let command = record.command();
-        if let Command::Submit(request) = command {
-            let after = request.id.get().saturating_add(1);
-            counters.next_order_id = counters.next_order_id.max(after);
-        }
-        engine.apply(command);
-    }
-    Ok(counters)
-}
-
-/// Sem WAL, começa do zero em memória. Com WAL, abre (cortando rabo rasgado) e reaplica
-/// o log antes de aceitar qualquer comando novo.
-fn boot(
-    engine: &mut Engine,
-    wal_path: Option<&Path>,
-    output: &mut impl Write,
-) -> io::Result<(Option<Wal>, Counters)> {
+/// Sem WAL, começa do zero em memória. Com WAL, abre e reaplica o log antes de aceitar
+/// qualquer comando novo.
+fn boot(wal_path: Option<&Path>, output: &mut impl Write) -> io::Result<Sequencer> {
     let Some(path) = wal_path else {
-        return Ok((None, Counters::FRESH));
+        return Ok(Sequencer::in_memory());
     };
-    let recovery = Wal::open(path).map_err(io::Error::other)?;
-    // Rabo rasgado o open já cortou; um quadro íntegro que não decodifica é bug ou
-    // formato incompatível, e seguir sem ele quebraria o replay. Fail-stop.
-    let counters = replay(engine, &recovery.records)
-        .map_err(|error| io::Error::other(format!("log inválido: {error}")))?;
+    let (sequencer, report) = Sequencer::open(path).map_err(io::Error::other)?;
     writeln!(
         output,
         "log: {} comandos reaplicados, {} bytes descartados",
-        recovery.records.len(),
-        recovery.discarded
+        report.replayed, report.discarded
     )?;
-    Ok((Some(recovery.wal), counters))
-}
-
-fn new_engine() -> Engine {
-    // Taxa de taker de 10 bps (0,1%) para a casa: pequena, mas exercita o caminho (decisão 7).
-    let fees = FeeSchedule {
-        house: HOUSE,
-        taker_bps: Bps::new(10).expect("10 bps é menos que 100%"),
-    };
-    Engine::new(listings(), fees).expect("instrumentos fixos não se repetem")
+    Ok(sequencer)
 }
 
 fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) -> io::Result<()> {
-    let mut engine = new_engine();
-    let (mut wal, mut counters) = boot(&mut engine, wal_path, output)?;
+    let mut sequencer = boot(wal_path, output)?;
 
     for line in input.lines() {
         let line = line?;
-        let command = match parse_line(&line) {
+        let intent = match parse_line(&line) {
             Ok(Input::Quit) => break,
             Ok(Input::Submit {
                 side,
@@ -188,18 +70,14 @@ fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) ->
                     writeln!(output, "erro: instrumento desconhecido \"{symbol}\"")?;
                     continue;
                 };
-                let request = OrderRequest {
-                    id: OrderId::new(counters.next_order_id),
+                Intent::Order {
                     account: ACCOUNT,
                     instrument,
                     side,
                     kind,
-                    total: lots,
-                    seq: Seq::new(counters.next_seq),
+                    lots,
                     time_in_force,
-                };
-                counters.next_order_id = next(counters.next_order_id)?;
-                Command::Submit(request)
+                }
             }
             Ok(Input::Deposit {
                 asset: name,
@@ -209,7 +87,7 @@ fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) ->
                     writeln!(output, "erro: ativo desconhecido \"{name}\"")?;
                     continue;
                 };
-                Command::Deposit {
+                Intent::Deposit {
                     account: ACCOUNT,
                     asset,
                     amount,
@@ -217,7 +95,7 @@ fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) ->
             }
             Ok(Input::Balance) => {
                 for (name, asset) in ASSETS {
-                    let balance = engine.balance(ACCOUNT, asset);
+                    let balance = sequencer.balance(ACCOUNT, asset);
                     writeln!(
                         output,
                         "{name}: disponível {}, reservado {}",
@@ -232,9 +110,9 @@ fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) ->
                     writeln!(output, "erro: instrumento desconhecido \"{symbol}\"")?;
                     continue;
                 };
-                Command::Cancel {
-                    instrument,
+                Intent::Cancel {
                     account: ACCOUNT,
+                    instrument,
                     order,
                 }
             }
@@ -245,54 +123,11 @@ fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) ->
             }
         };
 
-        let seq = Seq::new(counters.next_seq);
-        counters.next_seq = next(counters.next_seq)?;
-        if let Some(wal) = wal.as_mut() {
-            // Durável antes de aplicar e de responder (seção 4.6). Falhou, para: o comando
-            // não é aplicado e o WAL fica envenenado.
-            let record = LogRecord::new(seq, command);
-            wal.append(&record.to_bytes()).map_err(io::Error::other)?;
-        }
-
-        for event in engine.apply(command) {
+        for event in sequencer.submit(intent).map_err(io::Error::other)? {
             writeln!(output, "{}", render(&event))?;
         }
     }
     Ok(())
-}
-
-fn next(counter: u64) -> io::Result<u64> {
-    counter
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("contador chegou ao limite de u64"))
-}
-
-fn asset_id(name: &str) -> Option<AssetId> {
-    ASSETS
-        .iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(_, asset)| *asset)
-}
-
-fn asset_name(asset: AssetId) -> &'static str {
-    ASSETS
-        .iter()
-        .find(|(_, id)| *id == asset)
-        .map_or("?", |(name, _)| name)
-}
-
-fn instrument_id(symbol: &str) -> Option<InstrumentId> {
-    INSTRUMENTS
-        .iter()
-        .find(|(name, _)| *name == symbol)
-        .map(|(_, instrument)| *instrument)
-}
-
-fn symbol(instrument: InstrumentId) -> &'static str {
-    INSTRUMENTS
-        .iter()
-        .find(|(_, id)| *id == instrument)
-        .map_or("?", |(name, _)| name)
 }
 
 fn render(event: &Event) -> String {
@@ -573,6 +408,8 @@ mod tests {
     mod wal {
         use std::fs::{self, OpenOptions};
 
+        use exchange_wal::Wal;
+
         use super::*;
 
         /// Caminho temporário que se apaga no fim do teste, inclusive se ele falhar.
@@ -687,191 +524,6 @@ mod tests {
             let error = wal_session(&path, "").unwrap_err();
 
             assert!(error.to_string().starts_with("log inválido:"), "{error}");
-        }
-
-        fn deposit(seq: u64) -> Vec<u8> {
-            let command = Command::Deposit {
-                account: ACCOUNT,
-                asset: BRL,
-                amount: Amount::new(100).unwrap(),
-            };
-            LogRecord::new(Seq::new(seq), command).to_bytes()
-        }
-
-        #[test]
-        fn replay_accepts_a_contiguous_log() {
-            let counters = replay(&mut new_engine(), &[deposit(1), deposit(2)]).unwrap();
-
-            assert_eq!(counters.next_seq, 3);
-        }
-
-        #[test]
-        fn replay_rejects_a_gap_in_seq() {
-            let error = replay(&mut new_engine(), &[deposit(1), deposit(3)]).unwrap_err();
-
-            assert_eq!(
-                error,
-                ReplayError::UnexpectedSeq {
-                    expected: 2,
-                    found: 3
-                }
-            );
-        }
-
-        #[test]
-        fn replay_rejects_a_repeated_seq() {
-            let error = replay(&mut new_engine(), &[deposit(1), deposit(1)]).unwrap_err();
-
-            assert_eq!(
-                error,
-                ReplayError::UnexpectedSeq {
-                    expected: 2,
-                    found: 1
-                }
-            );
-        }
-
-        #[test]
-        fn seq_at_the_limit_is_an_error_not_a_panic() {
-            assert_eq!(
-                check_seq(u64::MAX, Seq::new(u64::MAX)),
-                Err(ReplayError::SeqExhausted)
-            );
-        }
-
-        // Uma sessão que passa por todos os caminhos que mexem em estado: depósito,
-        // descanso, fill parcial e total, IOC, cancelamento, rejeições e FOK expirada.
-        const SCENARIO: &str = "\
-            sell TESTE/BRL 10000 5\n\
-            sell TESTE/BRL 10100 3\n\
-            buy TESTE/BRL 9900 4\n\
-            buy TESTE/BRL 10000 2\n\
-            buy TESTE/BRL 10100 4 ioc\n\
-            cancel TESTE/BRL 3\n\
-            sell TESTE/BRL mkt 1\n\
-            buy TESTE/BRL 10005 1\n\
-            buy TESTE/BRL 100 0\n\
-            sell TESTE/BRL 10200 2 fok\n\
-            buy TESTE/BRL 10200 2\n\
-            cancel TESTE/BRL 99\n";
-
-        /// O log da sessão, onde termina cada registro e o estado esperado depois de cada
-        /// prefixo: `expected[n]` é o engine com só os `n` primeiros comandos aplicados,
-        /// construído direto com `apply`, sem passar pelo replay que está sob teste.
-        struct Recorded {
-            bytes: Vec<u8>,
-            ends: Vec<usize>,
-            expected: Vec<(Engine, Counters)>,
-        }
-
-        fn record_scenario(name: &str) -> Recorded {
-            let path = TempPath::new(&format!("{name}-scenario"));
-            wal_session(&path, &format!("{FUNDING}{SCENARIO}")).unwrap();
-            let bytes = fs::read(&path.0).unwrap();
-
-            let decoded = exchange_wal::decode(&bytes);
-            assert_eq!(
-                decoded.valid_len,
-                bytes.len(),
-                "a sessão gravou um log íntegro"
-            );
-            let mut ends = Vec::new();
-            let mut commands = Vec::new();
-            for payload in decoded.records {
-                ends.push(ends.last().unwrap_or(&0) + exchange_wal::HEADER_LEN + payload.len());
-                commands.push(LogRecord::from_bytes(payload).unwrap().command());
-            }
-            let expected = (0..=commands.len())
-                .map(|count| state_after(&commands[..count]))
-                .collect();
-            Recorded {
-                bytes,
-                ends,
-                expected,
-            }
-        }
-
-        fn state_after(commands: &[Command]) -> (Engine, Counters) {
-            let mut engine = new_engine();
-            let mut counters = Counters::FRESH;
-            for &command in commands {
-                if matches!(command, Command::Submit(_)) {
-                    counters.next_order_id += 1;
-                }
-                counters.next_seq += 1;
-                engine.apply(command);
-            }
-            (engine, counters)
-        }
-
-        fn complete_before(ends: &[usize], cut: usize) -> usize {
-            ends.iter().take_while(|&&end| end <= cut).count()
-        }
-
-        fn boot_from(path: &TempPath, bytes: &[u8]) -> (Engine, Counters) {
-            fs::write(&path.0, bytes).unwrap();
-            let mut engine = new_engine();
-            let (_, counters) = boot(&mut engine, Some(&path.0), &mut io::sink()).unwrap();
-            (engine, counters)
-        }
-
-        // Critério da F3: um crash pode deixar no disco qualquer prefixo do log. Para cada
-        // um deles, o boot sobe e reconstrói exatamente o estado dos comandos inteiros.
-        #[test]
-        fn crash_at_any_byte_recovers_the_state_of_the_complete_commands() {
-            let recorded = record_scenario("crash");
-            let path = TempPath::new("crash");
-
-            for cut in 0..=recorded.bytes.len() {
-                let complete = complete_before(&recorded.ends, cut);
-                let state = boot_from(&path, &recorded.bytes[..cut]);
-
-                assert!(
-                    state == recorded.expected[complete],
-                    "corte em {cut} bytes deveria recuperar {complete} comandos"
-                );
-                let kept = if complete == 0 {
-                    0
-                } else {
-                    recorded.ends[complete - 1]
-                };
-                assert_eq!(
-                    fs::metadata(&path.0).unwrap().len(),
-                    kept as u64,
-                    "corte em {cut}"
-                );
-            }
-        }
-
-        #[test]
-        fn flipped_bit_at_any_byte_recovers_everything_before_its_record() {
-            let recorded = record_scenario("flip");
-            let path = TempPath::new("flip");
-
-            for position in 0..recorded.bytes.len() {
-                let mut bytes = recorded.bytes.clone();
-                bytes[position] ^= 1 << (position % 8);
-                let intact = complete_before(&recorded.ends, position);
-
-                let state = boot_from(&path, &bytes);
-
-                assert!(
-                    state == recorded.expected[intact],
-                    "bit trocado no byte {position} deveria recuperar {intact} comandos"
-                );
-            }
-        }
-
-        #[test]
-        fn zeroed_tail_recovers_the_whole_log() {
-            let recorded = record_scenario("zeros");
-            let path = TempPath::new("zeros");
-            let mut bytes = recorded.bytes.clone();
-            bytes.extend_from_slice(&[0; 4096]);
-
-            let state = boot_from(&path, &bytes);
-
-            assert_eq!(state, *recorded.expected.last().unwrap());
         }
 
         #[test]
