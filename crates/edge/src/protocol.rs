@@ -244,7 +244,7 @@ fn known_asset(name: String) -> Result<AssetId, ProtocolError> {
     asset_id(&name).ok_or(ProtocolError::UnknownAsset(name))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Level {
     pub price: Price,
     pub lots: Lots,
@@ -259,31 +259,35 @@ impl From<Quote> for Level {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct AssetBalance {
-    pub asset: &'static str,
+    pub asset: String,
     pub available: Amount,
     pub reserved: Amount,
 }
 
 /// Mensagem do servidor. `code` dos rejeitados é estável, para máquina; `message` é texto
 /// para gente e pode mudar.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+///
+/// É o mesmo tipo dos dois lados: o servidor serializa, o cliente desserializa. Ao contrário
+/// de [`ClientMessage`], campo desconhecido é aceito: o servidor é rigoroso com o que recebe,
+/// o cliente é tolerante com o que lê, para que campos novos não quebrem clientes antigos.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     LoggedIn {
         account: AccountId,
     },
     Deposited {
-        asset: &'static str,
+        asset: String,
         amount: Amount,
     },
     DepositRejected {
-        asset: &'static str,
+        asset: String,
         amount: Amount,
     },
     Fill {
-        instrument: &'static str,
+        instrument: String,
         taker: OrderId,
         maker: OrderId,
         lots: Lots,
@@ -291,23 +295,23 @@ pub enum ServerMessage {
         fee: Amount,
     },
     Rested {
-        instrument: &'static str,
+        instrument: String,
         order: OrderId,
         lots: Lots,
     },
     Cancelled {
-        instrument: &'static str,
+        instrument: String,
         order: OrderId,
         lots: Lots,
     },
     Expired {
-        instrument: &'static str,
+        instrument: String,
         order: OrderId,
         lots: Lots,
     },
     Rejected {
         order: OrderId,
-        code: &'static str,
+        code: String,
         message: String,
     },
     Balances {
@@ -317,7 +321,7 @@ pub enum ServerMessage {
         message: String,
     },
     Snapshot {
-        instrument: &'static str,
+        instrument: String,
         feed: Feed,
         seq: u64,
         bids: Vec<Level>,
@@ -325,7 +329,7 @@ pub enum ServerMessage {
     },
     /// Nível 2: quantidade absoluta no preço; zero quer dizer que o nível sumiu.
     Depth {
-        instrument: &'static str,
+        instrument: String,
         feed: Feed,
         seq: u64,
         side: Side,
@@ -334,14 +338,14 @@ pub enum ServerMessage {
     },
     /// Nível 1: o topo do livro, `null` no lado vazio.
     Top {
-        instrument: &'static str,
+        instrument: String,
         feed: Feed,
         seq: u64,
         bid: Option<Level>,
         ask: Option<Level>,
     },
     Trade {
-        instrument: &'static str,
+        instrument: String,
         feed: Feed,
         seq: u64,
         price: Price,
@@ -349,11 +353,91 @@ pub enum ServerMessage {
     },
 }
 
+/// Uma mensagem do feed traduzida de volta para os tipos do [`crate::market_data`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FeedMessage {
+    Snapshot(Snapshot),
+    Update(Update),
+}
+
+impl ServerMessage {
+    /// `None` se não for mensagem do feed ou se o instrumento não existir no mercado.
+    pub fn into_feed(self) -> Option<FeedMessage> {
+        let quote = |level: Level| Quote {
+            price: level.price,
+            lots: level.lots,
+        };
+        let update = |instrument: &str, feed: Feed, seq, body| {
+            Some(FeedMessage::Update(Update {
+                instrument: instrument_id(instrument)?,
+                feed: feed.into(),
+                seq,
+                body,
+            }))
+        };
+        match self {
+            Self::Snapshot {
+                instrument,
+                feed,
+                seq,
+                bids,
+                asks,
+            } => Some(FeedMessage::Snapshot(Snapshot {
+                instrument: instrument_id(&instrument)?,
+                feed: feed.into(),
+                seq,
+                bids: bids.into_iter().map(quote).collect(),
+                asks: asks.into_iter().map(quote).collect(),
+            })),
+            Self::Depth {
+                instrument,
+                feed,
+                seq,
+                side,
+                price,
+                lots,
+            } => update(
+                &instrument,
+                feed,
+                seq,
+                Body::Level {
+                    side: side.into(),
+                    price,
+                    lots,
+                },
+            ),
+            Self::Top {
+                instrument,
+                feed,
+                seq,
+                bid,
+                ask,
+            } => update(
+                &instrument,
+                feed,
+                seq,
+                Body::Top {
+                    bid: bid.map(quote),
+                    ask: ask.map(quote),
+                },
+            ),
+            Self::Trade {
+                instrument,
+                feed,
+                seq,
+                price,
+                lots,
+            } => update(&instrument, feed, seq, Body::Trade { price, lots }),
+            _ => None,
+        }
+    }
+}
+
 impl From<&Snapshot> for ServerMessage {
     fn from(snapshot: &Snapshot) -> Self {
         let levels = |quotes: &[Quote]| quotes.iter().copied().map(Level::from).collect();
         Self::Snapshot {
-            instrument: symbol(snapshot.instrument),
+            instrument: symbol(snapshot.instrument).to_string(),
             feed: snapshot.feed.into(),
             seq: snapshot.seq,
             bids: levels(&snapshot.bids),
@@ -364,7 +448,7 @@ impl From<&Snapshot> for ServerMessage {
 
 impl From<&Update> for ServerMessage {
     fn from(update: &Update) -> Self {
-        let instrument = symbol(update.instrument);
+        let instrument = symbol(update.instrument).to_string();
         let feed = update.feed.into();
         let seq = update.seq;
         match update.body {
@@ -409,11 +493,11 @@ impl From<&Event> for ServerMessage {
     fn from(event: &Event) -> Self {
         match *event {
             Event::Deposited { asset, amount, .. } => Self::Deposited {
-                asset: asset_name(asset),
+                asset: asset_name(asset).to_string(),
                 amount,
             },
             Event::DepositRejected { asset, amount, .. } => Self::DepositRejected {
-                asset: asset_name(asset),
+                asset: asset_name(asset).to_string(),
                 amount,
             },
             Event::Fill {
@@ -421,7 +505,7 @@ impl From<&Event> for ServerMessage {
                 fill,
                 fee,
             } => Self::Fill {
-                instrument: symbol(instrument),
+                instrument: symbol(instrument).to_string(),
                 taker: fill.taker,
                 maker: fill.maker,
                 lots: fill.lots,
@@ -434,7 +518,7 @@ impl From<&Event> for ServerMessage {
                 lots,
                 ..
             } => Self::Rested {
-                instrument: symbol(instrument),
+                instrument: symbol(instrument).to_string(),
                 order,
                 lots,
             },
@@ -443,7 +527,7 @@ impl From<&Event> for ServerMessage {
                 order,
                 lots,
             } => Self::Cancelled {
-                instrument: symbol(instrument),
+                instrument: symbol(instrument).to_string(),
                 order,
                 lots,
             },
@@ -452,13 +536,13 @@ impl From<&Event> for ServerMessage {
                 order,
                 lots,
             } => Self::Expired {
-                instrument: symbol(instrument),
+                instrument: symbol(instrument).to_string(),
                 order,
                 lots,
             },
             Event::Rejected { order, reason } => Self::Rejected {
                 order,
-                code: reject_code(&reason),
+                code: reject_code(&reason).to_string(),
                 message: reject_message(&reason),
             },
         }
@@ -844,7 +928,7 @@ mod tests {
         );
         let balances = ServerMessage::Balances {
             balances: vec![AssetBalance {
-                asset: "BRL",
+                asset: "BRL".to_string(),
                 available: amount(10),
                 reserved: amount(5),
             }],
