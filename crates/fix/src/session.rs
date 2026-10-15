@@ -28,7 +28,12 @@ pub struct SessionConfig {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Action {
     Send(Message),
-    Deliver(AppMessage),
+    /// O `seq` acompanha a mensagem para que a aplicação possa recusá-la citando qual foi
+    /// (`RefSeqNum` do `BusinessMessageReject`).
+    Deliver {
+        seq: SeqNum,
+        app: AppMessage,
+    },
     Disconnect,
 }
 
@@ -239,7 +244,7 @@ impl Session {
         out: &mut Vec<Action>,
     ) {
         let admin = match body {
-            Body::App(app) => return out.push(Action::Deliver(app)),
+            Body::App(app) => return out.push(Action::Deliver { seq, app }),
             Body::Admin(admin) => admin,
         };
         match admin {

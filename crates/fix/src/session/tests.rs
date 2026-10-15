@@ -73,7 +73,7 @@ fn sent(actions: &[Action]) -> Vec<Envelope> {
             Action::Send(message) => {
                 Some(Envelope::parse(message.clone()).expect("a sessão só envia mensagens válidas"))
             }
-            Action::Deliver(_) | Action::Disconnect => None,
+            Action::Deliver { .. } | Action::Disconnect => None,
         })
         .collect()
 }
@@ -173,7 +173,13 @@ fn unexpected_comp_id_logs_out() {
 fn in_sequence_app_message_is_delivered() {
     let mut session = active_acceptor();
     let actions = session.receive(at(1), from_client(2, None, Body::App(app("a"))));
-    assert_eq!(actions, vec![Action::Deliver(app("a"))]);
+    assert_eq!(
+        actions,
+        vec![Action::Deliver {
+            seq: seq(2),
+            app: app("a")
+        }]
+    );
     assert_eq!(session.next_inbound(), seq(3));
 }
 
@@ -203,9 +209,21 @@ fn gap_asks_for_resend_once_and_discards_until_filled() {
     );
     assert_eq!(session.receive(at(2), fill), vec![]);
     let replayed = session.receive(at(2), from_client(5, Some(at(1)), Body::App(app("e"))));
-    assert_eq!(replayed, vec![Action::Deliver(app("e"))]);
+    assert_eq!(
+        replayed,
+        vec![Action::Deliver {
+            seq: seq(5),
+            app: app("e")
+        }]
+    );
     let replayed = session.receive(at(2), from_client(6, Some(at(1)), Body::App(app("f"))));
-    assert_eq!(replayed, vec![Action::Deliver(app("f"))]);
+    assert_eq!(
+        replayed,
+        vec![Action::Deliver {
+            seq: seq(6),
+            app: app("f")
+        }]
+    );
 
     let next_gap = session.receive(at(3), from_client(8, None, Body::App(app("h"))));
     assert_eq!(
@@ -553,7 +571,7 @@ impl Link2 {
             match action {
                 Action::Send(message) if self.up => self.in_flight[side].push_back(message),
                 Action::Send(_) => {}
-                Action::Deliver(app) => self.peers[side].delivered.push(app),
+                Action::Deliver { app, .. } => self.peers[side].delivered.push(app),
                 Action::Disconnect => self.drop_link(),
             }
         }
