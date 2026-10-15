@@ -64,6 +64,7 @@ name = "edge"
 version = "0.1.0"
 dependencies = [
  "exchange-core",
+ "exchange-fix",
  "exchange-wal",
  "proptest",
  "serde",

@@ -62,9 +62,10 @@ impl fmt::Display for SeqNum {
     }
 }
 
-/// Valor livre de um campo: `CompID`, `TestReqID`, texto de Logout. Mesma regra de qualquer
-/// valor FIX, não vazio e sem SOH.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// Valor livre de um campo: `CompID`, `TestReqID`, `ClOrdID`, texto de Logout. Mesma regra
+/// de qualquer valor FIX, não vazio e sem SOH. `Hash` porque `CompID` e `ClOrdID` são
+/// chaves de mapa na borda.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Text(Vec<u8>);
 
 impl Text {
