@@ -3,6 +3,15 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
+mod admin;
+mod time;
+
+pub use admin::{
+    Admin, AppMessage, Body, Envelope, Header, NotApp, ParseError, RejectReason, SeqNum,
+    SessionReject, Text,
+};
+pub use time::UtcTimestamp;
+
 pub const SOH: u8 = 0x01;
 pub const MAX_BODY_LEN: usize = 4096;
 
@@ -328,20 +337,21 @@ fn parse_field(raw: &[u8]) -> Result<Field, Garbled> {
         .position(|&byte| byte == b'=')
         .ok_or(Garbled::BadField)?;
     let tag = parse_number(&raw[..equals])
+        .and_then(|number| u32::try_from(number).ok())
         .and_then(Tag::new)
         .ok_or(Garbled::BadField)?;
     Field::new(tag, &raw[equals + 1..]).map_err(|_| Garbled::BadField)
 }
 
-fn parse_number(digits: &[u8]) -> Option<u32> {
+fn parse_number(digits: &[u8]) -> Option<u64> {
     if digits.is_empty() || (digits.starts_with(b"0") && digits.len() > 1) {
         return None;
     }
-    digits.iter().try_fold(0u32, |number, &raw| {
+    digits.iter().try_fold(0u64, |number, &raw| {
         if !raw.is_ascii_digit() {
             return None;
         }
-        number.checked_mul(10)?.checked_add(u32::from(raw - b'0'))
+        number.checked_mul(10)?.checked_add(u64::from(raw - b'0'))
     })
 }
 
