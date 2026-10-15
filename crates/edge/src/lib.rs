@@ -3,6 +3,7 @@
 pub mod core_thread;
 pub mod feed_client;
 pub mod fix_app;
+pub mod fix_gateway;
 pub mod market;
 pub mod market_data;
 pub mod protocol;
