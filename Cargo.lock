@@ -103,6 +103,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "exchange-fix"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "exchange-wal"
 version = "0.1.0"
 dependencies = [

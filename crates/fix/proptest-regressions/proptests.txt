@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c1e8904dd046b8cbc6fd76bbb9c4eaff366a764a4b854662c248246af3df7507 # shrinks to messages = [Message { msg_type: [65, 76], body: [] }], cuts = []
+cc 67f9386612aaeb539ac68ee655f79468f281b5f25f7c2d506ff8ff90cd324f4c # shrinks to message = Message { msg_type: [65, 76], body: [Field { tag: Tag(999998686), value: [19, 39] }, Field { tag: Tag(1344447854), value: [2, 70, 143, 157, 194, 191, 113, 169] }] }
