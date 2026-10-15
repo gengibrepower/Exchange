@@ -24,6 +24,12 @@ impl UtcTimestamp {
         self.0
     }
 
+    /// Zero se `earlier` está no futuro: o relógio de parede pode andar para trás, e um
+    /// prazo não deve virar um número gigante por causa disso.
+    pub const fn saturating_millis_since(self, earlier: Self) -> u64 {
+        self.0.saturating_sub(earlier.0)
+    }
+
     /// Aceita `YYYYMMDD-HH:MM:SS.sss` e também a forma sem milissegundos, que o FIX 4.4
     /// permite. Datas antes de 1970 ficam de fora: não existem num simulador que nasceu
     /// depois disso, e assim toda a aritmética fica em `u64`.
