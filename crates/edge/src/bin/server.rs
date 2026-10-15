@@ -4,21 +4,25 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use edge::core_thread::spawn_core;
+use edge::fix_gateway::{self, Registry};
 use edge::market::new_market_data;
 use edge::sequencer::Sequencer;
 use edge::server::{Limits, serve};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-const USAGE: &str = "uso: server [--listen <endereço:porta>] [--wal <caminho>]";
+const USAGE: &str =
+    "uso: server [--listen <endereço:porta>] [--fix <endereço:porta>] [--wal <caminho>]";
 
 // Só a própria máquina por padrão: um simulador sem autenticação não deve aparecer na rede
 // por acidente (seção 6). Expor é pedir explicitamente com --listen.
 const DEFAULT_LISTEN: &str = "127.0.0.1:7000";
+const DEFAULT_FIX: &str = "127.0.0.1:7001";
 
 const QUEUE: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 não é zero");
 
@@ -34,17 +38,26 @@ const LIMITS: Limits = Limits {
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     listen: SocketAddr,
+    fix: SocketAddr,
     wal: Option<PathBuf>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Args, &'static str> {
     let mut listen = None;
+    let mut fix = None;
     let mut wal = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(USAGE)?;
+        let address = || {
+            value
+                .to_str()
+                .and_then(|text| text.parse().ok())
+                .ok_or(USAGE)
+        };
         let slot_was_empty = if flag == "--listen" {
-            let address = value.to_str().and_then(|text| text.parse().ok());
-            listen.replace(address.ok_or(USAGE)?).is_none()
+            listen.replace(address()?).is_none()
+        } else if flag == "--fix" {
+            fix.replace(address()?).is_none()
         } else if flag == "--wal" {
             wal.replace(PathBuf::from(value)).is_none()
         } else {
@@ -58,7 +71,11 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Args, &'static
         Some(address) => address,
         None => DEFAULT_LISTEN.parse().map_err(|_| USAGE)?,
     };
-    Ok(Args { listen, wal })
+    let fix = match fix {
+        Some(address) => address,
+        None => DEFAULT_FIX.parse().map_err(|_| USAGE)?,
+    };
+    Ok(Args { listen, fix, wal })
 }
 
 #[tokio::main]
@@ -101,9 +118,13 @@ async fn run() -> io::Result<()> {
 
     let listener = TcpListener::bind(args.listen).await?;
     eprintln!("ouvindo em {}", listener.local_addr()?);
+    let fix_listener = TcpListener::bind(args.fix).await?;
+    eprintln!("FIX ouvindo em {}", fix_listener.local_addr()?);
+    let registry = Arc::new(Registry::default());
 
     tokio::select! {
-        served = serve(listener, core, LIMITS) => served,
+        served = serve(listener, core.clone(), LIMITS) => served,
+        served = fix_gateway::serve(fix_listener, core, registry, LIMITS) => served,
         outcome = core_stopped => Err(io::Error::other(match outcome {
             Ok(Ok(Err(error))) => format!("o núcleo parou: {error}"),
             Ok(Err(_)) => "o núcleo entrou em pânico".to_string(),
@@ -126,6 +147,7 @@ mod tests {
             parse(&[]),
             Ok(Args {
                 listen: "127.0.0.1:7000".parse().unwrap(),
+                fix: "127.0.0.1:7001".parse().unwrap(),
                 wal: None
             })
         );
@@ -135,14 +157,29 @@ mod tests {
     fn flags_in_any_order() {
         let expected = Ok(Args {
             listen: "0.0.0.0:9000".parse().unwrap(),
+            fix: "0.0.0.0:9001".parse().unwrap(),
             wal: Some(PathBuf::from("x.wal")),
         });
         assert_eq!(
-            parse(&["--listen", "0.0.0.0:9000", "--wal", "x.wal"]),
+            parse(&[
+                "--listen",
+                "0.0.0.0:9000",
+                "--fix",
+                "0.0.0.0:9001",
+                "--wal",
+                "x.wal"
+            ]),
             expected
         );
         assert_eq!(
-            parse(&["--wal", "x.wal", "--listen", "0.0.0.0:9000"]),
+            parse(&[
+                "--wal",
+                "x.wal",
+                "--fix",
+                "0.0.0.0:9001",
+                "--listen",
+                "0.0.0.0:9000"
+            ]),
             expected
         );
     }
@@ -153,5 +190,10 @@ mod tests {
         assert_eq!(parse(&["--listen", "localhost"]), Err(USAGE));
         assert_eq!(parse(&["--port", "7000"]), Err(USAGE));
         assert_eq!(parse(&["--wal", "a", "--wal", "b"]), Err(USAGE));
+        assert_eq!(
+            parse(&["--fix", "1.2.3.4:5", "--fix", "1.2.3.4:6"]),
+            Err(USAGE)
+        );
+        assert_eq!(parse(&["--fix", "nada"]), Err(USAGE));
     }
 }
