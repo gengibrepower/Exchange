@@ -4,12 +4,14 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 mod admin;
+mod session;
 mod time;
 
 pub use admin::{
     Admin, AppMessage, Body, Envelope, Header, NotApp, ParseError, RejectReason, SeqNum,
     SessionReject, Text,
 };
+pub use session::{Action, Role, Session, SessionConfig};
 pub use time::UtcTimestamp;
 
 pub const SOH: u8 = 0x01;
