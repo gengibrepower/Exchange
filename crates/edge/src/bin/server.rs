@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -10,14 +10,14 @@ use std::time::Duration;
 
 use edge::core_thread::spawn_core;
 use edge::fix_gateway::{self, Registry};
-use edge::market::new_market_data;
-use edge::sequencer::Sequencer;
+use edge::market::{new_market_data, restore_market_data};
+use edge::sequencer::{Sequencer, SnapshotBoot};
 use edge::server::{Limits, serve};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-const USAGE: &str =
-    "uso: server [--listen <endereço:porta>] [--fix <endereço:porta>] [--wal <caminho>]";
+const USAGE: &str = "uso: server [--listen <endereço:porta>] [--fix <endereço:porta>] \
+                     [--wal <caminho> [--snapshot-every <comandos>]]";
 
 // Só a própria máquina por padrão: um simulador sem autenticação não deve aparecer na rede
 // por acidente (seção 6). Expor é pedir explicitamente com --listen.
@@ -43,12 +43,14 @@ struct Args {
     listen: SocketAddr,
     fix: SocketAddr,
     wal: Option<PathBuf>,
+    snapshot_every: Option<NonZeroU64>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Args, &'static str> {
     let mut listen = None;
     let mut fix = None;
     let mut wal = None;
+    let mut snapshot_every = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(USAGE)?;
         let address = || {
@@ -63,6 +65,9 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Args, &'static
             fix.replace(address()?).is_none()
         } else if flag == "--wal" {
             wal.replace(PathBuf::from(value)).is_none()
+        } else if flag == "--snapshot-every" {
+            let every = value.to_str().and_then(|text| text.parse().ok());
+            snapshot_every.replace(every.ok_or(USAGE)?).is_none()
         } else {
             return Err(USAGE);
         };
@@ -78,7 +83,15 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Args, &'static
         Some(address) => address,
         None => DEFAULT_FIX.parse().map_err(|_| USAGE)?,
     };
-    Ok(Args { listen, fix, wal })
+    if wal.is_none() && snapshot_every.is_some() {
+        return Err(USAGE);
+    }
+    Ok(Args {
+        listen,
+        fix,
+        wal,
+        snapshot_every,
+    })
 }
 
 #[tokio::main]
@@ -94,20 +107,21 @@ async fn main() -> ExitCode {
 
 async fn run() -> io::Result<()> {
     let args = parse_args(std::env::args_os().skip(1)).map_err(io::Error::other)?;
-    let mut market_data = new_market_data();
-    let sequencer = match &args.wal {
-        None => Sequencer::in_memory(),
+    let (sequencer, market_data) = match &args.wal {
+        None => (Sequencer::in_memory(), new_market_data()),
         Some(path) => {
-            // O feed também é estado derivado do log: vê o replay para voltar com o livro.
-            let (sequencer, report) = Sequencer::open_observed(path, |events| {
-                market_data.apply(events);
-            })
-            .map_err(io::Error::other)?;
+            let (sequencer, report) =
+                Sequencer::open(path, args.snapshot_every).map_err(io::Error::other)?;
             eprintln!(
                 "log: {} comandos reaplicados, {} bytes descartados",
                 report.replayed, report.discarded
             );
-            sequencer
+            if !matches!(report.snapshot, SnapshotBoot::Missing) {
+                eprintln!("snapshot: {}", report.snapshot);
+            }
+            // O feed também é estado derivado: volta com o livro que o engine voltou.
+            let market_data = restore_market_data(&sequencer.engine_state());
+            (sequencer, market_data)
         }
     };
     let (core, core_thread) = spawn_core(sequencer, market_data, QUEUE, FEED, REPORTS)?;
@@ -151,7 +165,8 @@ mod tests {
             Ok(Args {
                 listen: "127.0.0.1:7000".parse().unwrap(),
                 fix: "127.0.0.1:7001".parse().unwrap(),
-                wal: None
+                wal: None,
+                snapshot_every: None,
             })
         );
     }
@@ -162,6 +177,7 @@ mod tests {
             listen: "0.0.0.0:9000".parse().unwrap(),
             fix: "0.0.0.0:9001".parse().unwrap(),
             wal: Some(PathBuf::from("x.wal")),
+            snapshot_every: NonZeroU64::new(100),
         });
         assert_eq!(
             parse(&[
@@ -170,12 +186,16 @@ mod tests {
                 "--fix",
                 "0.0.0.0:9001",
                 "--wal",
-                "x.wal"
+                "x.wal",
+                "--snapshot-every",
+                "100"
             ]),
             expected
         );
         assert_eq!(
             parse(&[
+                "--snapshot-every",
+                "100",
                 "--wal",
                 "x.wal",
                 "--fix",
@@ -198,5 +218,10 @@ mod tests {
             Err(USAGE)
         );
         assert_eq!(parse(&["--fix", "nada"]), Err(USAGE));
+        assert_eq!(parse(&["--snapshot-every", "100"]), Err(USAGE));
+        assert_eq!(
+            parse(&["--wal", "x.wal", "--snapshot-every", "0"]),
+            Err(USAGE)
+        );
     }
 }

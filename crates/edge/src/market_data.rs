@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use exchange_core::domain::{InstrumentId, Lots, OrderId, Price, Side};
-use exchange_core::engine::Event;
+use exchange_core::domain::{InstrumentId, Lots, OrderId, OrderKind, Price, Side};
+use exchange_core::engine::{EngineState, Event};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Feed {
@@ -155,6 +155,37 @@ impl MarketData {
                 .map(|instrument| (instrument, InstrumentFeed::default()))
                 .collect(),
         }
+    }
+
+    /// O feed de um engine que acaba de subir: ordens em repouso e níveis saem do livro de
+    /// `state`, e as sequências começam do zero. Depois de um reinício toda conexão de feed
+    /// caiu, e o assinante começa por um snapshot de qualquer jeito (seção 4.3).
+    ///
+    /// # Panics
+    /// Se o livro de `state` tiver ordem que não seja limite: um engine nunca deixa uma
+    /// descansar, e [`exchange_core::engine::Engine::restore`] recusa o estado que tenha.
+    pub fn restore(
+        instruments: impl IntoIterator<Item = InstrumentId>,
+        state: &EngineState,
+    ) -> Self {
+        let mut market = Self::new(instruments);
+        for instrument in &state.instruments {
+            let Some(feed) = market.books.get_mut(&instrument.instrument) else {
+                continue;
+            };
+            for (side, orders) in [(Side::Bid, &instrument.bids), (Side::Ask, &instrument.asks)] {
+                for open in orders {
+                    let OrderKind::Limit(price) = open.request.kind else {
+                        panic!("só ordem limite descansa no livro");
+                    };
+                    let lots = open.remaining;
+                    feed.resting
+                        .insert(open.request.id, Resting { side, price, lots });
+                    feed.add(side, price, lots);
+                }
+            }
+        }
+        market
     }
 
     /// Os incrementos causados pelos eventos de um comando, na ordem em que aconteceram.

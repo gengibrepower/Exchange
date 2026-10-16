@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::sequencer::snapshot_path;
+
 /// Caminho temporário que se apaga no fim do teste, inclusive se ele falhar.
 pub(crate) struct TempPath(pub(crate) PathBuf);
 
@@ -14,9 +16,15 @@ impl TempPath {
     }
 }
 
+/// O log leva junto o snapshot dele e o temporário que um crash pode deixar.
 impl Drop for TempPath {
     fn drop(&mut self) {
-        remove_if_present(&self.0);
+        let snapshot = snapshot_path(&self.0);
+        let mut temporary = snapshot.clone().into_os_string();
+        temporary.push(".tmp");
+        for path in [&self.0, &snapshot, Path::new(&temporary)] {
+            remove_if_present(path);
+        }
     }
 }
 

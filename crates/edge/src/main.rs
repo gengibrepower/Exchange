@@ -2,12 +2,13 @@ mod parse;
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::num::NonZeroU64;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use edge::market::{ASSETS, asset_id, asset_name, instrument_id, symbol};
 use edge::protocol::reject_message;
-use edge::sequencer::{Intent, Sequencer};
+use edge::sequencer::{Intent, Sequencer, SnapshotBoot};
 use exchange_core::domain::AccountId;
 use exchange_core::engine::Event;
 
@@ -15,12 +16,12 @@ use crate::parse::{Input, parse_line};
 
 const ACCOUNT: AccountId = AccountId::new(1);
 
-const USAGE: &str = "uso: edge [--wal <caminho>]";
+const USAGE: &str = "uso: edge [--wal <caminho> [--snapshot-every <comandos>]]";
 
 fn main() -> ExitCode {
     let result = parse_args(std::env::args_os().skip(1))
         .map_err(io::Error::other)
-        .and_then(|wal| run(io::stdin().lock(), &mut io::stdout().lock(), wal.as_deref()));
+        .and_then(|log| run(io::stdin().lock(), &mut io::stdout().lock(), log.as_ref()));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -30,31 +31,60 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Option<PathBuf>, &'static str> {
-    match (args.next(), args.next(), args.next()) {
-        (None, _, _) => Ok(None),
-        (Some(flag), Some(path), None) if flag == "--wal" => Ok(Some(PathBuf::from(path))),
-        _ => Err(USAGE),
+#[derive(Debug, PartialEq, Eq)]
+struct Log {
+    wal: PathBuf,
+    snapshot_every: Option<NonZeroU64>,
+}
+
+fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Option<Log>, &'static str> {
+    let mut wal = None;
+    let mut snapshot_every = None;
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or(USAGE)?;
+        let slot_was_empty = if flag == "--wal" {
+            wal.replace(PathBuf::from(value)).is_none()
+        } else if flag == "--snapshot-every" {
+            let every = value.to_str().and_then(|text| text.parse().ok());
+            snapshot_every.replace(every.ok_or(USAGE)?).is_none()
+        } else {
+            return Err(USAGE);
+        };
+        if !slot_was_empty {
+            return Err(USAGE);
+        }
+    }
+    match (wal, snapshot_every) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(USAGE),
+        (Some(wal), snapshot_every) => Ok(Some(Log {
+            wal,
+            snapshot_every,
+        })),
     }
 }
 
-/// Sem WAL, começa do zero em memória. Com WAL, abre e reaplica o log antes de aceitar
+/// Sem WAL, começa do zero em memória. Com WAL, sobe do snapshot e do log antes de aceitar
 /// qualquer comando novo.
-fn boot(wal_path: Option<&Path>, output: &mut impl Write) -> io::Result<Sequencer> {
-    let Some(path) = wal_path else {
+fn boot(log: Option<&Log>, output: &mut impl Write) -> io::Result<Sequencer> {
+    let Some(log) = log else {
         return Ok(Sequencer::in_memory());
     };
-    let (sequencer, report) = Sequencer::open(path).map_err(io::Error::other)?;
+    let (sequencer, report) =
+        Sequencer::open(&log.wal, log.snapshot_every).map_err(io::Error::other)?;
     writeln!(
         output,
         "log: {} comandos reaplicados, {} bytes descartados",
         report.replayed, report.discarded
     )?;
+    if !matches!(report.snapshot, SnapshotBoot::Missing) {
+        writeln!(output, "snapshot: {}", report.snapshot)?;
+    }
     Ok(sequencer)
 }
 
-fn run(input: impl BufRead, output: &mut impl Write, wal_path: Option<&Path>) -> io::Result<()> {
-    let mut sequencer = boot(wal_path, output)?;
+fn run(input: impl BufRead, output: &mut impl Write, log: Option<&Log>) -> io::Result<()> {
+    let mut sequencer = boot(log, output)?;
 
     for line in input.lines() {
         let line = line?;
@@ -398,8 +428,11 @@ mod tests {
 
     mod wal {
         use std::fs::{self, OpenOptions};
+        use std::path::Path;
 
         use exchange_wal::Wal;
+
+        use edge::sequencer::snapshot_path;
 
         use super::*;
 
@@ -418,6 +451,7 @@ mod tests {
         impl Drop for TempPath {
             fn drop(&mut self) {
                 remove_if_present(&self.0);
+                remove_if_present(&snapshot_path(&self.0));
             }
         }
 
@@ -431,9 +465,42 @@ mod tests {
         }
 
         fn wal_session(path: &TempPath, input: &str) -> io::Result<String> {
+            logged_session(path, None, input)
+        }
+
+        fn logged_session(
+            path: &TempPath,
+            snapshot_every: Option<u64>,
+            input: &str,
+        ) -> io::Result<String> {
+            let log = Log {
+                wal: path.0.clone(),
+                snapshot_every: snapshot_every.map(|every| NonZeroU64::new(every).unwrap()),
+            };
             let mut output = Vec::new();
-            run(input.as_bytes(), &mut output, Some(&path.0))?;
+            run(input.as_bytes(), &mut output, Some(&log))?;
             Ok(String::from_utf8(output).expect("saída é UTF-8"))
+        }
+
+        // Com snapshot a cada 2 comandos, o reinício carrega o estado dos 4 primeiros e só
+        // reaplica o quinto; o que se vê depois é o mesmo de quem nunca reiniciou.
+        #[test]
+        fn restart_from_a_snapshot_replays_only_the_rest_of_the_log() {
+            let path = TempPath::new("snapshot");
+            let history = "sell TESTE/BRL 10000 5\nbuy TESTE/BRL 10100 2\nbuy TESTE/BRL 9000 1\n";
+            let uninterrupted = raw_session(&format!("{FUNDING}{history}balance\n"));
+
+            logged_session(&path, Some(2), &format!("{FUNDING}{history}")).unwrap();
+            let restarted = wal_session(&path, "balance\n").unwrap();
+
+            assert_eq!(
+                restarted.lines().take(2).collect::<Vec<_>>(),
+                [
+                    "log: 1 comandos reaplicados, 0 bytes descartados",
+                    "snapshot: carregado, cobre 4 comandos"
+                ]
+            );
+            assert_eq!(last_lines(&restarted, 2), last_lines(&uninterrupted, 2));
         }
 
         fn last_lines(output: &str, count: usize) -> Vec<&str> {
@@ -518,20 +585,34 @@ mod tests {
         }
 
         #[test]
-        fn args_select_the_wal_path() {
-            let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        fn args_select_the_wal_path_and_the_snapshot_interval() {
+            let parse = |list: &[&str]| parse_args(list.iter().map(OsString::from));
+            let log = |snapshot_every: Option<u64>| {
+                Ok(Some(Log {
+                    wal: PathBuf::from("x.wal"),
+                    snapshot_every: snapshot_every.and_then(NonZeroU64::new),
+                }))
+            };
 
-            assert_eq!(parse_args(args(&[]).into_iter()), Ok(None));
+            assert_eq!(parse(&[]), Ok(None));
+            assert_eq!(parse(&["--wal", "x.wal"]), log(None));
             assert_eq!(
-                parse_args(args(&["--wal", "x.wal"]).into_iter()),
-                Ok(Some(PathBuf::from("x.wal")))
+                parse(&["--wal", "x.wal", "--snapshot-every", "50"]),
+                log(Some(50))
             );
-            assert_eq!(parse_args(args(&["--wal"]).into_iter()), Err(USAGE));
-            assert_eq!(parse_args(args(&["-w", "x.wal"]).into_iter()), Err(USAGE));
             assert_eq!(
-                parse_args(args(&["--wal", "x.wal", "extra"]).into_iter()),
+                parse(&["--snapshot-every", "50", "--wal", "x.wal"]),
+                log(Some(50))
+            );
+            assert_eq!(parse(&["--wal"]), Err(USAGE));
+            assert_eq!(parse(&["-w", "x.wal"]), Err(USAGE));
+            assert_eq!(parse(&["--wal", "x.wal", "extra"]), Err(USAGE));
+            assert_eq!(parse(&["--snapshot-every", "50"]), Err(USAGE));
+            assert_eq!(
+                parse(&["--wal", "x.wal", "--snapshot-every", "0"]),
                 Err(USAGE)
             );
+            assert_eq!(parse(&["--wal", "a", "--wal", "b"]), Err(USAGE));
         }
     }
 }

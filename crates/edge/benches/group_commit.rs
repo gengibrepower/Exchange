@@ -29,7 +29,7 @@ fn main() {
         stop(core);
 
         let log = fresh_log(&format!("group-commit-{sessions}"));
-        let (sequencer, _) = Sequencer::open(&log).expect("abrir o WAL");
+        let (sequencer, _) = Sequencer::open(&log, None).expect("abrir o WAL");
         let (durable, core) = runtime.block_on(measure(sequencer, sessions));
         stop(core);
         remove_if_present(&log);
