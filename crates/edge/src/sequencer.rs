@@ -127,7 +127,7 @@ pub struct BootReport {
 }
 
 /// O núcleo rodando: único dono do engine, do WAL e dos contadores (single writer). Todo
-/// comando passa por [`Sequencer::submit`], que grava antes de aplicar (seção 4.6).
+/// comando passa por [`Sequencer::submit_batch`], que grava antes de aplicar (seção 4.6).
 pub struct Sequencer {
     engine: Engine,
     wal: Option<Wal>,
@@ -179,65 +179,45 @@ impl Sequencer {
         Ok((sequencer, report))
     }
 
-    /// Transforma a intenção em comando, com o próximo `seq` e, se for ordem, o próximo
-    /// id; grava no WAL (se houver) e só então aplica.
+    /// Um lote de um: ver [`Sequencer::submit_batch`].
     ///
     /// # Errors
-    /// [`SequencerError::Wal`] se a gravação falhar: o comando não é aplicado e o WAL
-    /// fica envenenado. [`SequencerError::CounterExhausted`] se um contador estourar.
+    /// Os mesmos de [`Sequencer::submit_batch`].
+    ///
+    /// # Panics
+    /// Nunca: um lote de uma intenção devolve exatamente um resultado.
     pub fn submit(&mut self, intent: Intent) -> Result<Vec<Event>, SequencerError> {
-        let seq = self.counters.next_seq;
-        let next_seq = next(seq)?;
-        let mut next_order_id = self.counters.next_order_id;
-        let command = match intent {
-            Intent::Deposit {
-                account,
-                asset,
-                amount,
-            } => Command::Deposit {
-                account,
-                asset,
-                amount,
-            },
-            Intent::Order {
-                account,
-                instrument,
-                side,
-                kind,
-                lots,
-                time_in_force,
-            } => {
-                let request = OrderRequest {
-                    id: OrderId::new(next_order_id),
-                    account,
-                    instrument,
-                    side,
-                    kind,
-                    total: lots,
-                    seq: Seq::new(seq),
-                    time_in_force,
-                };
-                next_order_id = next(next_order_id)?;
-                Command::Submit(request)
-            }
-            Intent::Cancel {
-                account,
-                instrument,
-                order,
-            } => Command::Cancel {
-                instrument,
-                account,
-                order,
-            },
-        };
+        let mut results = self.submit_batch(&[intent])?;
+        Ok(results.pop().expect("um lote de um devolve um resultado"))
+    }
+
+    /// Transforma cada intenção em comando, com o próximo `seq` e, se for ordem, o próximo
+    /// id; grava todos no WAL (se houver) com um único `fsync` (group commit, decisão 5) e
+    /// só então aplica, em ordem. Devolve os eventos de cada intenção, na mesma ordem.
+    ///
+    /// O log e os eventos são exatamente os de chamar [`Sequencer::submit`] uma vez por
+    /// intenção: o lote muda quantos `fsync`, nunca o que é gravado.
+    ///
+    /// # Errors
+    /// [`SequencerError::Wal`] se a gravação falhar: nada do lote é aplicado e o WAL fica
+    /// envenenado. [`SequencerError::CounterExhausted`] se um contador estourar, antes de
+    /// gravar qualquer coisa.
+    pub fn submit_batch(&mut self, intents: &[Intent]) -> Result<Vec<Vec<Event>>, SequencerError> {
+        let mut counters = self.counters;
+        let records = intents
+            .iter()
+            .map(|&intent| record_for(&mut counters, intent))
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(wal) = self.wal.as_mut() {
-            wal.append(&LogRecord::new(Seq::new(seq), command).to_bytes())?;
+            let payloads: Vec<Vec<u8>> = records.iter().map(LogRecord::to_bytes).collect();
+            let slices: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+            wal.append_batch(&slices)?;
         }
-        self.counters = Counters {
-            next_seq,
-            next_order_id,
-        };
-        Ok(self.engine.apply(command))
+        self.counters = counters;
+        Ok(records
+            .iter()
+            .map(|record| self.engine.apply(record.command()))
+            .collect())
     }
 
     pub fn balance(&self, account: AccountId, asset: AssetId) -> Balance {
@@ -257,6 +237,60 @@ impl Sequencer {
         sequencer.counters.next_seq = u64::MAX;
         sequencer
     }
+}
+
+/// O registro de `intent` com os próximos números de `counters`, que avançam. Quem chama
+/// passa uma cópia e só a confirma depois de gravar: falha no meio não consome número.
+fn record_for(counters: &mut Counters, intent: Intent) -> Result<LogRecord, SequencerError> {
+    let seq = counters.next_seq;
+    let next_seq = next(seq)?;
+    let mut next_order_id = counters.next_order_id;
+    let command = match intent {
+        Intent::Deposit {
+            account,
+            asset,
+            amount,
+        } => Command::Deposit {
+            account,
+            asset,
+            amount,
+        },
+        Intent::Order {
+            account,
+            instrument,
+            side,
+            kind,
+            lots,
+            time_in_force,
+        } => {
+            let request = OrderRequest {
+                id: OrderId::new(next_order_id),
+                account,
+                instrument,
+                side,
+                kind,
+                total: lots,
+                seq: Seq::new(seq),
+                time_in_force,
+            };
+            next_order_id = next(next_order_id)?;
+            Command::Submit(request)
+        }
+        Intent::Cancel {
+            account,
+            instrument,
+            order,
+        } => Command::Cancel {
+            instrument,
+            account,
+            order,
+        },
+    };
+    *counters = Counters {
+        next_seq,
+        next_order_id,
+    };
+    Ok(LogRecord::new(Seq::new(seq), command))
 }
 
 fn next(counter: u64) -> Result<u64, SequencerError> {
@@ -303,6 +337,7 @@ mod tests {
     use std::fs;
 
     use exchange_core::domain::Price;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::market::{BRL, TESTE};
@@ -589,5 +624,96 @@ mod tests {
         };
         assert_eq!(snapshot.bids, depth(Side::Bid));
         assert_eq!(snapshot.asks, depth(Side::Ask));
+    }
+
+    #[test]
+    fn counter_exhausted_mid_batch_changes_nothing() {
+        let mut sequencer = Sequencer::in_memory();
+        sequencer.counters.next_seq = u64::MAX - 1;
+        let before = sequencer.counters;
+
+        let result = sequencer.submit_batch(&[fund(BRL, 100), fund(BRL, 200)]);
+
+        assert!(matches!(result, Err(SequencerError::CounterExhausted)));
+        assert_eq!(sequencer.counters, before);
+        assert_eq!(
+            sequencer.balance(ACCOUNT, BRL),
+            market::new_engine().balance(ACCOUNT, BRL)
+        );
+    }
+
+    #[test]
+    fn empty_batch_answers_nothing_and_logs_nothing() {
+        let path = TempPath::new("empty-batch");
+        let (mut sequencer, _) = Sequencer::open(&path.0).unwrap();
+
+        assert_eq!(
+            sequencer.submit_batch(&[]).unwrap(),
+            Vec::<Vec<Event>>::new()
+        );
+        assert_eq!(sequencer.counters, Counters::FRESH);
+        assert_eq!(fs::metadata(&path.0).unwrap().len(), 0);
+    }
+
+    fn intent() -> impl Strategy<Value = Intent> {
+        let side = prop_oneof![Just(Side::Bid), Just(Side::Ask)];
+        let tif = prop_oneof![
+            Just(TimeInForce::Gtc),
+            Just(TimeInForce::Ioc),
+            Just(TimeInForce::Fok)
+        ];
+        prop_oneof![
+            (1..10_000_000i64).prop_map(|amount| fund(BRL, amount)),
+            (1..10_000i64).prop_map(|amount| fund(TESTE, amount)),
+            (side, 95..=105i64, 1..6i64, tif).prop_map(|(side, hundreds, lots, tif)| limit(
+                side,
+                hundreds * 100,
+                lots,
+                tif
+            )),
+            (1..30u64).prop_map(cancel),
+        ]
+    }
+
+    /// `intents` em pedaços com os tamanhos de `sizes`, repetidos em ciclo.
+    fn chunks<'a>(mut intents: &'a [Intent], sizes: &[usize]) -> Vec<&'a [Intent]> {
+        let mut chunks = Vec::new();
+        for &size in sizes.iter().cycle() {
+            if intents.is_empty() {
+                break;
+            }
+            let (chunk, rest) = intents.split_at(size.min(intents.len()));
+            chunks.push(chunk);
+            intents = rest;
+        }
+        chunks
+    }
+
+    proptest! {
+        // O lote só pode mudar quantos `fsync` acontecem: eventos, estado, contadores e os
+        // bytes do log têm de ser exatamente os de uma submissão por vez.
+        #[test]
+        fn batches_are_indistinguishable_from_one_submit_per_intent(
+            intents in prop::collection::vec(intent(), 0..40),
+            sizes in prop::collection::vec(1..8usize, 1..10),
+        ) {
+            let one_by_one = TempPath::new("equivalence-one-by-one");
+            let batched = TempPath::new("equivalence-batched");
+            let (mut single, _) = Sequencer::open(&one_by_one.0).unwrap();
+            let (mut grouped, _) = Sequencer::open(&batched.0).unwrap();
+
+            let expected: Vec<Vec<Event>> =
+                intents.iter().map(|&intent| single.submit(intent).unwrap()).collect();
+            let answered: Vec<Vec<Event>> = chunks(&intents, &sizes)
+                .into_iter()
+                .flat_map(|chunk| grouped.submit_batch(chunk).unwrap())
+                .collect();
+
+            prop_assert_eq!(answered, expected);
+            prop_assert_eq!(&grouped.engine, &single.engine);
+            prop_assert_eq!(grouped.counters, single.counters);
+            drop((single, grouped));
+            prop_assert_eq!(fs::read(&batched.0).unwrap(), fs::read(&one_by_one.0).unwrap());
+        }
     }
 }

@@ -29,7 +29,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Em andamento: F7** — endurecimento: benchmarks do matching e do WAL feitos; faltam group commit no WAL, snapshots, stop orders e múltiplos instrumentos.
+- **Em andamento: F7** — endurecimento: benchmarks do matching e do WAL e group commit no WAL feitos; faltam medir o group commit de ponta a ponta, snapshots, stop orders e múltiplos instrumentos.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -76,7 +76,7 @@ A conta negocia consigo mesma, então só os 50 centavos de taxa saem dela — f
 
 ### Persistência
 
-Com `--wal`, cada comando é gravado no log e sincronizado com o disco (`fsync`) antes de ser aplicado e respondido. Ao subir de novo com o mesmo arquivo, o log é reaplicado e o estado volta igual:
+Com `--wal`, cada comando é gravado no log e sincronizado com o disco (`fsync`) antes de ser aplicado e respondido. No servidor, os comandos que chegam juntos dividem um mesmo `fsync` (group commit), sem mudar nada do que é gravado. Ao subir de novo com o mesmo arquivo, o log é reaplicado e o estado volta igual:
 
 ```
 $ cargo run -p edge -- --wal exchange.wal
