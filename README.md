@@ -29,7 +29,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Próxima: F7** — endurecimento: benchmark, snapshots, stop orders, múltiplos instrumentos.
+- **Em andamento: F7** — endurecimento: benchmark do matching feito; faltam benchmark do WAL, snapshots, stop orders e múltiplos instrumentos.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -176,6 +176,27 @@ compra   9900        3
 ```
 
 Num buraco, ele avisa (`buraco na sequência: esperava 6, veio 9 — pedindo snapshot novo`) e segue com o livro reconstruído. `--plain` imprime cada redesenho em sequência em vez de limpar a tela.
+
+## Benchmark
+
+```
+cargo bench -p exchange-core
+```
+
+Mede `Engine::apply` inteiro (risco pré-trade, reserva, matching e liquidação no ledger), sem WAL nem rede, sobre um fluxo determinístico de ordens limite em torno de um preço médio, em três cenários: `resting` (nada cruza), `crossing` (metade cruza o spread) e `with_cancels` (40% cruza, 20% são cancelamentos). Antes de medir, o fluxo é rodado uma vez e o benchmark falha se mais de 1% dos comandos for rejeitado: rejeitar é o caminho barato e daria um número falso.
+
+- `matching` (`criterion`): throughput, 10 mil comandos por iteração, cada uma num engine novo.
+- `latency`: cada `apply` cronometrado em 100 mil comandos, com os percentis pelo método nearest-rank.
+
+Numa AMD Ryzen 5 PRO 5650U, perfil `bench`:
+
+| Cenário | Throughput | p50 | p99 | p99.9 | máx |
+|---|---|---|---|---|---|
+| `resting` | 2,87 M comandos/s | 321 ns | 742 ns | 5,24 µs | 3,71 ms |
+| `crossing` | 1,89 M comandos/s | 311 ns | 2,62 µs | 3,87 µs | 1,15 ms |
+| `with_cancels` | 2,14 M comandos/s | 251 ns | 2,26 µs | 3,67 µs | 230 µs |
+
+A referência da seção 12 do escopo é mais de 100 mil ordens/s numa thread. O máximo, na casa dos milissegundos, é uma amostra isolada; o p99.9 mostra que a cauda fica em poucos microssegundos.
 
 ## Licença
 
