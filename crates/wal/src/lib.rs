@@ -3,8 +3,10 @@
 use std::fmt;
 
 mod file;
+mod snapshot;
 
 pub use file::{Recovery, Wal, WalError};
+pub use snapshot::{SnapshotError, read_snapshot, write_snapshot};
 
 pub const HEADER_LEN: usize = 8;
 
