@@ -313,6 +313,20 @@ impl FixOrders {
             },
         );
         let mut reports = vec![self.execution(id, &Execution::New)];
+        reports.extend(self.executions(events));
+        reports
+    }
+
+    /// Os relatórios das ordens desta sessão em `events`, sejam do próprio comando ou do de
+    /// outra sessão: fills, disparos de stop, cancelamentos e expirações feitos pelo núcleo.
+    /// Ordem que não entrou por esta sessão (a mesma conta pelo JSON) não tem `ClOrdID`
+    /// aqui e fica de fora.
+    ///
+    /// # Panics
+    /// Nunca por entrada: o núcleo não executa mais que a quantidade da ordem, e ela cabe
+    /// em `i64`.
+    pub fn executions(&mut self, events: &[Event]) -> Vec<AppMessage> {
+        let mut reports = Vec::new();
         for event in events {
             match *event {
                 Event::Fill { fill, .. } => {

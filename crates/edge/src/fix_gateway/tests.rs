@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 
-use exchange_core::domain::Amount;
+use exchange_core::domain::{Amount, Lots, OrderKind, Price, Side, TimeInForce};
 use exchange_fix::{AppMessage, Field, Tag};
 
 use super::*;
@@ -13,12 +13,18 @@ use crate::sequencer::{Intent, Sequencer};
 const PATIENCE: Duration = Duration::from_secs(5);
 
 async fn start() -> (SocketAddr, CoreHandle) {
+    start_with_reports(1024).await
+}
+
+/// `reports` é a capacidade das inscrições limitadas: a do FIX não tem, e um teste mostra
+/// que ela passa de qualquer uma.
+async fn start_with_reports(reports: usize) -> (SocketAddr, CoreHandle) {
     let (core, _thread) = spawn_core(
         Sequencer::in_memory(),
         new_market_data(),
         NonZeroUsize::new(16).unwrap(),
         NonZeroUsize::new(1024).unwrap(),
-        NonZeroUsize::new(1024).unwrap(),
+        NonZeroUsize::new(reports).unwrap(),
     )
     .unwrap();
     for account in [1, 2] {
@@ -239,6 +245,64 @@ async fn reconnect_recovers_the_lost_report_without_duplicating_the_order() {
 
     assert_eq!(client.delivered.len(), 2, "nenhuma confirmação duplicada");
     assert_eq!(resting_bid_lots(&core).await, 5, "uma ordem só no livro");
+}
+
+fn bid(account: u64, lots: i64) -> Intent {
+    Intent::Order {
+        account: AccountId::new(account),
+        instrument: INSTRUMENTS[0].1,
+        side: Side::Bid,
+        kind: OrderKind::Limit(Price::new(1000).unwrap()),
+        lots: Lots::new(lots).unwrap(),
+        time_in_force: TimeInForce::Gtc,
+    }
+}
+
+/// `(ExecType, CumQty)` dos relatórios a partir de `from`.
+fn trades_from(client: &Client, from: usize) -> Vec<(&str, &str)> {
+    client.delivered[from..]
+        .iter()
+        .map(|report| (get(report, 150).unwrap(), get(report, 14).unwrap()))
+        .collect()
+}
+
+// A conta 2 toma a oferta da conta 1 por outra porta: a sessão FIX da conta 1 recebe o
+// relatório sem ter mandado nada.
+#[tokio::test]
+async fn resting_order_taken_by_another_account_is_reported() {
+    let (address, core) = start().await;
+    let mut seller = Client::account(1);
+    seller.log_on(address).await;
+    seller.send(order("v1", "2", "5", "1000")).await;
+    seller.wait_for_deliveries(1).await;
+
+    core.submit(bid(2, 2)).await.unwrap();
+
+    seller.wait_for_deliveries(2).await;
+    assert_eq!(trades_from(&seller, 1), [("F", "2")]);
+    assert_eq!(get(&seller.delivered[1], 11), Some("v1"));
+}
+
+// O cliente cai e a oferta dele é tomada em mais lances do que uma inscrição limitada
+// guardaria: depois do Logon, chegam todos, em ordem, sem buraco.
+#[tokio::test]
+async fn reports_during_a_disconnection_arrive_after_the_next_logon() {
+    let (address, core) = start_with_reports(4).await;
+    let mut seller = Client::account(1);
+    seller.log_on(address).await;
+    seller.send(order("v1", "2", "10", "1000")).await;
+    seller.wait_for_deliveries(1).await;
+    seller.crash();
+
+    for _ in 0..10 {
+        core.submit(bid(2, 1)).await.unwrap();
+    }
+    seller.log_on(address).await;
+    seller.wait_for_deliveries(11).await;
+
+    let cumulative: Vec<String> = (1..=10).map(|lots| lots.to_string()).collect();
+    let expected: Vec<(&str, &str)> = cumulative.iter().map(|lots| ("F", lots.as_str())).collect();
+    assert_eq!(trades_from(&seller, 1), expected);
 }
 
 #[tokio::test]

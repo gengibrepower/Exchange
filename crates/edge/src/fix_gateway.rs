@@ -22,7 +22,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
-use crate::core_thread::CoreHandle;
+use crate::core_thread::{CoreHandle, Reports};
 use crate::fix_app::{FixOrders, Request};
 use crate::market::HOUSE;
 use crate::server::{AcceptFailure, Limits, classify};
@@ -45,6 +45,9 @@ const PROPOSED_HEARTBEAT: NonZeroU32 = NonZeroU32::new(30).expect("30 não é ze
 struct FixAccount {
     session: Session,
     orders: FixOrders,
+    /// Criada na primeira conexão e mantida nas quedas: o que acontece com as ordens da
+    /// conta enquanto o cliente está fora fica guardado e sai depois do próximo Logon.
+    reports: Option<Reports>,
 }
 
 enum Slot {
@@ -74,6 +77,7 @@ impl Registry {
                     heartbeat_secs: PROPOSED_HEARTBEAT,
                 }),
                 orders: FixOrders::new(account),
+                reports: None,
             }),
         }
     }
@@ -138,7 +142,7 @@ async fn connection(stream: TcpStream, core: &CoreHandle, registry: &Registry) {
     };
     // Erro de I/O ou núcleo parado só encerram esta conexão; o estado volta ao registro
     // do mesmo jeito, e a próxima conexão recupera o que faltou pelo resend.
-    let _ = drive(&mut state, logon, reader, writer, inbox, core).await;
+    let _ = drive(&mut state, account, logon, reader, writer, inbox, core).await;
     state.session.disconnected();
     registry.checkin(account, state);
 }
@@ -159,18 +163,38 @@ fn account_of(logon: &Message) -> Option<(AccountId, Text)> {
 
 async fn drive(
     state: &mut FixAccount,
+    account: AccountId,
     logon: Message,
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     mut inbox: Vec<u8>,
     core: &CoreHandle,
 ) -> io::Result<()> {
-    let mut actions = state.session.connect(now());
-    actions.extend(state.session.receive(now(), logon));
+    let FixAccount {
+        session,
+        orders,
+        reports,
+    } = state;
+    let reports = match reports {
+        Some(reports) => reports,
+        None => reports.insert(
+            core.durable_reports(account)
+                .await
+                .map_err(io::Error::other)?,
+        ),
+    };
+    let mut actions = session.connect(now());
+    actions.extend(session.receive(now(), logon));
     let mut ticker = tokio::time::interval(TICK);
     let mut chunk = [0; READ_CHUNK];
     loop {
-        if perform(state, actions, &mut writer, core).await? == Flow::Stop {
+        let mut link = Link {
+            session,
+            orders,
+            reports,
+            writer: &mut writer,
+        };
+        if link.perform(actions).await? == Flow::Stop {
             return Ok(());
         }
         actions = tokio::select! {
@@ -182,11 +206,19 @@ async fn drive(
                 inbox.extend_from_slice(&chunk[..read]);
                 let mut actions = Vec::new();
                 while let Some(message) = take_frame(&mut inbox) {
-                    actions.extend(state.session.receive(now(), message));
+                    actions.extend(session.receive(now(), message));
                 }
                 actions
             }
-            _ = ticker.tick() => state.session.tick(now()),
+            events = reports.next() => {
+                let events = events.map_err(io::Error::other)?;
+                orders
+                    .executions(&events)
+                    .into_iter()
+                    .flat_map(|report| session.send(now(), report))
+                    .collect()
+            }
+            _ = ticker.tick() => session.tick(now()),
         };
     }
 }
@@ -197,39 +229,54 @@ enum Flow {
     Stop,
 }
 
-/// Executa as ações na ordem. Uma mensagem de aplicação vai ao núcleo e as respostas
-/// voltam pela sessão, que lhes dá seq; elas entram no fim da fila, depois do que já
-/// estava esperando, e por isso saem no fio na mesma ordem dos seqs.
-async fn perform(
-    state: &mut FixAccount,
-    actions: Vec<Action>,
-    writer: &mut OwnedWriteHalf,
-    core: &CoreHandle,
-) -> io::Result<Flow> {
-    let mut queue = VecDeque::from(actions);
-    while let Some(action) = queue.pop_front() {
-        match action {
-            Action::Send(message) => {
-                let mut bytes = Vec::new();
-                encode(&message, &mut bytes).map_err(io::Error::other)?;
-                writer.write_all(&bytes).await?;
-            }
-            Action::Deliver { seq, app } => {
-                let replies = match state.orders.request(seq, &app) {
-                    Request::Reply(reply) => vec![reply],
-                    Request::Submit { intent, pending } => {
-                        let events = core.submit(intent).await.map_err(io::Error::other)?;
-                        state.orders.outcome(pending, &events)
-                    }
-                };
-                for reply in replies {
-                    queue.extend(state.session.send(now(), reply));
+/// O que uma conexão empresta do estado da conta para executar as ações.
+struct Link<'a> {
+    session: &'a mut Session,
+    orders: &'a mut FixOrders,
+    reports: &'a mut Reports,
+    writer: &'a mut OwnedWriteHalf,
+}
+
+impl Link<'_> {
+    /// Executa as ações na ordem. Uma mensagem de aplicação vai ao núcleo e as respostas
+    /// voltam pela sessão, que lhes dá seq; elas entram no fim da fila, depois do que já
+    /// estava esperando, e por isso saem no fio na mesma ordem dos seqs. O que outros
+    /// comandos fizeram com as ordens desta sessão antes deste sai antes da resposta.
+    async fn perform(&mut self, actions: Vec<Action>) -> io::Result<Flow> {
+        let mut queue = VecDeque::from(actions);
+        while let Some(action) = queue.pop_front() {
+            match action {
+                Action::Send(message) => {
+                    let mut bytes = Vec::new();
+                    encode(&message, &mut bytes).map_err(io::Error::other)?;
+                    self.writer.write_all(&bytes).await?;
                 }
+                Action::Deliver { seq, app } => {
+                    let replies = match self.orders.request(seq, &app) {
+                        Request::Reply(reply) => vec![reply],
+                        Request::Submit { intent, pending } => {
+                            let submitted = self
+                                .reports
+                                .submit(intent)
+                                .await
+                                .map_err(io::Error::other)?;
+                            let mut replies = Vec::new();
+                            for events in &submitted.earlier {
+                                replies.extend(self.orders.executions(events));
+                            }
+                            replies.extend(self.orders.outcome(pending, &submitted.events));
+                            replies
+                        }
+                    };
+                    for reply in replies {
+                        queue.extend(self.session.send(now(), reply));
+                    }
+                }
+                Action::Disconnect => return Ok(Flow::Stop),
             }
-            Action::Disconnect => return Ok(Flow::Stop),
         }
+        Ok(Flow::Continue)
     }
-    Ok(Flow::Continue)
 }
 
 async fn next_message(reader: &mut OwnedReadHalf, inbox: &mut Vec<u8>) -> Option<Message> {
