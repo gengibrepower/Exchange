@@ -354,3 +354,107 @@ fn unsupported_message_type_is_business_rejected() {
     assert_eq!(get(&reports[0], 372), Some("G"));
     assert_eq!(get(&reports[0], 380), Some("3"));
 }
+
+fn stop(cl_ord_id: &str, side: &str, lots: &str, stop_px: &str, limit: Option<&str>) -> AppMessage {
+    let mut fields = vec![
+        (11, cl_ord_id),
+        (55, "TESTE/BRL"),
+        (54, side),
+        (38, lots),
+        (99, stop_px),
+    ];
+    match limit {
+        Some(price) => fields.extend([(40, "4"), (44, price)]),
+        None => fields.push((40, "3")),
+    }
+    message("D", &fields)
+}
+
+// Dormente, o stop é só `New`: a venda que chega não negocia contra ele.
+#[test]
+fn armed_stop_is_new_and_stays_out_of_the_book() {
+    let mut exchange = Exchange::new();
+    let mut seller = FixOrders::new(SELLER);
+    let mut buyer = FixOrders::new(BUYER);
+    let reports = exchange.send(&mut buyer, &stop("c1", "1", "2", "1000", Some("1000")));
+    assert_eq!(executions(&reports), vec![("0", "0", "0", "2")]);
+
+    let reports = exchange.send(&mut seller, &limit("v1", "2", "2", "1000"));
+    assert_eq!(executions(&reports), vec![("0", "0", "0", "2")]);
+}
+
+#[test]
+fn stop_fired_by_its_own_session_reports_triggered_then_trades() {
+    let mut exchange = Exchange::new();
+    let mut seller = FixOrders::new(SELLER);
+    let mut buyer = FixOrders::new(BUYER);
+    exchange.send(&mut seller, &limit("v1", "2", "1", "1000"));
+    exchange.send(&mut seller, &limit("v2", "2", "5", "1010"));
+    exchange.send(&mut buyer, &stop("c1", "1", "2", "1000", None));
+
+    let reports = exchange.send(&mut buyer, &limit("c2", "1", "1", "1000"));
+
+    assert_eq!(
+        executions(&reports),
+        vec![
+            ("0", "0", "0", "1"),
+            ("F", "2", "1", "0"),
+            ("L", "0", "0", "2"),
+            ("F", "2", "2", "0")
+        ]
+    );
+    let ids: Vec<_> = reports.iter().map(|report| get(report, 11)).collect();
+    assert_eq!(ids, vec![Some("c2"), Some("c2"), Some("c1"), Some("c1")]);
+    assert_eq!(get(&reports[3], 31), Some("1010"));
+}
+
+// O stop disparado pela ordem de outra sessão não aparece para ela.
+#[test]
+fn stop_of_another_session_is_not_reported() {
+    let mut exchange = Exchange::new();
+    let mut seller = FixOrders::new(SELLER);
+    let mut buyer = FixOrders::new(BUYER);
+    exchange.send(&mut seller, &limit("v1", "2", "1", "1000"));
+    exchange.send(&mut seller, &limit("v2", "2", "5", "1010"));
+    exchange.send(&mut buyer, &stop("c1", "1", "2", "1000", None));
+    let mut other = FixOrders::new(BUYER);
+
+    let reports = exchange.send(&mut other, &limit("o1", "1", "1", "1000"));
+
+    assert_eq!(
+        executions(&reports),
+        vec![("0", "0", "0", "1"), ("F", "2", "1", "0")]
+    );
+}
+
+#[test]
+fn stop_needs_its_stop_price_and_stop_limit_its_price() {
+    let mut exchange = Exchange::new();
+    let mut buyer = FixOrders::new(BUYER);
+    let no_stop_px = message(
+        "D",
+        &[
+            (11, "c1"),
+            (55, "TESTE/BRL"),
+            (54, "1"),
+            (38, "1"),
+            (40, "3"),
+        ],
+    );
+    let reports = exchange.send(&mut buyer, &no_stop_px);
+    assert_eq!(get(&reports[0], 58), Some("tag 99 ausente"));
+
+    let no_price = message(
+        "D",
+        &[
+            (11, "c2"),
+            (55, "TESTE/BRL"),
+            (54, "1"),
+            (38, "1"),
+            (40, "4"),
+            (99, "1000"),
+        ],
+    );
+    let reports = exchange.send(&mut buyer, &no_price);
+    assert_eq!(get(&reports[0], 58), Some("tag 44 ausente"));
+}

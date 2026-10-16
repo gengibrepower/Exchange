@@ -114,6 +114,19 @@ pub enum ClientMessage {
         #[serde(default)]
         tif: Tif,
     },
+    /// Dormente até o último negócio chegar a `trigger`; aí entra como limite em `limit`
+    /// ou, sem ele, a mercado. Tipo próprio, e não um campo em `limit`/`market`: um stop
+    /// não tem proteção explícita, e o `deny_unknown_fields` recusa a mistura.
+    Stop {
+        instrument: String,
+        side: Side,
+        trigger: Price,
+        #[serde(default)]
+        limit: Option<Price>,
+        lots: Lots,
+        #[serde(default)]
+        tif: Tif,
+    },
     Cancel {
         instrument: String,
         order: OrderId,
@@ -212,6 +225,21 @@ impl ClientMessage {
                 instrument: known_instrument(instrument)?,
                 side: side.into(),
                 kind: OrderKind::Market { protection },
+                lots,
+                time_in_force: tif.into(),
+            },
+            Self::Stop {
+                instrument,
+                side,
+                trigger,
+                limit,
+                lots,
+                tif,
+            } => Intent::Order {
+                account,
+                instrument: known_instrument(instrument)?,
+                side: side.into(),
+                kind: OrderKind::Stop { trigger, limit },
                 lots,
                 time_in_force: tif.into(),
             },
@@ -775,6 +803,51 @@ mod tests {
         malformed(
             r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":5}"#,
         );
+    }
+
+    #[test]
+    fn stop_resolves_to_a_dormant_order() {
+        assert_eq!(
+            resolved(
+                r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":9500,"lots":5}"#
+            ),
+            Ok(Inbound::Submit(Intent::Order {
+                account: ACCOUNT,
+                instrument: TESTE_BRL,
+                side: CoreSide::Ask,
+                kind: OrderKind::Stop {
+                    trigger: price(9_500),
+                    limit: None
+                },
+                lots: lots(5),
+                time_in_force: TimeInForce::Gtc
+            }))
+        );
+        assert_eq!(
+            resolved(
+                r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":9500,"limit":9400,"lots":5,"tif":"ioc"}"#
+            ),
+            Ok(Inbound::Submit(Intent::Order {
+                account: ACCOUNT,
+                instrument: TESTE_BRL,
+                side: CoreSide::Ask,
+                kind: OrderKind::Stop {
+                    trigger: price(9_500),
+                    limit: Some(price(9_400))
+                },
+                lots: lots(5),
+                time_in_force: TimeInForce::Ioc
+            }))
+        );
+    }
+
+    #[test]
+    fn stop_without_trigger_or_with_protection_is_malformed() {
+        malformed(r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","lots":5}"#);
+        malformed(
+            r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":9500,"protection":9000,"lots":5}"#,
+        );
+        malformed(r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":0,"lots":5}"#);
     }
 
     #[test]
