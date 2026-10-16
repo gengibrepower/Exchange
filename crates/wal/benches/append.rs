@@ -33,34 +33,24 @@ fn per_record(c: &mut Criterion) {
 
     for records in BATCHES {
         let log = BenchLog::new(&format!("batch-{records}"));
-        let mut file = open_raw(&log);
+        let mut wal = Wal::open(log.path()).expect("abrir o WAL").wal;
+        let batch = vec![&PAYLOAD[..]; records];
         group.throughput(Throughput::Elements(records as u64));
         group.bench_function(format!("batch/{records}"), |b| {
-            b.iter(|| write_batch(&mut file, black_box(records)));
+            b.iter(|| wal.append_batch(black_box(&batch)).expect("gravar o lote"));
         });
     }
 
     group.finish();
 }
 
-/// O arquivo cru, sem a API do `Wal`, para os cenários que ele ainda não tem.
+/// O arquivo cru, sem a API do `Wal`: o `no_fsync` não é uma operação que o WAL ofereça.
 fn open_raw(log: &BenchLog) -> File {
     OpenOptions::new()
         .append(true)
         .create(true)
         .open(log.path())
         .expect("abrir o log do benchmark")
-}
-
-/// Simulação de group commit: `records` frames num buffer só, um `write_all` e um
-/// `sync_data` para todos. Ao voltar, todos sobrevivem a um crash.
-fn write_batch(file: &mut File, records: usize) {
-    let mut buffer = Vec::with_capacity(records * (HEADER_LEN + PAYLOAD.len()));
-    for _ in 0..records {
-        encode(&PAYLOAD, &mut buffer).expect("payload pequeno");
-    }
-    file.write_all(&buffer).expect("gravar no arquivo");
-    file.sync_data().expect("sincronizar com disco");
 }
 
 criterion_group!(benches, per_record);

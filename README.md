@@ -29,7 +29,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Em andamento: F7** — endurecimento: benchmarks do matching e do WAL e group commit no WAL feitos; faltam medir o group commit de ponta a ponta, snapshots, stop orders e múltiplos instrumentos.
+- **Em andamento: F7** — endurecimento: benchmarks e group commit no WAL feitos; faltam snapshots, stop orders e múltiplos instrumentos.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -208,7 +208,7 @@ Mede o custo de um registro durável com payload do tamanho de um comando real (
 
 - `append`: o `Wal::append` de hoje, um `fsync` por registro.
 - `no_fsync`: o mesmo frame sem `fsync`. Só para comparação, nunca uma opção: sem ele o registro não sobrevive a queda de energia.
-- `batch/{1,8,64}`: N frames num `write` e um `fsync`, simulando group commit.
+- `batch/{1,8,64}`: `Wal::append_batch` com N registros, um `write` e um `fsync` para todos.
 - `latency`: p50/p99/p99.9/máx de 5 mil `append`.
 
 Num NVMe SK Hynix com btrfs, em várias rodadas (o `fsync` oscila bastante de uma rodada para outra):
@@ -223,6 +223,24 @@ Num NVMe SK Hynix com btrfs, em várias rodadas (o `fsync` oscila bastante de um
 Latência do `append`: p50 de 0,7 a 4,4 ms, p99 em torno de 5 ms, máximo de dezenas de ms.
 
 O `fsync` é praticamente todo o custo, e um lote o divide pelo número de registros. Com um `fsync` por comando, o servidor com `--wal` fica em centenas de comandos/s, enquanto o núcleo faz milhões: é o caso que a decisão 5 previa para adotar group commit.
+
+### Group commit de ponta a ponta
+
+```
+cargo bench -p edge --bench group_commit
+```
+
+Sessões concorrentes falando com a thread do núcleo pelo `CoreHandle`, como as conexões do servidor, cada uma em closed loop: manda um depósito e só manda o próximo depois da resposta. São 2.048 comandos no total, divididos entre as sessões, com o WAL no disco e, para comparação, só em memória.
+
+Com uma sessão, a fila nunca tem mais de um pedido e cada comando paga um `fsync` inteiro. Com mais sessões, os pedidos que chegam durante um `fsync` entram juntos no próximo, e um `fsync` atende vários clientes. Ninguém espera de propósito por um lote.
+
+| Sessões | Memória | WAL |
+|---|---|---|
+| 1 | 50–64 mil cmd/s | 430–770 cmd/s |
+| 8 | 260–280 mil cmd/s | 1,6–3,7 mil cmd/s |
+| 64 | 450–660 mil cmd/s | 7–21 mil cmd/s |
+
+Com 64 sessões, o WAL atende de 10 a 30 vezes mais comandos por segundo que com uma, e cada cliente continua esperando mais ou menos um `fsync` por comando. A coluna de memória é o teto sem disco: o custo dos canais e da troca de thread. Por ela, uma sessão sozinha passa uns 15–20 µs só indo e voltando do núcleo.
 
 ## Licença
 

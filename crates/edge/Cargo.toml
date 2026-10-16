@@ -14,5 +14,9 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 [dev-dependencies]
 proptest = "1"
 
+[[bench]]
+name = "group_commit"
+harness = false
+
 [lints]
 workspace = true
