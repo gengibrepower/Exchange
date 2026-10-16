@@ -1,13 +1,14 @@
 //! Servidor TCP da borda (seção 4.4). O TCP entrega um fluxo de bytes sem fronteiras; a
 //! fronteira entre mensagens é convenção nossa: uma por linha, com teto de tamanho.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use exchange_core::domain::{AccountId, InstrumentId};
+use exchange_core::domain::{AccountId, InstrumentId, OrderId};
+use exchange_core::engine::Event;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
@@ -20,6 +21,7 @@ use crate::core_thread::{CoreError, CoreHandle};
 use crate::market::{ASSETS, HOUSE};
 use crate::market_data::{Feed, Update};
 use crate::protocol::{self, AssetBalance, ClientMessage, Inbound, ServerMessage};
+use crate::sequencer::Intent;
 
 /// Linha maior que isso sem `\n` não é protocolo: é erro e a conexão fecha, para um
 /// cliente não fazer o servidor acumular memória sem fim (seção 6).
@@ -112,10 +114,14 @@ async fn refuse(mut stream: TcpStream) {
 
 /// Estado da sessão: antes do login só `login` é aceito; depois, tudo menos outro login,
 /// sempre em nome da conta autenticada.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Session {
     AwaitingLogin,
-    Active(AccountId),
+    /// `orders` são as ordens que esta sessão criou: só eventos delas chegam ao cliente.
+    Active {
+        account: AccountId,
+        orders: HashSet<OrderId>,
+    },
 }
 
 /// Trata uma mensagem conforme o estado da sessão, possivelmente mudando o estado, e
@@ -129,7 +135,7 @@ pub async fn respond(
     message: ClientMessage,
     core: &CoreHandle,
 ) -> Result<Vec<ServerMessage>, CoreError> {
-    let Session::Active(account) = *state else {
+    let Session::Active { account, orders } = state else {
         let message = match message {
             ClientMessage::Subscribe { instrument, feed } => {
                 return match protocol::subscription(instrument, feed) {
@@ -145,9 +151,13 @@ pub async fn respond(
         if account == HOUSE {
             return Ok(vec![error("a conta da casa não negocia")]);
         }
-        *state = Session::Active(account);
+        *state = Session::Active {
+            account,
+            orders: HashSet::new(),
+        };
         return Ok(vec![ServerMessage::LoggedIn { account }]);
     };
+    let account = *account;
     match message.resolve(account) {
         Err(problem) => Ok(vec![error(problem.to_string())]),
         Ok(Inbound::Login(_)) => Ok(vec![error(format!(
@@ -155,16 +165,44 @@ pub async fn respond(
             account.get()
         ))]),
         Ok(Inbound::Balance) => Ok(vec![balances(core, account).await?]),
-        Ok(Inbound::Submit(intent)) => Ok(core
-            .submit(intent)
-            .await?
-            .iter()
-            .map(ServerMessage::from)
-            .collect()),
+        Ok(Inbound::Submit(intent)) => {
+            let events = core.submit(intent).await?;
+            Ok(visible(orders, intent, &events)
+                .map(ServerMessage::from)
+                .collect())
+        }
         Ok(Inbound::Subscribe { instrument, feed }) => {
             subscriptions.subscribe(core, instrument, feed).await
         }
     }
+}
+
+/// Os eventos de um comando que dizem respeito à sessão: os das ordens que ela criou e a
+/// resposta ao cancelamento que ela mesma pediu. Uma ordem nova é a do primeiro evento do
+/// comando, e passa a ser da sessão se não for rejeitada. Um stop de outra conta, disparado
+/// pela ordem desta, não aparece: nem que existe, nem de quem é, nem quanto executou.
+fn visible<'a>(
+    orders: &mut HashSet<OrderId>,
+    intent: Intent,
+    events: &'a [Event],
+) -> impl Iterator<Item = &'a Event> {
+    let asked = match intent {
+        Intent::Order { .. } => events.iter().find_map(Event::order),
+        Intent::Cancel { order, .. } => Some(order),
+        Intent::Deposit { .. } => None,
+    };
+    if let (Intent::Order { .. }, Some(order)) = (intent, asked)
+        && !matches!(events.first(), Some(Event::Rejected { .. }))
+    {
+        orders.insert(order);
+    }
+    let orders = &*orders;
+    let mine = move |order: OrderId| Some(order) == asked || orders.contains(&order);
+    events.iter().filter(move |event| match event {
+        Event::Deposited { .. } | Event::DepositRejected { .. } => true,
+        Event::Fill { fill, .. } => mine(fill.taker) || mine(fill.maker),
+        other => other.order().is_some_and(mine),
+    })
 }
 
 /// O que a sessão assinou e o último `seq` já entregue em cada fluxo. Um único receptor do
@@ -960,6 +998,75 @@ mod tests {
             r#"{"type":"depth","instrument":"OUTRO/BRL","feed":"l2","seq":3,"side":"sell","price":2005,"lots":1}"#,
         ] {
             assert_eq!(watcher.recv().await, expected);
+        }
+    }
+
+    /// Carol oferece 1 lot a 10000 e 5 a 10500; Alice arma um stop de compra a mercado de
+    /// 2 lots com gatilho em 10000.
+    async fn armed_stop(address: SocketAddr) -> (Client, Client) {
+        let mut carol = Client::login(address, 3).await;
+        carol.fund().await;
+        for (price, lots) in [(10_000, 1), (10_500, 5)] {
+            carol
+                .send(&format!(
+                    r#"{{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":{price},"lots":{lots}}}"#
+                ))
+                .await;
+            carol.recv().await;
+        }
+        let mut alice = Client::login(address, 1).await;
+        alice.fund().await;
+        alice
+            .send(
+                r#"{"type":"stop","instrument":"TESTE/BRL","side":"buy","trigger":10000,"lots":2}"#,
+            )
+            .await;
+        assert_eq!(
+            alice.recv().await,
+            r#"{"type":"armed","instrument":"TESTE/BRL","order":3,"side":"buy","trigger":10000,"lots":2}"#
+        );
+        (carol, alice)
+    }
+
+    // Quem dispara o stop de outra conta recebe só o próprio negócio: nem que o stop
+    // existia, nem de quem era, nem quanto executou.
+    #[tokio::test]
+    async fn stop_fired_by_another_session_stays_private() {
+        let address = start(Sequencer::in_memory()).await;
+        let (_carol, mut alice) = armed_stop(address).await;
+        let mut bob = Client::login(address, 2).await;
+        bob.fund().await;
+
+        bob.send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":1}"#)
+            .await;
+        assert_eq!(
+            bob.recv().await,
+            r#"{"type":"fill","instrument":"TESTE/BRL","taker":4,"maker":1,"lots":1,"price":10000,"fee":10}"#
+        );
+        bob.send(r#"{"type":"balance"}"#).await;
+        assert!(bob.recv().await.starts_with(r#"{"type":"balances""#));
+
+        alice.send(r#"{"type":"balance"}"#).await;
+        assert_eq!(
+            alice.recv().await,
+            r#"{"type":"balances","balances":[{"asset":"TESTE","available":100200,"reserved":0},{"asset":"BRL","available":99978979,"reserved":0},{"asset":"OUTRO","available":0,"reserved":0}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_fired_by_its_own_session_is_reported_in_full() {
+        let address = start(Sequencer::in_memory()).await;
+        let (_carol, mut alice) = armed_stop(address).await;
+
+        alice
+            .send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":1}"#)
+            .await;
+        for expected in [
+            r#"{"type":"fill","instrument":"TESTE/BRL","taker":4,"maker":1,"lots":1,"price":10000,"fee":10}"#,
+            r#"{"type":"triggered","instrument":"TESTE/BRL","order":3}"#,
+            r#"{"type":"fill","instrument":"TESTE/BRL","taker":3,"maker":2,"lots":2,"price":10500,"fee":21}"#,
+        ] {
+            assert_eq!(alice.recv().await, expected);
         }
     }
 

@@ -29,7 +29,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Em andamento: F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento e stop orders no núcleo feitos; faltam stop orders na borda (JSON, CLI e FIX) e snapshots.
+- **Em andamento: F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento e stop orders feitos; faltam o aviso ao dono quando a ordem dele é afetada pelo comando de outra sessão, e snapshots.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -49,7 +49,8 @@ Um comando por linha:
 | `deposit <ativo> <quantia>` | credita a conta (ativos: `TESTE`, `OUTRO`, `BRL`) |
 | `buy\|sell <instrumento> <preço> <lots> [gtc\|ioc\|fok]` | ordem limite |
 | `buy\|sell <instrumento> mkt <lots> [max <proteção>] [gtc\|ioc\|fok]` | ordem a mercado; sem `max`, a proteção vem do colar de preço |
-| `cancel <instrumento> <id>` | cancela uma ordem descansando |
+| `buy\|sell <instrumento> <preço\|mkt> <lots> stop <gatilho> [gtc\|ioc\|fok]` | stop: dormente até um negócio chegar ao gatilho (compra: no gatilho ou acima; venda: no gatilho ou abaixo); aí entra como limite em `<preço>` ou a mercado |
+| `cancel <instrumento> <id>` | cancela uma ordem descansando ou um stop dormente |
 | `balance` | saldos disponível e reservado |
 | `quit` | sai |
 
@@ -144,19 +145,20 @@ Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
 | `deposit` | `asset`, `amount` | credita a conta da sessão |
 | `limit` | `instrument`, `side` (`buy`/`sell`), `price`, `lots`, `tif` opcional (`gtc`/`ioc`/`fok`) | ordem limite |
 | `market` | `instrument`, `side`, `lots`, `protection` e `tif` opcionais | ordem a mercado; sem `protection`, vale o colar de preço |
-| `cancel` | `instrument`, `order` | cancela uma ordem descansando |
+| `stop` | `instrument`, `side`, `trigger`, `lots`, `limit` e `tif` opcionais | stop dormente até o último negócio chegar a `trigger`; aí vira limite em `limit` ou, sem ele, a mercado |
+| `cancel` | `instrument`, `order` | cancela uma ordem descansando ou um stop dormente |
 | `balance` | — | saldos da conta da sessão |
 | `subscribe` | `instrument`, `feed` (`l1`/`l2`) | assina o feed (não exige login); assinar de novo traz um snapshot novo |
 
-O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `rejected` (com `code` estável e `message` legível), `balances` e `error`; a quem assina, envia `snapshot` e depois os incrementos `depth` (quantidade absoluta no preço, `0` quando o nível some), `top` e `trade`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
+O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances` e `error`. Cada sessão só recebe eventos das ordens que ela criou: quem dispara o stop de outra conta vê o próprio negócio e nada do stop; a quem assina, envia `snapshot` e depois os incrementos `depth` (quantidade absoluta no preço, `0` quando o nível some), `top` e `trade`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
 
 ## FIX
 
 A porta FIX fala FIX 4.4, com codec e sessão implementados à mão no crate `exchange-fix` (puro: não lê relógio nem toca rede; o instante entra como dado). O `SenderCompID` é o número da conta (a casa, `0`, é recusada) e o `TargetCompID` é `EXCHANGE`; o cliente é o initiator e propõe o `HeartBtInt` no Logon.
 
 - **Sessão**: todo `MsgSeqNum` é conferido. Buraco gera um único `ResendRequest`; o reenvio volta com `PossDupFlag=Y`, e as mensagens administrativas viram `SequenceReset-GapFill`. Duplicata abaixo do esperado com `PossDupFlag` é ignorada; sem ela, a sessão encerra com Logout. Silêncio além do intervalo gera `TestRequest` e, sem resposta, a conexão cai. Seqs e mensagens enviadas sobrevivem à queda da conexão: ao reconectar, o Logon revela o que faltou.
-- **Aplicação**: `NewOrderSingle` (`35=D`) e `OrderCancelRequest` (`35=F`) entram; saem `ExecutionReport` (`35=8`: New, Trade, Canceled, Expired, Rejected), `OrderCancelReject` (`35=9`) e `BusinessMessageReject` (`35=j`). `ClOrdID` já usado é recusado sem chegar ao núcleo, o que protege o cliente que, na dúvida depois de uma queda, manda a mesma ordem de novo.
-- **Desvios do padrão**, os mesmos da borda JSON: preço inteiro por lot (sem casas decimais), sem `AvgPx`, e só quem enviou a ordem que gerou o negócio recebe o relatório.
+- **Aplicação**: `NewOrderSingle` (`35=D`, `OrdType` 1 mercado, 2 limite, 3 stop e 4 stop-limite, com o gatilho em `StopPx`, tag 99) e `OrderCancelRequest` (`35=F`) entram; saem `ExecutionReport` (`35=8`: New, Trade, Canceled, Expired, Rejected e Triggered, `ExecType=L`, quando o stop dispara), `OrderCancelReject` (`35=9`) e `BusinessMessageReject` (`35=j`). `ClOrdID` já usado é recusado sem chegar ao núcleo, o que protege o cliente que, na dúvida depois de uma queda, manda a mesma ordem de novo.
+- **Desvios do padrão**, os mesmos da borda JSON: preço inteiro por lot (sem casas decimais), sem `AvgPx`, e só quem enviou a ordem que gerou o negócio recebe o relatório: o dono de uma ordem descansando ou de um stop disparado pelo comando de outra sessão não é avisado.
 
 A garantia "nem perde nem duplica" é testada de duas formas: um `proptest` com duas sessões num TCP simulado que cai em pontos aleatórios, perde o que estava em trânsito e recebe reenvios a mais (cada lado recebe exatamente o que o outro enviou, uma vez e em ordem); e um teste de integração com o servidor real, em que a conexão cai depois de a ordem chegar ao núcleo e antes de a confirmação ser lida.
 

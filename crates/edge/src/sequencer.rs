@@ -449,8 +449,18 @@ mod tests {
         }
     }
 
+    fn stop(side: Side, trigger: i64, limit: Option<i64>, lots: i64) -> Intent {
+        let price = |units| Price::new(units).unwrap();
+        let kind = OrderKind::Stop {
+            trigger: price(trigger),
+            limit: limit.map(price),
+        };
+        order(side, kind, lots, TimeInForce::Gtc)
+    }
+
     // Uma sessão que passa por todos os caminhos que mexem em estado: depósito,
-    // descanso, fill parcial e total, IOC, cancelamento, rejeições e FOK expirada.
+    // descanso, fill parcial e total, IOC, cancelamento, rejeições, FOK expirada e stops,
+    // um disparado e outro que fica dormente.
     fn scenario() -> Vec<Intent> {
         use Side::{Ask, Bid};
         use TimeInForce::{Fok, Gtc, Ioc};
@@ -469,6 +479,10 @@ mod tests {
             limit(Ask, 10_200, 2, Fok),
             limit(Bid, 10_200, 2, Gtc),
             cancel(99),
+            limit(Ask, 10_300, 2, Gtc),
+            stop(Bid, 10_300, None, 1),
+            stop(Ask, 9_000, Some(8_900), 1),
+            limit(Bid, 10_300, 1, Gtc),
         ]
     }
 
@@ -510,6 +524,20 @@ mod tests {
             ends,
             expected,
         }
+    }
+
+    #[test]
+    fn scenario_fires_one_stop_and_leaves_one_dormant() {
+        let mut sequencer = Sequencer::in_memory();
+        let events: Vec<_> = scenario()
+            .into_iter()
+            .flat_map(|intent| sequencer.submit(intent).unwrap())
+            .collect();
+        let count =
+            |wanted: fn(&Event) -> bool| events.iter().filter(|event| wanted(event)).count();
+
+        assert_eq!(count(|event| matches!(event, Event::Armed { .. })), 2);
+        assert_eq!(count(|event| matches!(event, Event::Triggered { .. })), 1);
     }
 
     fn state_after(commands: &[Command]) -> (Engine, Counters) {

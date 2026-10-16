@@ -84,6 +84,22 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// A ordem de que o evento fala; num fill, a do taker. `None` em depósitos.
+    pub fn order(&self) -> Option<OrderId> {
+        match *self {
+            Self::Rested { order, .. }
+            | Self::Cancelled { order, .. }
+            | Self::Expired { order, .. }
+            | Self::Rejected { order, .. }
+            | Self::Armed { order, .. }
+            | Self::Triggered { order, .. } => Some(order),
+            Self::Fill { fill, .. } => Some(fill.taker),
+            Self::Deposited { .. } | Self::DepositRejected { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RejectReason {
     UnknownInstrument(InstrumentId),

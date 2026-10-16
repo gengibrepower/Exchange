@@ -33,7 +33,15 @@ pub enum ParseError {
     InvalidNumber(String),
     UnknownTimeInForce(String),
     ProtectionNeedsMarket,
+    StopTakesNoProtection,
     Domain(DomainError),
+}
+
+/// O que vem depois dos lots, antes do time-in-force: no máximo um dos dois.
+#[derive(Clone, Copy)]
+enum Modifier<'a> {
+    Protection(&'a str),
+    Trigger(&'a str),
 }
 
 impl std::fmt::Display for ParseError {
@@ -43,11 +51,14 @@ impl std::fmt::Display for ParseError {
             Self::UnknownCommand(command) => write!(f, "comando desconhecido \"{command}\""),
             Self::WrongArity => write!(
                 f,
-                "uso: buy|sell <instrumento> <preço|mkt> <lots> [max <proteção>] [gtc|ioc|fok] | cancel <instrumento> <id> | deposit <ativo> <quantia> | balance | quit"
+                "uso: buy|sell <instrumento> <preço|mkt> <lots> [max <proteção> | stop <gatilho>] [gtc|ioc|fok] | cancel <instrumento> <id> | deposit <ativo> <quantia> | balance | quit"
             ),
             Self::InvalidNumber(token) => write!(f, "número inválido \"{token}\""),
             Self::ProtectionNeedsMarket => {
                 write!(f, "\"max\" só vale para ordem a mercado (preço mkt)")
+            }
+            Self::StopTakesNoProtection => {
+                write!(f, "stop não leva \"max\": o teto vem do gatilho e do colar")
             }
             Self::UnknownTimeInForce(token) => {
                 write!(
@@ -71,14 +82,19 @@ pub fn parse_line(line: &str) -> Result<Input, ParseError> {
         ["quit"] => Ok(Input::Quit),
         [side @ ("buy" | "sell"), symbol, price, lots, options @ ..] => {
             let side = if *side == "buy" { Side::Bid } else { Side::Ask };
-            let (protection, time_in_force) = match options {
+            let (modifier, time_in_force) = match options {
                 [] => (None, "gtc"),
                 [tif] => (None, *tif),
-                ["max", bound] => (Some(*bound), "gtc"),
-                ["max", bound, tif] => (Some(*bound), *tif),
+                ["max", bound] => (Some(Modifier::Protection(bound)), "gtc"),
+                ["max", bound, tif] => (Some(Modifier::Protection(bound)), *tif),
+                ["stop", trigger] => (Some(Modifier::Trigger(trigger)), "gtc"),
+                ["stop", trigger, tif] => (Some(Modifier::Trigger(trigger)), *tif),
+                ["max", _, "stop", ..] | ["stop", _, "max", ..] => {
+                    return Err(ParseError::StopTakesNoProtection);
+                }
                 _ => return Err(ParseError::WrongArity),
             };
-            submit(side, symbol, price, lots, protection, time_in_force)
+            submit(side, symbol, price, lots, modifier, time_in_force)
         }
         ["cancel", symbol, id] => Ok(Input::Cancel {
             symbol: symbol.to_string(),
@@ -102,16 +118,24 @@ fn submit(
     symbol: &str,
     price: &str,
     lots: &str,
-    protection: Option<&str>,
+    modifier: Option<Modifier>,
     time_in_force: &str,
 ) -> Result<Input, ParseError> {
-    let protection = protection
-        .map(|bound| Price::new(number(bound)?).map_err(ParseError::Domain))
-        .transpose()?;
-    let kind = match (price, protection) {
-        ("mkt", protection) => OrderKind::Market { protection },
-        (_, Some(_)) => return Err(ParseError::ProtectionNeedsMarket),
-        (price, None) => OrderKind::Limit(Price::new(number(price)?).map_err(ParseError::Domain)?),
+    let kind = match (price, modifier) {
+        ("mkt", None) => OrderKind::Market { protection: None },
+        ("mkt", Some(Modifier::Protection(bound))) => OrderKind::Market {
+            protection: Some(price_of(bound)?),
+        },
+        (_, Some(Modifier::Protection(_))) => return Err(ParseError::ProtectionNeedsMarket),
+        ("mkt", Some(Modifier::Trigger(trigger))) => OrderKind::Stop {
+            trigger: price_of(trigger)?,
+            limit: None,
+        },
+        (limit, Some(Modifier::Trigger(trigger))) => OrderKind::Stop {
+            trigger: price_of(trigger)?,
+            limit: Some(price_of(limit)?),
+        },
+        (limit, None) => OrderKind::Limit(price_of(limit)?),
     };
     let lots = Lots::new(number(lots)?).map_err(ParseError::Domain)?;
     let time_in_force = match time_in_force {
@@ -133,6 +157,10 @@ fn number<T: FromStr>(token: &str) -> Result<T, ParseError> {
     token
         .parse()
         .map_err(|_| ParseError::InvalidNumber(token.to_string()))
+}
+
+fn price_of(token: &str) -> Result<Price, ParseError> {
+    Price::new(number(token)?).map_err(ParseError::Domain)
 }
 
 #[cfg(test)]
@@ -320,5 +348,55 @@ mod tests {
             parse_line("sell TESTE/BRL 100 -1"),
             Err(ParseError::Domain(DomainError::NegativeLots(-1)))
         );
+    }
+
+    fn kind_of(line: &str) -> Result<OrderKind, ParseError> {
+        parse_line(line).map(|input| match input {
+            Input::Submit { kind, .. } => kind,
+            other => panic!("esperava uma ordem, veio {other:?}"),
+        })
+    }
+
+    #[test]
+    fn parses_stop_market_and_stop_limit() {
+        let price = |units| Price::new(units).expect("preço de teste válido");
+        assert_eq!(
+            kind_of("sell TESTE/BRL mkt 5 stop 9500"),
+            Ok(OrderKind::Stop {
+                trigger: price(9_500),
+                limit: None
+            })
+        );
+        assert_eq!(
+            kind_of("sell TESTE/BRL 9400 5 stop 9500 ioc"),
+            Ok(OrderKind::Stop {
+                trigger: price(9_500),
+                limit: Some(price(9_400))
+            })
+        );
+    }
+
+    #[test]
+    fn stop_with_protection_is_an_error() {
+        assert_eq!(
+            parse_line("sell TESTE/BRL mkt 5 max 9000 stop 9500"),
+            Err(ParseError::StopTakesNoProtection)
+        );
+        assert_eq!(
+            parse_line("sell TESTE/BRL mkt 5 stop 9500 max 9000"),
+            Err(ParseError::StopTakesNoProtection)
+        );
+    }
+
+    #[test]
+    fn stop_trigger_must_be_a_price() {
+        assert_eq!(
+            parse_line("buy TESTE/BRL mkt 5 stop abc"),
+            Err(ParseError::InvalidNumber("abc".to_string()))
+        );
+        assert!(matches!(
+            parse_line("buy TESTE/BRL mkt 5 stop 0"),
+            Err(ParseError::Domain(_))
+        ));
     }
 }

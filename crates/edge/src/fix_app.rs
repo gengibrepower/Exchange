@@ -42,6 +42,7 @@ const ORD_STATUS: Tag = tag(39);
 const ORD_TYPE: Tag = tag(40);
 const ORIG_CL_ORD_ID: Tag = tag(41);
 const PRICE: Tag = tag(44);
+const STOP_PX: Tag = tag(99);
 const SIDE: Tag = tag(54);
 const SYMBOL: Tag = tag(55);
 const TIME_IN_FORCE: Tag = tag(59);
@@ -140,6 +141,8 @@ enum Execution {
         request: Option<(Text, Text)>,
     },
     Expired,
+    /// O stop disparou (`ExecType=L`, "Triggered or Activated by System").
+    Triggered,
 }
 
 /// As ordens FIX de uma conta. Vive tanto quanto a sessão (através de quedas de conexão),
@@ -208,6 +211,14 @@ impl FixOrders {
         let kind = match fields.required(ORD_TYPE, Some)? {
             b"1" => OrderKind::Market { protection: None },
             b"2" => OrderKind::Limit(fields.required(PRICE, price)?),
+            b"3" => OrderKind::Stop {
+                trigger: fields.required(STOP_PX, price)?,
+                limit: None,
+            },
+            b"4" => OrderKind::Stop {
+                trigger: fields.required(STOP_PX, price)?,
+                limit: Some(fields.required(PRICE, price)?),
+            },
             _ => return Err(Problem::invalid(ORD_TYPE)),
         };
         let time_in_force = fields
@@ -282,7 +293,7 @@ impl FixOrders {
     }
 
     fn new_order_outcome(&mut self, order: NewOrder, events: &[Event]) -> Vec<AppMessage> {
-        let Some(id) = events.iter().find_map(new_order_id) else {
+        let Some(id) = events.iter().find_map(Event::order) else {
             return Vec::new();
         };
         if let Some(reason) = events.iter().find_map(|event| match event {
@@ -325,6 +336,9 @@ impl FixOrders {
                 }
                 Event::Expired { order, .. } if self.close(order, Closed::Expired) => {
                     reports.push(self.execution(order, &Execution::Expired));
+                }
+                Event::Triggered { order, .. } if self.orders.contains_key(&order) => {
+                    reports.push(self.execution(order, &Execution::Triggered));
                 }
                 _ => {}
             }
@@ -406,6 +420,7 @@ impl FixOrders {
                 .str(EXEC_TYPE, "4"),
             Execution::Cancelled { request: None } => out.str(EXEC_TYPE, "4"),
             Execution::Expired => out.str(EXEC_TYPE, "C"),
+            Execution::Triggered => out.str(EXEC_TYPE, "L"),
         };
         out.str(ORD_STATUS, tracked.status())
             .order(order)
@@ -436,18 +451,6 @@ impl FixOrders {
             .str(ORD_REJ_REASON, code)
             .str(Tag::TEXT, text)
             .build("8")
-    }
-}
-
-fn new_order_id(event: &Event) -> Option<OrderId> {
-    match *event {
-        Event::Rejected { order, .. }
-        | Event::Rested { order, .. }
-        | Event::Expired { order, .. }
-        | Event::Cancelled { order, .. }
-        | Event::Armed { order, .. } => Some(order),
-        Event::Fill { fill, .. } => Some(fill.taker),
-        Event::Deposited { .. } | Event::DepositRejected { .. } | Event::Triggered { .. } => None,
     }
 }
 
