@@ -29,7 +29,8 @@ enum Request {
     /// Pela fila, como o snapshot: a inscrição recebe exatamente o que vier depois dela.
     Subscribe {
         account: AccountId,
-        reply: oneshot::Sender<(SubscriberId, mpsc::Receiver<Delivery>)>,
+        buffer: Buffer,
+        reply: oneshot::Sender<(SubscriberId, DeliveryReceiver)>,
     },
 }
 
@@ -54,6 +55,52 @@ struct Origin {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SubscriberId(u64);
+
+/// Quanto uma inscrição guarda sem ser lida.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Buffer {
+    /// Até a capacidade do núcleo; além disso, a inscrição é cortada.
+    Limited,
+    /// Sem limite, para quem não pode perder nada e cujo acúmulo já é limitado por outro
+    /// caminho (ver [`CoreHandle::durable_reports`]).
+    Unlimited,
+}
+
+enum DeliverySender {
+    Limited(mpsc::Sender<Delivery>),
+    Unlimited(mpsc::UnboundedSender<Delivery>),
+}
+
+impl DeliverySender {
+    /// `false` se a inscrição tem que sair: cheia ou abandonada. Nunca espera.
+    fn offer(&self, delivery: Delivery) -> bool {
+        match self {
+            Self::Limited(sender) => sender.try_send(delivery).is_ok(),
+            Self::Unlimited(sender) => sender.send(delivery).is_ok(),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Limited(sender) => sender.is_closed(),
+            Self::Unlimited(sender) => sender.is_closed(),
+        }
+    }
+}
+
+enum DeliveryReceiver {
+    Limited(mpsc::Receiver<Delivery>),
+    Unlimited(mpsc::UnboundedReceiver<Delivery>),
+}
+
+impl DeliveryReceiver {
+    async fn recv(&mut self) -> Option<Delivery> {
+        match self {
+            Self::Limited(receiver) => receiver.recv().await,
+            Self::Unlimited(receiver) => receiver.recv().await,
+        }
+    }
+}
 
 /// Os eventos de um comando que dizem respeito a uma conta; `ticket` marca a resposta a
 /// um comando da própria inscrição.
@@ -129,9 +176,32 @@ impl CoreHandle {
     /// # Errors
     /// [`CoreError::Stopped`] se o núcleo parou antes de receber ou de responder.
     pub async fn reports(&self, account: AccountId) -> Result<Reports, CoreError> {
+        self.subscribe_reports(account, Buffer::Limited).await
+    }
+
+    /// Como [`CoreHandle::reports`], mas a inscrição nunca é cortada: o que ninguém lê fica
+    /// guardado. Para a sessão FIX, que precisa atravessar uma queda de conexão sem perder
+    /// relatório. Não esgota a memória porque só eventos das ordens que a conta já tem
+    /// chegam sem um comando dela: o acúmulo é limitado pela exposição da própria conta.
+    ///
+    /// # Errors
+    /// [`CoreError::Stopped`] se o núcleo parou antes de receber ou de responder.
+    pub async fn durable_reports(&self, account: AccountId) -> Result<Reports, CoreError> {
+        self.subscribe_reports(account, Buffer::Unlimited).await
+    }
+
+    async fn subscribe_reports(
+        &self,
+        account: AccountId,
+        buffer: Buffer,
+    ) -> Result<Reports, CoreError> {
         let (reply, response) = oneshot::channel();
         self.requests
-            .send(Request::Subscribe { account, reply })
+            .send(Request::Subscribe {
+                account,
+                buffer,
+                reply,
+            })
             .await
             .map_err(|_| CoreError::Stopped)?;
         let (subscriber, receiver) = response.await.map_err(|_| CoreError::Stopped)?;
@@ -198,7 +268,7 @@ pub struct Reports {
     core: CoreHandle,
     account: AccountId,
     subscriber: SubscriberId,
-    receiver: mpsc::Receiver<Delivery>,
+    receiver: DeliveryReceiver,
     next_ticket: u64,
 }
 
@@ -266,13 +336,13 @@ impl Reports {
     }
 }
 
-/// As inscrições de cada conta. Cada uma tem um buffer limitado: cheio, a inscrição é
-/// cortada, porque esperar seria deixar um cliente lento segurar o núcleo, e descartar
-/// em silêncio seria perder um fill que não há como pedir de novo.
+/// As inscrições de cada conta. Uma inscrição limitada que enche é cortada, porque esperar
+/// seria deixar um cliente lento segurar o núcleo, e descartar em silêncio seria perder um
+/// fill que não há como pedir de novo. Nos dois tipos, o núcleo nunca espera.
 struct Router {
     capacity: usize,
     next_id: u64,
-    subscribers: HashMap<AccountId, Vec<(SubscriberId, mpsc::Sender<Delivery>)>>,
+    subscribers: HashMap<AccountId, Vec<(SubscriberId, DeliverySender)>>,
 }
 
 impl Router {
@@ -286,8 +356,27 @@ impl Router {
 
     /// Aproveita para tirar as inscrições da conta cuja sessão já foi embora: sem isso,
     /// uma conta que não negocia mais guardaria as antigas para sempre.
-    fn subscribe(&mut self, account: AccountId) -> (SubscriberId, mpsc::Receiver<Delivery>) {
-        let (sender, receiver) = mpsc::channel(self.capacity);
+    fn subscribe(
+        &mut self,
+        account: AccountId,
+        buffer: Buffer,
+    ) -> (SubscriberId, DeliveryReceiver) {
+        let (sender, receiver) = match buffer {
+            Buffer::Limited => {
+                let (sender, receiver) = mpsc::channel(self.capacity);
+                (
+                    DeliverySender::Limited(sender),
+                    DeliveryReceiver::Limited(receiver),
+                )
+            }
+            Buffer::Unlimited => {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                (
+                    DeliverySender::Unlimited(sender),
+                    DeliveryReceiver::Unlimited(receiver),
+                )
+            }
+        };
         let id = SubscriberId(self.next_id);
         self.next_id += 1;
         let subscribers = self.subscribers.entry(account).or_default();
@@ -326,7 +415,7 @@ impl Router {
                     ticket,
                     events: concerned.clone(),
                 };
-                sender.try_send(delivery).is_ok()
+                sender.offer(delivery)
             });
             if subscribers.is_empty() {
                 self.subscribers.remove(&account);
@@ -423,8 +512,12 @@ fn serve(
                     }
                 }
                 Step::Query(query) => answer(&sequencer, &market_data, query),
-                Step::Subscribe { account, reply } => {
-                    let _ = reply.send(router.subscribe(account));
+                Step::Subscribe {
+                    account,
+                    buffer,
+                    reply,
+                } => {
+                    let _ = reply.send(router.subscribe(account, buffer));
                 }
             }
         }
@@ -450,7 +543,8 @@ enum Step {
     Query(Query),
     Subscribe {
         account: AccountId,
-        reply: oneshot::Sender<(SubscriberId, mpsc::Receiver<Delivery>)>,
+        buffer: Buffer,
+        reply: oneshot::Sender<(SubscriberId, DeliveryReceiver)>,
     },
 }
 
@@ -463,8 +557,19 @@ fn steps(round: Vec<Request>) -> Vec<Step> {
             (Request::Submit(pending), Some(Step::Batch(batch))) => batch.push(pending),
             (Request::Submit(pending), _) => steps.push(Step::Batch(vec![pending])),
             (Request::Query(query), _) => steps.push(Step::Query(query)),
-            (Request::Subscribe { account, reply }, _) => {
-                steps.push(Step::Subscribe { account, reply });
+            (
+                Request::Subscribe {
+                    account,
+                    buffer,
+                    reply,
+                },
+                _,
+            ) => {
+                steps.push(Step::Subscribe {
+                    account,
+                    buffer,
+                    reply,
+                });
             }
         }
     }
@@ -1155,6 +1260,32 @@ mod tests {
             [(OrderId::new(7), OrderId::new(1))]
         );
         drop((alice, again));
+        shut_down(handle, thread);
+    }
+
+    // O mesmo cenário que corta a inscrição limitada: a durável guarda tudo.
+    #[tokio::test]
+    async fn durable_subscription_keeps_everything_nobody_read() {
+        let (handle, thread) = core_with_reports(2);
+        funded(&handle, &[ALICE, BOB]).await;
+        handle
+            .submit(limit(ALICE, Side::Ask, 10_000, 10))
+            .await
+            .unwrap();
+        let mut alice = handle.durable_reports(ALICE).await.unwrap();
+
+        for _ in 0..10 {
+            handle
+                .submit(limit(BOB, Side::Bid, 10_000, 1))
+                .await
+                .unwrap();
+        }
+
+        for taker in 2..=11 {
+            let fill = [(OrderId::new(taker), OrderId::new(1))];
+            assert_eq!(fills_of(&next(&mut alice).await.unwrap()), fill);
+        }
+        drop(alice);
         shut_down(handle, thread);
     }
 

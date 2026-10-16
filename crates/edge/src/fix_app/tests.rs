@@ -10,6 +10,9 @@ const BUYER: AccountId = AccountId::new(2);
 struct Exchange {
     core: Sequencer,
     next_seq: u64,
+    /// Os eventos do último comando, para entregar às outras sessões como os relatórios
+    /// privados entregariam.
+    last: Vec<Event>,
 }
 
 impl Exchange {
@@ -26,7 +29,11 @@ impl Exchange {
                 .expect("depósito em memória não falha");
             }
         }
-        Self { core, next_seq: 1 }
+        Self {
+            core,
+            next_seq: 1,
+            last: Vec::new(),
+        }
     }
 
     fn send(&mut self, orders: &mut FixOrders, app: &AppMessage) -> Vec<AppMessage> {
@@ -35,11 +42,11 @@ impl Exchange {
         match orders.request(seq, app) {
             Request::Reply(reply) => vec![reply],
             Request::Submit { intent, pending } => {
-                let events = self
+                self.last = self
                     .core
                     .submit(intent)
                     .expect("núcleo em memória não falha");
-                orders.outcome(pending, &events)
+                orders.outcome(pending, &self.last)
             }
         }
     }
@@ -457,4 +464,55 @@ fn stop_needs_its_stop_price_and_stop_limit_its_price() {
     );
     let reports = exchange.send(&mut buyer, &no_price);
     assert_eq!(get(&reports[0], 58), Some("tag 44 ausente"));
+}
+
+#[test]
+fn resting_order_taken_by_another_session_is_reported_to_its_own() {
+    let mut exchange = Exchange::new();
+    let mut seller = FixOrders::new(SELLER);
+    let mut buyer = FixOrders::new(BUYER);
+    exchange.send(&mut seller, &limit("v1", "2", "5", "1000"));
+    exchange.send(&mut buyer, &limit("c1", "1", "2", "1000"));
+
+    let reports = seller.executions(&exchange.last);
+
+    assert_eq!(executions(&reports), vec![("F", "1", "2", "3")]);
+    assert_eq!(get(&reports[0], 11), Some("v1"));
+    assert_eq!(get(&reports[0], 31), Some("1000"));
+    assert_eq!(get(&reports[0], 32), Some("2"));
+}
+
+// A mesma conta por outra porta (o JSON) não tem `ClOrdID` nesta sessão.
+#[test]
+fn order_that_did_not_enter_through_this_session_is_not_reported() {
+    let mut exchange = Exchange::new();
+    let mut seller = FixOrders::new(SELLER);
+    let mut buyer = FixOrders::new(BUYER);
+    exchange.send(&mut seller, &limit("v1", "2", "5", "1000"));
+    exchange.send(&mut buyer, &limit("c1", "1", "2", "1000"));
+
+    assert_eq!(
+        FixOrders::new(SELLER).executions(&exchange.last),
+        Vec::new()
+    );
+}
+
+#[test]
+fn stop_fired_by_another_session_reports_triggered_then_trade_to_its_owner() {
+    let mut exchange = Exchange::new();
+    let mut seller = FixOrders::new(SELLER);
+    let mut buyer = FixOrders::new(BUYER);
+    exchange.send(&mut seller, &limit("v1", "2", "1", "1000"));
+    exchange.send(&mut seller, &limit("v2", "2", "5", "1010"));
+    exchange.send(&mut buyer, &stop("c1", "1", "2", "1000", None));
+    let mut other = FixOrders::new(BUYER);
+    exchange.send(&mut other, &limit("o1", "1", "1", "1000"));
+
+    let reports = buyer.executions(&exchange.last);
+
+    assert_eq!(
+        executions(&reports),
+        vec![("L", "0", "0", "2"), ("F", "2", "2", "0")]
+    );
+    assert_eq!(get(&reports[1], 31), Some("1010"));
 }
