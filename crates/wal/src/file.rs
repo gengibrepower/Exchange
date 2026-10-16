@@ -94,14 +94,35 @@ impl Wal {
     /// [`WalError::PayloadTooLarge`] sem escrever nada; [`WalError::Io`] se a escrita ou
     /// o `fsync` falhar, o que envenena o WAL; [`WalError::Poisoned`] depois disso.
     pub fn append(&mut self, payload: &[u8]) -> Result<(), WalError> {
+        self.append_batch(&[payload])
+    }
+
+    /// Anexa todos os `payloads`, em ordem, com um único `fsync` (group commit, decisão 5):
+    /// ao voltar `Ok`, todos sobrevivem a um crash. Um crash antes disso deixa no disco um
+    /// prefixo do lote, que a recuperação corta no último registro inteiro. Lote vazio
+    /// não toca o disco.
+    ///
+    /// # Errors
+    /// Os mesmos de [`Wal::append`]; com [`WalError::PayloadTooLarge`], nada do lote é
+    /// escrito.
+    pub fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
-        let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-        encode(payload, &mut frame)?;
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let len = payloads
+            .iter()
+            .map(|payload| HEADER_LEN + payload.len())
+            .sum();
+        let mut buffer = Vec::with_capacity(len);
+        for payload in payloads {
+            encode(payload, &mut buffer)?;
+        }
         let written = self
             .file
-            .write_all(&frame)
+            .write_all(&buffer)
             .and_then(|()| self.file.sync_data());
         if written.is_err() {
             self.poisoned = true;
@@ -270,5 +291,122 @@ mod tests {
 
         assert!(matches!(wal.append(b"um"), Err(WalError::Io(_))));
         assert!(matches!(wal.append(b"dois"), Err(WalError::Poisoned)));
+    }
+
+    #[test]
+    fn batch_survives_reopening() {
+        let path = TempPath::new("batch");
+        reopen(&path)
+            .wal
+            .append_batch(&[b"um", b"dois", b"tres"])
+            .unwrap();
+
+        let recovery = reopen(&path);
+
+        assert_eq!(
+            recovery.records,
+            [b"um".to_vec(), b"dois".to_vec(), b"tres".to_vec()]
+        );
+        assert_eq!(recovery.discarded, 0);
+    }
+
+    #[test]
+    fn batch_writes_the_same_bytes_as_one_append_per_record() {
+        let one_by_one = TempPath::new("one-by-one");
+        log_with(&one_by_one, &[b"um", b"dois", b"tres"]);
+        let batched = TempPath::new("batched");
+        reopen(&batched)
+            .wal
+            .append_batch(&[b"um", b"dois", b"tres"])
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&batched.0).unwrap(),
+            fs::read(&one_by_one.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn records_after_a_batch_land_after_it() {
+        let path = TempPath::new("after-batch");
+        let mut wal = reopen(&path).wal;
+        wal.append_batch(&[b"um", b"dois"]).unwrap();
+        wal.append(b"tres").unwrap();
+        wal.append_batch(&[b"quatro"]).unwrap();
+
+        let recovery = reopen(&path);
+
+        assert_eq!(
+            recovery.records,
+            [
+                b"um".to_vec(),
+                b"dois".to_vec(),
+                b"tres".to_vec(),
+                b"quatro".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_batch_writes_nothing() {
+        let path = TempPath::new("empty-batch");
+        reopen(&path).wal.append_batch(&[]).unwrap();
+
+        assert_eq!(file_len(&path), 0);
+    }
+
+    #[test]
+    fn failed_batch_poisons_the_wal() {
+        let path = TempPath::new("poison-batch");
+        drop(reopen(&path));
+        let read_only = File::open(&path.0).unwrap();
+        let mut wal = Wal {
+            file: read_only,
+            poisoned: false,
+        };
+
+        assert!(matches!(
+            wal.append_batch(&[b"um", b"dois"]),
+            Err(WalError::Io(_))
+        ));
+        assert!(matches!(
+            wal.append_batch(&[b"tres"]),
+            Err(WalError::Poisoned)
+        ));
+    }
+
+    // Um crash no meio do `write` do lote deixa no disco só os primeiros bytes dele. Para
+    // cada corte possível, a recuperação devolve os registros de antes do lote mais um
+    // prefixo do lote — nunca um buraco, nunca um registro pela metade.
+    #[test]
+    fn crash_at_any_byte_of_a_batch_recovers_a_prefix() {
+        let before: [&[u8]; 1] = [b"antes"];
+        let batch: [&[u8]; 3] = [b"um", b"dois", b"tres"];
+        let path = TempPath::new("batch-crash");
+        log_with(&path, &before);
+        let start = file_len(&path);
+        reopen(&path).wal.append_batch(&batch).unwrap();
+        let full = fs::read(&path.0).unwrap();
+
+        let mut ends = Vec::new();
+        let mut end = start;
+        for payload in batch {
+            end += frame_len(payload);
+            ends.push(end);
+        }
+
+        for cut in start..=file_len(&path) {
+            fs::write(&path.0, &full[..usize::try_from(cut).unwrap()]).unwrap();
+
+            let recovery = reopen(&path);
+
+            let complete = ends.iter().take_while(|&&end| end <= cut).count();
+            let expected: Vec<Vec<u8>> = before
+                .iter()
+                .chain(&batch[..complete])
+                .map(|payload| payload.to_vec())
+                .collect();
+            assert_eq!(recovery.records, expected, "corte no byte {cut}");
+        }
     }
 }
