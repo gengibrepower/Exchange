@@ -2,6 +2,7 @@
 //! e a borda assíncrona fala com ele só por canais. A ordem em que os pedidos saem do canal
 //! é a ordem canônica do sistema — a do log.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
@@ -19,18 +20,46 @@ use crate::sequencer::{Intent, Sequencer, SequencerError};
 /// último pedido espera pelo `fsync` dos que vieram antes.
 const MAX_BATCH: usize = 256;
 
-/// Um pedido com o endereço de volta: o núcleo responde pelo `oneshot` e nunca espera
-/// ninguém para isso.
+/// Um pedido com o endereço de volta: o núcleo responde sem nunca esperar ninguém.
 enum Request {
     Submit(Submission),
     /// Consulta não vai para o log, mas passa pela mesma fila para ver o estado numa
     /// posição bem definida: depois de tudo que entrou antes dela.
     Query(Query),
+    /// Pela fila, como o snapshot: a inscrição recebe exatamente o que vier depois dela.
+    Subscribe {
+        account: AccountId,
+        reply: oneshot::Sender<(SubscriberId, mpsc::Receiver<Delivery>)>,
+    },
 }
 
 struct Submission {
     intent: Intent,
-    reply: oneshot::Sender<Vec<Event>>,
+    reply: Reply,
+}
+
+enum Reply {
+    /// Todos os eventos do comando, para quem não tem inscrição.
+    Direct(oneshot::Sender<Vec<Event>>),
+    /// Pelo fluxo privado da inscrição, na mesma fila dos eventos alheios.
+    Stream(Origin),
+}
+
+#[derive(Clone, Copy)]
+struct Origin {
+    account: AccountId,
+    subscriber: SubscriberId,
+    ticket: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SubscriberId(u64);
+
+/// Os eventos de um comando que dizem respeito a uma conta; `ticket` marca a resposta a
+/// um comando da própria inscrição.
+struct Delivery {
+    ticket: Option<u64>,
+    events: Vec<Event>,
 }
 
 enum Query {
@@ -52,12 +81,18 @@ enum Query {
 pub enum CoreError {
     /// A thread do núcleo terminou (fail-stop ou desligamento): nada mais é aceito.
     Stopped,
+    /// Os relatórios privados se acumularam sem leitura e o núcleo cortou a inscrição.
+    FellBehind,
 }
 
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stopped => write!(f, "o núcleo parou"),
+            Self::FellBehind => write!(
+                f,
+                "relatórios acumulados sem leitura: a sessão foi desconectada"
+            ),
         }
     }
 }
@@ -79,10 +114,34 @@ impl CoreHandle {
     pub async fn submit(&self, intent: Intent) -> Result<Vec<Event>, CoreError> {
         let (reply, response) = oneshot::channel();
         self.requests
-            .send(Request::Submit(Submission { intent, reply }))
+            .send(Request::Submit(Submission {
+                intent,
+                reply: Reply::Direct(reply),
+            }))
             .await
             .map_err(|_| CoreError::Stopped)?;
         response.await.map_err(|_| CoreError::Stopped)
+    }
+
+    /// Inscreve-se nos relatórios privados de `account`: tudo que acontecer com ela daqui em
+    /// diante, inclusive o que vier do comando de outra sessão.
+    ///
+    /// # Errors
+    /// [`CoreError::Stopped`] se o núcleo parou antes de receber ou de responder.
+    pub async fn reports(&self, account: AccountId) -> Result<Reports, CoreError> {
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .send(Request::Subscribe { account, reply })
+            .await
+            .map_err(|_| CoreError::Stopped)?;
+        let (subscriber, receiver) = response.await.map_err(|_| CoreError::Stopped)?;
+        Ok(Reports {
+            core: self.clone(),
+            account,
+            subscriber,
+            receiver,
+            next_ticket: 0,
+        })
     }
 
     /// # Errors
@@ -132,9 +191,154 @@ impl CoreHandle {
     }
 }
 
+/// Os relatórios privados de uma conta, num fluxo único na ordem do núcleo. Os comandos
+/// desta sessão respondem pelo mesmo fluxo: nenhum evento alheio mais antigo chega depois
+/// da resposta a um comando mais novo.
+pub struct Reports {
+    core: CoreHandle,
+    account: AccountId,
+    subscriber: SubscriberId,
+    receiver: mpsc::Receiver<Delivery>,
+    next_ticket: u64,
+}
+
+/// A resposta a um comando e, antes dela, o que chegou de outros comandos que vieram antes
+/// dele no log.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Submitted {
+    pub earlier: Vec<Vec<Event>>,
+    pub events: Vec<Event>,
+}
+
+impl Reports {
+    pub fn account(&self) -> AccountId {
+        self.account
+    }
+
+    /// Espera vaga na fila e depois a própria resposta, no fluxo.
+    ///
+    /// # Errors
+    /// [`CoreError::Stopped`] se o núcleo parou; [`CoreError::FellBehind`] se a inscrição
+    /// foi cortada.
+    pub async fn submit(&mut self, intent: Intent) -> Result<Submitted, CoreError> {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        let origin = Origin {
+            account: self.account,
+            subscriber: self.subscriber,
+            ticket,
+        };
+        self.core
+            .requests
+            .send(Request::Submit(Submission {
+                intent,
+                reply: Reply::Stream(origin),
+            }))
+            .await
+            .map_err(|_| CoreError::Stopped)?;
+        let mut earlier = Vec::new();
+        loop {
+            let delivery = self.receive().await?;
+            if delivery.ticket == Some(ticket) {
+                return Ok(Submitted {
+                    earlier,
+                    events: delivery.events,
+                });
+            }
+            earlier.push(delivery.events);
+        }
+    }
+
+    /// Os próximos eventos desta conta vindos do comando de outra sessão.
+    ///
+    /// # Errors
+    /// Os mesmos de [`Reports::submit`].
+    pub async fn next(&mut self) -> Result<Vec<Event>, CoreError> {
+        Ok(self.receive().await?.events)
+    }
+
+    async fn receive(&mut self) -> Result<Delivery, CoreError> {
+        match self.receiver.recv().await {
+            Some(delivery) => Ok(delivery),
+            None if self.core.requests.is_closed() => Err(CoreError::Stopped),
+            None => Err(CoreError::FellBehind),
+        }
+    }
+}
+
+/// As inscrições de cada conta. Cada uma tem um buffer limitado: cheio, a inscrição é
+/// cortada, porque esperar seria deixar um cliente lento segurar o núcleo, e descartar
+/// em silêncio seria perder um fill que não há como pedir de novo.
+struct Router {
+    capacity: usize,
+    next_id: u64,
+    subscribers: HashMap<AccountId, Vec<(SubscriberId, mpsc::Sender<Delivery>)>>,
+}
+
+impl Router {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            capacity: capacity.get(),
+            next_id: 0,
+            subscribers: HashMap::new(),
+        }
+    }
+
+    /// Aproveita para tirar as inscrições da conta cuja sessão já foi embora: sem isso,
+    /// uma conta que não negocia mais guardaria as antigas para sempre.
+    fn subscribe(&mut self, account: AccountId) -> (SubscriberId, mpsc::Receiver<Delivery>) {
+        let (sender, receiver) = mpsc::channel(self.capacity);
+        let id = SubscriberId(self.next_id);
+        self.next_id += 1;
+        let subscribers = self.subscribers.entry(account).or_default();
+        subscribers.retain(|(_, sender)| !sender.is_closed());
+        subscribers.push((id, sender));
+        (id, receiver)
+    }
+
+    /// Cada inscrição recebe os eventos da sua conta; a de `origin` recebe a resposta ao
+    /// próprio comando mesmo sem nenhum, para não ficar esperando.
+    fn deliver(&mut self, events: &[Event], origin: Option<Origin>) {
+        let mut accounts: Vec<AccountId> =
+            origin.map(|origin| origin.account).into_iter().collect();
+        for account in events.iter().flat_map(Event::accounts) {
+            if !accounts.contains(&account) {
+                accounts.push(account);
+            }
+        }
+        for account in accounts {
+            let Some(subscribers) = self.subscribers.get_mut(&account) else {
+                continue;
+            };
+            let concerned: Vec<Event> = events
+                .iter()
+                .filter(|event| event.accounts().any(|concerned| concerned == account))
+                .cloned()
+                .collect();
+            subscribers.retain(|(id, sender)| {
+                let ticket = origin
+                    .filter(|origin| origin.subscriber == *id)
+                    .map(|origin| origin.ticket);
+                if concerned.is_empty() && ticket.is_none() {
+                    return true;
+                }
+                let delivery = Delivery {
+                    ticket,
+                    events: concerned.clone(),
+                };
+                sender.try_send(delivery).is_ok()
+            });
+            if subscribers.is_empty() {
+                self.subscribers.remove(&account);
+            }
+        }
+    }
+}
+
 /// Move o `sequencer` e o feed `market_data` para uma thread dedicada. A fila aceita até
 /// `queue` pedidos pendentes; cheia, quem envia espera. O feed guarda até `feed`
-/// incrementos para quem está atrasado; além disso, o atrasado perde mensagens.
+/// incrementos para quem está atrasado; além disso, o atrasado perde mensagens. Cada
+/// inscrição nos relatórios privados guarda até `reports` entregas; além disso, é cortada.
 ///
 /// A thread termina quando todos os [`CoreHandle`] somem, devolvendo o `Sequencer`, ou ao
 /// primeiro erro do `Sequencer` (fail-stop), devolvendo o erro.
@@ -146,13 +350,22 @@ pub fn spawn_core(
     market_data: MarketData,
     queue: NonZeroUsize,
     feed: NonZeroUsize,
+    reports: NonZeroUsize,
 ) -> io::Result<(CoreHandle, JoinHandle<Result<Sequencer, SequencerError>>)> {
     let (requests, receiver) = mpsc::channel(queue.get());
     let (updates, _) = broadcast::channel(feed.get());
     let publisher = updates.clone();
     let thread = thread::Builder::new()
         .name("nucleo".to_string())
-        .spawn(move || run_core(sequencer, market_data, receiver, &publisher))?;
+        .spawn(move || {
+            run_core(
+                sequencer,
+                market_data,
+                receiver,
+                &publisher,
+                Router::new(reports),
+            )
+        })?;
     Ok((CoreHandle { requests, updates }, thread))
 }
 
@@ -161,15 +374,32 @@ pub fn spawn_core(
 /// único `fsync` (group commit, decisão 5); cada consulta fecha o lote anterior, para ver o
 /// estado depois de tudo que entrou antes dela e de nada que entrou depois.
 ///
-/// O feed é alimentado no mesmo laço, com os mesmos eventos, logo depois de cada comando:
-/// núcleo e feed nunca divergem.
+/// O feed e os relatórios privados são alimentados no mesmo laço, com os mesmos eventos,
+/// logo depois de cada comando e antes do próximo: núcleo, feed e relatórios nunca
+/// divergem nem trocam de ordem.
 fn run_core(
-    mut sequencer: Sequencer,
-    mut market_data: MarketData,
+    sequencer: Sequencer,
+    market_data: MarketData,
     mut requests: mpsc::Receiver<Request>,
     updates: &broadcast::Sender<Update>,
+    mut router: Router,
 ) -> Result<Sequencer, SequencerError> {
-    while let Some(round) = next_round(&mut requests) {
+    let outcome = serve(sequencer, market_data, &mut requests, updates, &mut router);
+    // A fila fecha antes das inscrições: quem vê o próprio fluxo acabar já encontra a fila
+    // fechada e sabe que o núcleo parou, em vez de achar que foi cortado por atraso.
+    drop(requests);
+    drop(router);
+    outcome
+}
+
+fn serve(
+    mut sequencer: Sequencer,
+    mut market_data: MarketData,
+    requests: &mut mpsc::Receiver<Request>,
+    updates: &broadcast::Sender<Update>,
+    router: &mut Router,
+) -> Result<Sequencer, SequencerError> {
+    while let Some(round) = next_round(requests) {
         for step in steps(round) {
             match step {
                 Step::Batch(batch) => {
@@ -181,12 +411,21 @@ fn run_core(
                             // mensagens. Em nenhum caso o núcleo espera.
                             let _ = updates.send(update);
                         }
-                        // Cliente que já foi embora: o comando aconteceu (está no log e
-                        // aplicado), só a resposta não tem para onde ir.
-                        let _ = pending.reply.send(events);
+                        match pending.reply {
+                            Reply::Direct(reply) => {
+                                router.deliver(&events, None);
+                                // Cliente que já foi embora: o comando aconteceu (está no
+                                // log e aplicado), só a resposta não tem para onde ir.
+                                let _ = reply.send(events);
+                            }
+                            Reply::Stream(origin) => router.deliver(&events, Some(origin)),
+                        }
                     }
                 }
                 Step::Query(query) => answer(&sequencer, &market_data, query),
+                Step::Subscribe { account, reply } => {
+                    let _ = reply.send(router.subscribe(account));
+                }
             }
         }
     }
@@ -209,10 +448,14 @@ fn next_round(requests: &mut mpsc::Receiver<Request>) -> Option<Vec<Request>> {
 enum Step {
     Batch(Vec<Submission>),
     Query(Query),
+    Subscribe {
+        account: AccountId,
+        reply: oneshot::Sender<(SubscriberId, mpsc::Receiver<Delivery>)>,
+    },
 }
 
-/// Agrupa as submissões seguidas em lotes, mantendo a ordem; cada consulta fica sozinha
-/// entre o lote de antes e o de depois.
+/// Agrupa as submissões seguidas em lotes, mantendo a ordem; cada consulta ou inscrição
+/// fica sozinha entre o lote de antes e o de depois.
 fn steps(round: Vec<Request>) -> Vec<Step> {
     let mut steps = Vec::new();
     for request in round {
@@ -220,6 +463,9 @@ fn steps(round: Vec<Request>) -> Vec<Step> {
             (Request::Submit(pending), Some(Step::Batch(batch))) => batch.push(pending),
             (Request::Submit(pending), _) => steps.push(Step::Batch(vec![pending])),
             (Request::Query(query), _) => steps.push(Step::Query(query)),
+            (Request::Subscribe { account, reply }, _) => {
+                steps.push(Step::Subscribe { account, reply });
+            }
         }
     }
     steps
@@ -247,6 +493,9 @@ fn answer(sequencer: &Sequencer, market_data: &MarketData, query: Query) {
 #[cfg(test)]
 mod tests {
     use exchange_core::domain::{Amount, Lots, OrderId, OrderKind, Price, Side, TimeInForce};
+    use exchange_core::engine::RejectReason;
+
+    use std::time::Duration;
 
     use super::*;
     use crate::market::{BRL, INSTRUMENTS, TESTE, new_market_data};
@@ -313,6 +562,7 @@ mod tests {
             new_market_data(),
             capacity(4),
             capacity(1024),
+            capacity(1024),
         )
         .unwrap();
 
@@ -373,8 +623,14 @@ mod tests {
     async fn concurrent_sessions_are_all_answered_and_the_log_replays_to_the_same_state() {
         let path = TempPath::new("concurrent");
         let (sequencer, _) = Sequencer::open(&path.0).unwrap();
-        let (handle, thread) =
-            spawn_core(sequencer, new_market_data(), capacity(8), capacity(1024)).unwrap();
+        let (handle, thread) = spawn_core(
+            sequencer,
+            new_market_data(),
+            capacity(8),
+            capacity(1024),
+            capacity(1024),
+        )
+        .unwrap();
 
         let sessions: Vec<_> = (0..8)
             .map(|session| tokio::spawn(trade(handle.clone(), session)))
@@ -398,6 +654,7 @@ mod tests {
             new_market_data(),
             capacity(4),
             capacity(1024),
+            capacity(1024),
         )
         .unwrap();
         let (reply, response) = oneshot::channel();
@@ -407,7 +664,7 @@ mod tests {
             .requests
             .send(Request::Submit(Submission {
                 intent: fund(ALICE, BRL, 500),
-                reply,
+                reply: Reply::Direct(reply),
             }))
             .await
             .unwrap();
@@ -423,6 +680,7 @@ mod tests {
             Sequencer::exhausted(),
             new_market_data(),
             capacity(4),
+            capacity(1024),
             capacity(1024),
         )
         .unwrap();
@@ -493,6 +751,7 @@ mod tests {
             new_market_data(),
             capacity(4),
             capacity(1024),
+            capacity(1024),
         )
         .unwrap();
         let mut receiver = handle.subscribe();
@@ -516,6 +775,7 @@ mod tests {
             new_market_data(),
             capacity(8),
             capacity(65_536),
+            capacity(1024),
         )
         .unwrap();
         trade(handle.clone(), 100).await;
@@ -545,6 +805,7 @@ mod tests {
             new_market_data(),
             capacity(4),
             capacity(4),
+            capacity(1024),
         )
         .unwrap();
         for intent in [fund(ALICE, BRL, 1_000_000), fund(ALICE, TESTE, 10_000)] {
@@ -594,6 +855,7 @@ mod tests {
             new_market_data(),
             capacity(4),
             capacity(4),
+            capacity(1024),
         )
         .unwrap();
 
@@ -606,6 +868,7 @@ mod tests {
 
     fn submission(intent: Intent) -> (Request, oneshot::Receiver<Vec<Event>>) {
         let (reply, response) = oneshot::channel();
+        let reply = Reply::Direct(reply);
         (Request::Submit(Submission { intent, reply }), response)
     }
 
@@ -619,13 +882,13 @@ mod tests {
         (Request::Query(query), response)
     }
 
-    /// O tamanho de cada lote, com `0` no lugar de cada consulta.
+    /// O tamanho de cada lote, com `0` no lugar de cada consulta ou inscrição.
     fn shape(steps: &[Step]) -> Vec<usize> {
         steps
             .iter()
             .map(|step| match step {
                 Step::Batch(batch) => batch.len(),
-                Step::Query(_) => 0,
+                Step::Query(_) | Step::Subscribe { .. } => 0,
             })
             .collect()
     }
@@ -686,6 +949,7 @@ mod tests {
             new_market_data(),
             receiver,
             &updates,
+            Router::new(capacity(16)),
         )
         .unwrap();
 
@@ -694,5 +958,223 @@ mod tests {
         assert_eq!(available(after_reply), Amount::new(150).unwrap());
         assert!(first_reply.blocking_recv().is_ok());
         assert!(second_reply.blocking_recv().is_ok());
+    }
+
+    const BOB: AccountId = AccountId::new(2);
+    const CAROL: AccountId = AccountId::new(3);
+
+    /// Com prazo: um defeito no roteamento faz o teste falhar, não travar a suíte.
+    async fn next(reports: &mut Reports) -> Result<Vec<Event>, CoreError> {
+        tokio::time::timeout(Duration::from_secs(5), reports.next())
+            .await
+            .expect("a entrega chegou a tempo")
+    }
+
+    async fn submit(reports: &mut Reports, intent: Intent) -> Result<Submitted, CoreError> {
+        tokio::time::timeout(Duration::from_secs(5), reports.submit(intent))
+            .await
+            .expect("a resposta chegou a tempo")
+    }
+
+    fn core_with_reports(
+        reports: usize,
+    ) -> (CoreHandle, JoinHandle<Result<Sequencer, SequencerError>>) {
+        spawn_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            capacity(16),
+            capacity(1024),
+            capacity(reports),
+        )
+        .unwrap()
+    }
+
+    async fn funded(handle: &CoreHandle, accounts: &[AccountId]) {
+        for &account in accounts {
+            for intent in [fund(account, BRL, 1_000_000), fund(account, TESTE, 10_000)] {
+                handle.submit(intent).await.unwrap();
+            }
+        }
+    }
+
+    fn fills_of(events: &[Event]) -> Vec<(OrderId, OrderId)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Fill { fill, .. } => Some((fill.taker, fill.maker)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // O caso que um fluxo só existe para evitar: a ordem de Alice é executada pelo comando
+    // de Bob e logo depois Alice pede o cancelamento. O fill tem que chegar antes da recusa
+    // que ele explica.
+    #[tokio::test]
+    async fn own_reply_arrives_after_the_earlier_reports_that_explain_it() {
+        let (handle, thread) = core_with_reports(16);
+        funded(&handle, &[ALICE, BOB]).await;
+        let mut alice = handle.reports(ALICE).await.unwrap();
+        let rested = submit(&mut alice, limit(ALICE, Side::Ask, 10_000, 2))
+            .await
+            .unwrap();
+        assert_eq!(rested.earlier, Vec::<Vec<Event>>::new());
+        assert!(matches!(rested.events.as_slice(), [Event::Rested { .. }]));
+
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 2))
+            .await
+            .unwrap();
+        let cancelled = submit(&mut alice, cancel(ALICE, OrderId::new(1)))
+            .await
+            .unwrap();
+
+        let earlier: Vec<_> = cancelled
+            .earlier
+            .iter()
+            .map(|events| fills_of(events))
+            .collect();
+        assert_eq!(earlier, [vec![(OrderId::new(2), OrderId::new(1))]]);
+        assert!(matches!(
+            cancelled.events.as_slice(),
+            [Event::Rejected {
+                reason: RejectReason::UnknownOrder,
+                ..
+            }]
+        ));
+        drop(alice);
+        shut_down(handle, thread);
+    }
+
+    #[tokio::test]
+    async fn subscription_starts_where_it_entered_the_queue() {
+        let (handle, thread) = core_with_reports(16);
+        funded(&handle, &[ALICE, BOB]).await;
+        handle
+            .submit(limit(ALICE, Side::Ask, 10_000, 2))
+            .await
+            .unwrap();
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 1))
+            .await
+            .unwrap();
+
+        let mut alice = handle.reports(ALICE).await.unwrap();
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 1))
+            .await
+            .unwrap();
+
+        let report = next(&mut alice).await.unwrap();
+        assert_eq!(fills_of(&report), [(OrderId::new(3), OrderId::new(1))]);
+        drop(alice);
+        shut_down(handle, thread);
+    }
+
+    // Carol não negocia: quando ela mesma manda um comando, nada de Alice e Bob veio antes.
+    #[tokio::test]
+    async fn reports_of_other_accounts_never_arrive() {
+        let (handle, thread) = core_with_reports(16);
+        funded(&handle, &[ALICE, BOB]).await;
+        let mut carol = handle.reports(CAROL).await.unwrap();
+        handle
+            .submit(limit(ALICE, Side::Ask, 10_000, 2))
+            .await
+            .unwrap();
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 2))
+            .await
+            .unwrap();
+
+        let deposited = submit(&mut carol, fund(CAROL, BRL, 10)).await.unwrap();
+
+        assert_eq!(deposited.earlier, Vec::<Vec<Event>>::new());
+        assert!(matches!(
+            deposited.events.as_slice(),
+            [Event::Deposited { account: CAROL, .. }]
+        ));
+        drop(carol);
+        shut_down(handle, thread);
+    }
+
+    #[tokio::test]
+    async fn every_session_of_the_account_gets_the_reports() {
+        let (handle, thread) = core_with_reports(16);
+        funded(&handle, &[ALICE, BOB]).await;
+        let mut first = handle.reports(ALICE).await.unwrap();
+        let mut second = handle.reports(ALICE).await.unwrap();
+
+        submit(&mut first, limit(ALICE, Side::Ask, 10_000, 1))
+            .await
+            .unwrap();
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 1))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            next(&mut second).await.unwrap().as_slice(),
+            [Event::Rested { .. }]
+        ));
+        let fill = [(OrderId::new(2), OrderId::new(1))];
+        assert_eq!(fills_of(&next(&mut first).await.unwrap()), fill);
+        assert_eq!(fills_of(&next(&mut second).await.unwrap()), fill);
+        drop((first, second));
+        shut_down(handle, thread);
+    }
+
+    // Alice não lê: o buffer de 2 enche, a inscrição é cortada, o núcleo segue atendendo,
+    // e Alice recebe o que ficou no buffer antes de saber que foi cortada.
+    #[tokio::test]
+    async fn subscription_that_does_not_read_is_cut_without_holding_the_core() {
+        let (handle, thread) = core_with_reports(2);
+        funded(&handle, &[ALICE, BOB]).await;
+        handle
+            .submit(limit(ALICE, Side::Ask, 10_000, 10))
+            .await
+            .unwrap();
+        let mut alice = handle.reports(ALICE).await.unwrap();
+
+        for _ in 0..5 {
+            let answered = handle.submit(limit(BOB, Side::Bid, 10_000, 1)).await;
+            assert!(answered.is_ok(), "o núcleo atendeu com Alice parada");
+        }
+
+        for taker in [2, 3] {
+            let fill = [(OrderId::new(taker), OrderId::new(1))];
+            assert_eq!(fills_of(&next(&mut alice).await.unwrap()), fill);
+        }
+        assert_eq!(next(&mut alice).await, Err(CoreError::FellBehind));
+        let mut again = handle.reports(ALICE).await.unwrap();
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            fills_of(&next(&mut again).await.unwrap()),
+            [(OrderId::new(7), OrderId::new(1))]
+        );
+        drop((alice, again));
+        shut_down(handle, thread);
+    }
+
+    #[tokio::test]
+    async fn stopped_core_ends_the_reports() {
+        let (handle, thread) = spawn_core(
+            Sequencer::exhausted(),
+            new_market_data(),
+            capacity(4),
+            capacity(16),
+            capacity(16),
+        )
+        .unwrap();
+        let mut alice = handle.reports(ALICE).await.unwrap();
+
+        assert_eq!(
+            submit(&mut alice, fund(ALICE, BRL, 1)).await,
+            Err(CoreError::Stopped)
+        );
+        drop((alice, handle));
+        assert!(thread.join().unwrap().is_err());
     }
 }

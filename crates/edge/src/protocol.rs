@@ -40,6 +40,14 @@ impl From<CoreSide> for Side {
     }
 }
 
+/// O lado de um fill: o taker chegou e cruzou, o maker estava no livro.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Taker,
+    Maker,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Feed {
@@ -314,10 +322,11 @@ pub enum ServerMessage {
         asset: String,
         amount: Amount,
     },
+    /// Fala só da ordem de quem recebe: `fee` é o que ele pagou, zero para o maker.
     Fill {
         instrument: String,
-        taker: OrderId,
-        maker: OrderId,
+        role: Role,
+        order: OrderId,
         lots: Lots,
         price: Price,
         fee: Amount,
@@ -530,9 +539,12 @@ impl ServerMessage {
     }
 }
 
-impl From<&Event> for ServerMessage {
-    fn from(event: &Event) -> Self {
-        match *event {
+impl ServerMessage {
+    /// O evento como `viewer` o vê; evento que não é dele não vira mensagem. Um fill vira
+    /// uma mensagem por ordem dele (as duas num autonegócio), com o papel e a taxa que ele
+    /// pagou: o maker não paga (decisão 7), e a ordem do outro lado não aparece.
+    pub fn from_event(viewer: AccountId, event: &Event) -> Vec<Self> {
+        let message = match *event {
             Event::Deposited { asset, amount, .. } => Self::Deposited {
                 asset: asset_name(asset).to_string(),
                 amount,
@@ -545,15 +557,26 @@ impl From<&Event> for ServerMessage {
                 instrument,
                 fill,
                 fee,
-                ..
-            } => Self::Fill {
-                instrument: symbol(instrument).to_string(),
-                taker: fill.taker,
-                maker: fill.maker,
-                lots: fill.lots,
-                price: fill.price,
-                fee,
-            },
+                taker_account,
+                maker_account,
+            } => {
+                let sides = [
+                    (taker_account, Role::Taker, fill.taker, fee),
+                    (maker_account, Role::Maker, fill.maker, Amount::ZERO),
+                ];
+                return sides
+                    .into_iter()
+                    .filter(|&(account, ..)| account == viewer)
+                    .map(|(_, role, order, fee)| Self::Fill {
+                        instrument: symbol(instrument).to_string(),
+                        role,
+                        order,
+                        lots: fill.lots,
+                        price: fill.price,
+                        fee,
+                    })
+                    .collect();
+            }
             Event::Rested {
                 instrument,
                 order,
@@ -609,6 +632,11 @@ impl From<&Event> for ServerMessage {
                 instrument: symbol(instrument).to_string(),
                 order,
             },
+        };
+        if event.accounts().any(|account| account == viewer) {
+            vec![message]
+        } else {
+            Vec::new()
         }
     }
 }
@@ -955,7 +983,14 @@ mod tests {
     }
 
     fn line(event: &Event) -> String {
-        ServerMessage::from(event).to_line()
+        lines(ACCOUNT, event)
+    }
+
+    fn lines(viewer: AccountId, event: &Event) -> String {
+        ServerMessage::from_event(viewer, event)
+            .iter()
+            .map(ServerMessage::to_line)
+            .collect()
     }
 
     #[test]
@@ -989,7 +1024,7 @@ mod tests {
                 taker_account: ACCOUNT,
                 maker_account: AccountId::new(2)
             }),
-            "{\"type\":\"fill\",\"instrument\":\"TESTE/BRL\",\"taker\":2,\"maker\":1,\"lots\":3,\"price\":10000,\"fee\":30}\n"
+            "{\"type\":\"fill\",\"instrument\":\"TESTE/BRL\",\"role\":\"taker\",\"order\":2,\"lots\":3,\"price\":10000,\"fee\":30}\n"
         );
         assert_eq!(
             line(&Event::Rested {
@@ -1020,6 +1055,58 @@ mod tests {
             }),
             "{\"type\":\"expired\",\"instrument\":\"TESTE/BRL\",\"order\":4,\"lots\":5}\n"
         );
+    }
+
+    fn fill_between(taker_account: AccountId, maker_account: AccountId) -> Event {
+        Event::Fill {
+            instrument: TESTE_BRL,
+            fill: Fill {
+                taker: OrderId::new(2),
+                maker: OrderId::new(1),
+                price: price(10_000),
+                lots: lots(3),
+            },
+            fee: amount(30),
+            taker_account,
+            maker_account,
+        }
+    }
+
+    #[test]
+    fn maker_sees_its_own_order_and_pays_no_fee() {
+        assert_eq!(
+            lines(AccountId::new(2), &fill_between(ACCOUNT, AccountId::new(2))),
+            "{\"type\":\"fill\",\"instrument\":\"TESTE/BRL\",\"role\":\"maker\",\"order\":1,\"lots\":3,\"price\":10000,\"fee\":0}\n"
+        );
+    }
+
+    #[test]
+    fn self_trade_is_one_line_per_order() {
+        assert_eq!(
+            lines(ACCOUNT, &fill_between(ACCOUNT, ACCOUNT)),
+            concat!(
+                "{\"type\":\"fill\",\"instrument\":\"TESTE/BRL\",\"role\":\"taker\",\"order\":2,\"lots\":3,\"price\":10000,\"fee\":30}\n",
+                "{\"type\":\"fill\",\"instrument\":\"TESTE/BRL\",\"role\":\"maker\",\"order\":1,\"lots\":3,\"price\":10000,\"fee\":0}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn events_of_another_account_become_nothing() {
+        let stranger = AccountId::new(9);
+        assert_eq!(
+            lines(stranger, &fill_between(ACCOUNT, AccountId::new(2))),
+            ""
+        );
+        let rested = Event::Rested {
+            instrument: TESTE_BRL,
+            order: OrderId::new(1),
+            account: ACCOUNT,
+            side: CoreSide::Bid,
+            price: price(10_000),
+            lots: lots(5),
+        };
+        assert_eq!(lines(stranger, &rested), "");
     }
 
     #[test]
