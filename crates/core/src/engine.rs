@@ -9,8 +9,12 @@ use crate::domain::{
 };
 use crate::ledger::{Balance, Ledger, LedgerError, Transfer};
 
+mod snapshot;
 mod stops;
 
+pub use snapshot::{
+    EngineState, InstrumentState, OpenOrder, OrderProblem, RestoreError, StateDecodeError,
+};
 use stops::StopBook;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

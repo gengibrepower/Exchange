@@ -476,6 +476,49 @@ impl Order {
         })
     }
 
+    /// Uma ordem aberta de volta de um snapshot: o pedido como está agora e o que resta. O
+    /// status sai do restante (`Accepted` intacta, `PartiallyFilled` depois de um fill),
+    /// os únicos que uma ordem aberta pode ter. É a única porta além de
+    /// [`Order::from_request`]; quem chama valida o resto contra o mercado.
+    ///
+    /// `None` se o restante não estiver entre 1 e o total.
+    pub(crate) fn restore(request: OrderRequest, remaining: Lots) -> Option<Self> {
+        if remaining == Lots::ZERO || remaining > request.total {
+            return None;
+        }
+        let status = if remaining == request.total {
+            OrderStatus::Accepted
+        } else {
+            OrderStatus::PartiallyFilled
+        };
+        Some(Self {
+            id: request.id,
+            account: request.account,
+            instrument: request.instrument,
+            side: request.side,
+            kind: request.kind,
+            total: request.total,
+            remaining,
+            seq: request.seq,
+            status,
+            time_in_force: request.time_in_force,
+        })
+    }
+
+    /// O pedido como a ordem está agora: um stop disparado já com o tipo em que entrou.
+    pub(crate) fn request(&self) -> OrderRequest {
+        OrderRequest {
+            id: self.id,
+            account: self.account,
+            instrument: self.instrument,
+            side: self.side,
+            kind: self.kind,
+            total: self.total,
+            seq: self.seq,
+            time_in_force: self.time_in_force,
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_time_in_force(mut self, time_in_force: TimeInForce) -> Self {

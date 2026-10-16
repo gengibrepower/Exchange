@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use super::{Command, Engine, Event, FeeSchedule, ListingConfig, RiskLimits};
+use super::{Command, Engine, EngineState, Event, FeeSchedule, ListingConfig, RiskLimits};
 use crate::domain::{
     AccountId, Amount, AssetId, Bps, Fill, Instrument, InstrumentId, Lots, OrderId, OrderKind,
     OrderRequest, Price, Seq, Side, TimeInForce,
@@ -417,5 +417,43 @@ proptest! {
                 }
             }
         }
+    }
+
+    // Decisão 6: o estado de qualquer história, ida e volta pelos bytes, é o mesmo engine e
+    // os mesmos bytes. E, mais forte que a igualdade, os dois respondem igual a qualquer
+    // continuação: um estado derivado errado na carga apareceria aqui.
+    #[test]
+    fn snapshot_restores_an_engine_that_behaves_the_same(
+        taker_bps in prop_oneof![Just(0_u32), Just(10), Just(10_000)],
+        collar_bps in prop_oneof![Just(500_u32), Just(10_000)],
+        history in prop::collection::vec(op(2), 0..=80),
+        future in prop::collection::vec(op(2), 1..=40)
+    ) {
+        let fees = FeeSchedule { house: HOUSE, taker_bps: Bps::new(taker_bps).expect("até 100%") };
+        let risk = RiskLimits {
+            max_lots: Lots::new(10).expect("positivo"),
+            collar: Bps::new(collar_bps).expect("até 100%"),
+        };
+        let listings = || specs().map(|instrument| ListingConfig { instrument, risk });
+        let mut engine = Engine::new(listings(), fees).expect("config válida");
+        let mut next_id = 1;
+        for op in &history {
+            engine.apply(command(op, &mut next_id));
+        }
+
+        let state = engine.state();
+        let bytes = state.to_bytes();
+        let decoded = EngineState::from_bytes(&bytes).expect("bytes do próprio estado");
+        prop_assert_eq!(&decoded, &state);
+        let mut restored =
+            Engine::restore(listings(), fees, &decoded).expect("estado de um engine de verdade");
+        prop_assert_eq!(&restored, &engine);
+        prop_assert_eq!(restored.state().to_bytes(), bytes);
+
+        for op in &future {
+            let command = command(op, &mut next_id);
+            prop_assert_eq!(restored.apply(command), engine.apply(command), "depois de {:?}", op);
+        }
+        prop_assert_eq!(&restored, &engine);
     }
 }
