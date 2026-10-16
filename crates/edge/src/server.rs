@@ -1,14 +1,13 @@
 //! Servidor TCP da borda (seção 4.4). O TCP entrega um fluxo de bytes sem fronteiras; a
 //! fronteira entre mensagens é convenção nossa: uma por linha, com teto de tamanho.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use exchange_core::domain::{AccountId, InstrumentId, OrderId};
-use exchange_core::engine::Event;
+use exchange_core::domain::{AccountId, InstrumentId};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
@@ -17,11 +16,10 @@ use tokio::sync::Semaphore;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
-use crate::core_thread::{CoreError, CoreHandle};
+use crate::core_thread::{CoreError, CoreHandle, Reports};
 use crate::market::{ASSETS, HOUSE};
 use crate::market_data::{Feed, Update};
 use crate::protocol::{self, AssetBalance, ClientMessage, Inbound, ServerMessage};
-use crate::sequencer::Intent;
 
 /// Linha maior que isso sem `\n` não é protocolo: é erro e a conexão fecha, para um
 /// cliente não fazer o servidor acumular memória sem fim (seção 6).
@@ -113,29 +111,25 @@ async fn refuse(mut stream: TcpStream) {
 }
 
 /// Estado da sessão: antes do login só `login` é aceito; depois, tudo menos outro login,
-/// sempre em nome da conta autenticada.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// sempre em nome da conta autenticada, cujos relatórios privados a sessão assina.
 pub enum Session {
     AwaitingLogin,
-    /// `orders` são as ordens que esta sessão criou: só eventos delas chegam ao cliente.
-    Active {
-        account: AccountId,
-        orders: HashSet<OrderId>,
-    },
+    Active(Reports),
 }
 
 /// Trata uma mensagem conforme o estado da sessão, possivelmente mudando o estado, e
 /// devolve as respostas na ordem em que devem ser escritas.
 ///
 /// # Errors
-/// [`CoreError::Stopped`] se o núcleo parou: a sessão deve ser encerrada.
+/// [`CoreError`] se o núcleo parou ou cortou os relatórios da sessão: ela deve ser
+/// encerrada.
 pub async fn respond(
     state: &mut Session,
     subscriptions: &mut Subscriptions,
     message: ClientMessage,
     core: &CoreHandle,
 ) -> Result<Vec<ServerMessage>, CoreError> {
-    let Session::Active { account, orders } = state else {
+    let Session::Active(reports) = state else {
         let message = match message {
             ClientMessage::Subscribe { instrument, feed } => {
                 return match protocol::subscription(instrument, feed) {
@@ -151,13 +145,10 @@ pub async fn respond(
         if account == HOUSE {
             return Ok(vec![error("a conta da casa não negocia")]);
         }
-        *state = Session::Active {
-            account,
-            orders: HashSet::new(),
-        };
+        *state = Session::Active(core.reports(account).await?);
         return Ok(vec![ServerMessage::LoggedIn { account }]);
     };
-    let account = *account;
+    let account = reports.account();
     match message.resolve(account) {
         Err(problem) => Ok(vec![error(problem.to_string())]),
         Ok(Inbound::Login(_)) => Ok(vec![error(format!(
@@ -166,43 +157,19 @@ pub async fn respond(
         ))]),
         Ok(Inbound::Balance) => Ok(vec![balances(core, account).await?]),
         Ok(Inbound::Submit(intent)) => {
-            let events = core.submit(intent).await?;
-            Ok(visible(orders, intent, &events)
-                .map(ServerMessage::from)
+            let submitted = reports.submit(intent).await?;
+            Ok(submitted
+                .earlier
+                .iter()
+                .chain([&submitted.events])
+                .flatten()
+                .flat_map(|event| ServerMessage::from_event(account, event))
                 .collect())
         }
         Ok(Inbound::Subscribe { instrument, feed }) => {
             subscriptions.subscribe(core, instrument, feed).await
         }
     }
-}
-
-/// Os eventos de um comando que dizem respeito à sessão: os das ordens que ela criou e a
-/// resposta ao cancelamento que ela mesma pediu. Uma ordem nova é a do primeiro evento do
-/// comando, e passa a ser da sessão se não for rejeitada. Um stop de outra conta, disparado
-/// pela ordem desta, não aparece: nem que existe, nem de quem é, nem quanto executou.
-fn visible<'a>(
-    orders: &mut HashSet<OrderId>,
-    intent: Intent,
-    events: &'a [Event],
-) -> impl Iterator<Item = &'a Event> {
-    let asked = match intent {
-        Intent::Order { .. } => events.iter().find_map(Event::order),
-        Intent::Cancel { order, .. } => Some(order),
-        Intent::Deposit { .. } => None,
-    };
-    if let (Intent::Order { .. }, Some(order)) = (intent, asked)
-        && !matches!(events.first(), Some(Event::Rejected { .. }))
-    {
-        orders.insert(order);
-    }
-    let orders = &*orders;
-    let mine = move |order: OrderId| Some(order) == asked || orders.contains(&order);
-    events.iter().filter(move |event| match event {
-        Event::Deposited { .. } | Event::DepositRejected { .. } => true,
-        Event::Fill { fill, .. } => mine(fill.taker) || mine(fill.maker),
-        other => other.order().is_some_and(mine),
-    })
 }
 
 /// O que a sessão assinou e o último `seq` já entregue em cada fluxo. Um único receptor do
@@ -311,6 +278,10 @@ async fn session(stream: TcpStream, core: CoreHandle, idle_timeout: Duration) {
                 Ok(_) | Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => (vec![error(CoreError::Stopped.to_string())], false),
             },
+            reported = next_report(&mut state) => match reported {
+                Ok(messages) => (messages, true),
+                Err(problem) => (vec![error(problem.to_string())], false),
+            },
             () = tokio::time::sleep_until(deadline), if !subscriptions.is_active() => {
                 (vec![error("sessão ociosa")], false)
             }
@@ -319,6 +290,19 @@ async fn session(stream: TcpStream, core: CoreHandle, idle_timeout: Duration) {
             return;
         }
     }
+}
+
+/// O que chegou para a conta vindo do comando de outra sessão; antes do login, nunca.
+async fn next_report(state: &mut Session) -> Result<Vec<ServerMessage>, CoreError> {
+    let Session::Active(reports) = state else {
+        return std::future::pending().await;
+    };
+    let account = reports.account();
+    let events = reports.next().await?;
+    Ok(events
+        .iter()
+        .flat_map(|event| ServerMessage::from_event(account, event))
+        .collect())
 }
 
 async fn handle(
@@ -415,6 +399,7 @@ mod tests {
             new_market_data(),
             NonZeroUsize::new(16).unwrap(),
             NonZeroUsize::new(1024).unwrap(),
+            NonZeroUsize::new(1024).unwrap(),
         )
         .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -508,7 +493,7 @@ mod tests {
             .await;
         assert_eq!(
             bob.recv().await,
-            r#"{"type":"fill","instrument":"TESTE/BRL","taker":2,"maker":1,"lots":2,"price":10000,"fee":20}"#
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":2,"lots":2,"price":10000,"fee":20}"#
         );
 
         bob.send(r#"{"type":"balance"}"#).await;
@@ -984,7 +969,7 @@ mod tests {
             .await;
         assert_eq!(
             bob.recv().await,
-            r#"{"type":"fill","instrument":"OUTRO/BRL","taker":4,"maker":1,"lots":2,"price":2005,"fee":5}"#
+            r#"{"type":"fill","instrument":"OUTRO/BRL","role":"taker","order":4,"lots":2,"price":2005,"fee":5}"#
         );
         bob.send(r#"{"type":"balance"}"#).await;
         assert_eq!(
@@ -1028,12 +1013,13 @@ mod tests {
         (carol, alice)
     }
 
-    // Quem dispara o stop de outra conta recebe só o próprio negócio: nem que o stop
-    // existia, nem de quem era, nem quanto executou.
+    // O stop de Alice disparado pela ordem de Bob: Alice fica sabendo pelo fluxo privado,
+    // Carol recebe os dois fills como maker, e Bob vê só o próprio negócio, sem saber do
+    // stop nem de quem eram as ordens do outro lado.
     #[tokio::test]
-    async fn stop_fired_by_another_session_stays_private() {
+    async fn stop_fired_by_another_session_reaches_only_those_it_concerns() {
         let address = start(Sequencer::in_memory()).await;
-        let (_carol, mut alice) = armed_stop(address).await;
+        let (mut carol, mut alice) = armed_stop(address).await;
         let mut bob = Client::login(address, 2).await;
         bob.fund().await;
 
@@ -1041,15 +1027,57 @@ mod tests {
             .await;
         assert_eq!(
             bob.recv().await,
-            r#"{"type":"fill","instrument":"TESTE/BRL","taker":4,"maker":1,"lots":1,"price":10000,"fee":10}"#
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":4,"lots":1,"price":10000,"fee":10}"#
         );
         bob.send(r#"{"type":"balance"}"#).await;
         assert!(bob.recv().await.starts_with(r#"{"type":"balances""#));
 
-        alice.send(r#"{"type":"balance"}"#).await;
+        for expected in [
+            r#"{"type":"triggered","instrument":"TESTE/BRL","order":3}"#,
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":3,"lots":2,"price":10500,"fee":21}"#,
+        ] {
+            assert_eq!(alice.recv().await, expected);
+        }
+        for expected in [
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"maker","order":1,"lots":1,"price":10000,"fee":0}"#,
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"maker","order":2,"lots":2,"price":10500,"fee":0}"#,
+        ] {
+            assert_eq!(carol.recv().await, expected);
+        }
+    }
+
+    // A ordem de Alice é executada pelo comando de Bob e Alice pede o cancelamento logo em
+    // seguida: o fill que explica a recusa chega antes dela.
+    #[tokio::test]
+    async fn fill_from_another_session_arrives_before_the_refusal_it_explains() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut alice = Client::login(address, 1).await;
+        let mut bob = Client::login(address, 2).await;
+        alice.fund().await;
+        bob.fund().await;
+        alice
+            .send(
+                r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":2}"#,
+            )
+            .await;
+        alice.recv().await;
+        bob.send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2}"#)
+            .await;
+        bob.recv().await;
+
+        alice
+            .send(r#"{"type":"cancel","instrument":"TESTE/BRL","order":1}"#)
+            .await;
+
         assert_eq!(
             alice.recv().await,
-            r#"{"type":"balances","balances":[{"asset":"TESTE","available":100200,"reserved":0},{"asset":"BRL","available":99978979,"reserved":0},{"asset":"OUTRO","available":0,"reserved":0}]}"#
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"maker","order":1,"lots":2,"price":10000,"fee":0}"#
+        );
+        assert!(
+            alice
+                .recv()
+                .await
+                .starts_with(r#"{"type":"rejected","order":1,"code":"unknown_order""#)
         );
     }
 
@@ -1062,9 +1090,9 @@ mod tests {
             .send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":1}"#)
             .await;
         for expected in [
-            r#"{"type":"fill","instrument":"TESTE/BRL","taker":4,"maker":1,"lots":1,"price":10000,"fee":10}"#,
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":4,"lots":1,"price":10000,"fee":10}"#,
             r#"{"type":"triggered","instrument":"TESTE/BRL","order":3}"#,
-            r#"{"type":"fill","instrument":"TESTE/BRL","taker":3,"maker":2,"lots":2,"price":10500,"fee":21}"#,
+            r#"{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":3,"lots":2,"price":10500,"fee":21}"#,
         ] {
             assert_eq!(alice.recv().await, expected);
         }

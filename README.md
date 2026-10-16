@@ -29,7 +29,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Em andamento: F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento e stop orders feitos; faltam o aviso ao dono quando a ordem dele é afetada pelo comando de outra sessão, e snapshots.
+- **Em andamento: F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento, stop orders e relatórios privados no JSON feitos; faltam os relatórios privados no FIX e snapshots.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -132,9 +132,15 @@ $ socat - TCP:127.0.0.1:7000
 {"type":"deposit","asset":"BRL","amount":10000000}
 {"type":"deposited","asset":"BRL","amount":10000000}
 {"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2}
-{"type":"fill","instrument":"TESTE/BRL","taker":2,"maker":1,"lots":2,"price":10000,"fee":20}
+{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":2,"lots":2,"price":10000,"fee":20}
 {"type":"balance"}
-{"type":"balances","balances":[{"asset":"TESTE","available":200,"reserved":0},{"asset":"BRL","available":9979980,"reserved":0}]}
+{"type":"balances","balances":[{"asset":"TESTE","available":200,"reserved":0},{"asset":"BRL","available":9979980,"reserved":0},{"asset":"OUTRO","available":0,"reserved":0}]}
+```
+
+E, no primeiro terminal, a conta 1 fica sabendo na hora, sem ter mandado nada:
+
+```
+{"type":"fill","instrument":"TESTE/BRL","role":"maker","order":1,"lots":2,"price":10000,"fee":0}
 ```
 
 Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
@@ -150,7 +156,11 @@ Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
 | `balance` | — | saldos da conta da sessão |
 | `subscribe` | `instrument`, `feed` (`l1`/`l2`) | assina o feed (não exige login); assinar de novo traz um snapshot novo |
 
-O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances` e `error`. Cada sessão só recebe eventos das ordens que ela criou: quem dispara o stop de outra conta vê o próprio negócio e nada do stop; a quem assina, envia `snapshot` e depois os incrementos `depth` (quantidade absoluta no preço, `0` quando o nível some), `top` e `trade`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
+O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances` e `error`. O `fill` fala só da ordem de quem recebe: `role` diz se ela era `taker` ou `maker`, `fee` é o que essa conta pagou (o maker não paga), e um autonegócio vira duas linhas, uma por ordem.
+
+Cada sessão recebe tudo que acontece com a sua conta, inclusive o que vem do comando de outra sessão: o fill de uma ordem descansando, o disparo de um stop. Nunca recebe o que é de outra conta: quem dispara o stop alheio vê o próprio negócio e nada do stop. Tudo chega num fluxo só, na ordem do núcleo, então o fill que explica a recusa de um cancelamento chega antes dela. Uma sessão que acumula 1.024 entregas sem ler é desconectada com um `error`: o núcleo não espera ninguém, e descartar em silêncio perderia um fill que não há como pedir de novo.
+
+A quem assina o feed, o servidor envia `snapshot` e depois os incrementos `depth` (quantidade absoluta no preço, `0` quando o nível some), `top` e `trade`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
 
 ## FIX
 
@@ -158,7 +168,7 @@ A porta FIX fala FIX 4.4, com codec e sessão implementados à mão no crate `ex
 
 - **Sessão**: todo `MsgSeqNum` é conferido. Buraco gera um único `ResendRequest`; o reenvio volta com `PossDupFlag=Y`, e as mensagens administrativas viram `SequenceReset-GapFill`. Duplicata abaixo do esperado com `PossDupFlag` é ignorada; sem ela, a sessão encerra com Logout. Silêncio além do intervalo gera `TestRequest` e, sem resposta, a conexão cai. Seqs e mensagens enviadas sobrevivem à queda da conexão: ao reconectar, o Logon revela o que faltou.
 - **Aplicação**: `NewOrderSingle` (`35=D`, `OrdType` 1 mercado, 2 limite, 3 stop e 4 stop-limite, com o gatilho em `StopPx`, tag 99) e `OrderCancelRequest` (`35=F`) entram; saem `ExecutionReport` (`35=8`: New, Trade, Canceled, Expired, Rejected e Triggered, `ExecType=L`, quando o stop dispara), `OrderCancelReject` (`35=9`) e `BusinessMessageReject` (`35=j`). `ClOrdID` já usado é recusado sem chegar ao núcleo, o que protege o cliente que, na dúvida depois de uma queda, manda a mesma ordem de novo.
-- **Desvios do padrão**, os mesmos da borda JSON: preço inteiro por lot (sem casas decimais), sem `AvgPx`, e só quem enviou a ordem que gerou o negócio recebe o relatório: o dono de uma ordem descansando ou de um stop disparado pelo comando de outra sessão não é avisado.
+- **Desvios do padrão**: preço inteiro por lot (sem casas decimais), como na borda JSON; sem `AvgPx`; e, por enquanto, só quem enviou a ordem que gerou o negócio recebe o relatório: o dono de uma ordem descansando ou de um stop disparado pelo comando de outra sessão não é avisado.
 
 A garantia "nem perde nem duplica" é testada de duas formas: um `proptest` com duas sessões num TCP simulado que cai em pontos aleatórios, perde o que estava em trânsito e recebe reenvios a mais (cada lado recebe exatamente o que o outro enviou, uma vez e em ordem); e um teste de integração com o servidor real, em que a conexão cai depois de a ordem chegar ao núcleo e antes de a confirmação ser lida.
 

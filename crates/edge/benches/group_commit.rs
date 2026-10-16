@@ -14,6 +14,7 @@ const COMMANDS: u32 = 2_048;
 const SESSIONS: [u32; 3] = [1, 8, 64];
 const QUEUE: NonZeroUsize = NonZeroUsize::new(1_024).expect("1024 não é zero");
 const FEED: NonZeroUsize = NonZeroUsize::new(4_096).expect("4096 não é zero");
+const REPORTS: NonZeroUsize = NonZeroUsize::new(1_024).expect("1024 não é zero");
 
 type CoreThread = JoinHandle<Result<Sequencer, SequencerError>>;
 
@@ -44,7 +45,7 @@ fn main() {
 /// O tempo de parede para `sessions` clientes concorrentes, juntos, terem [`COMMANDS`]
 /// comandos respondidos.
 async fn measure(sequencer: Sequencer, sessions: u32) -> (Duration, CoreThread) {
-    let (core, thread) = spawn_core(sequencer, market::new_market_data(), QUEUE, FEED)
+    let (core, thread) = spawn_core(sequencer, market::new_market_data(), QUEUE, FEED, REPORTS)
         .expect("criar a thread do núcleo");
     let per_session = COMMANDS / sessions;
 

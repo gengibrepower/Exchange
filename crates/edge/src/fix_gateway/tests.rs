@@ -18,6 +18,7 @@ async fn start() -> (SocketAddr, CoreHandle) {
         new_market_data(),
         NonZeroUsize::new(16).unwrap(),
         NonZeroUsize::new(1024).unwrap(),
+        NonZeroUsize::new(1024).unwrap(),
     )
     .unwrap();
     for account in [1, 2] {
