@@ -145,6 +145,7 @@ fn render(event: &Event) -> String {
             instrument,
             fill,
             fee,
+            ..
         } => format!(
             "fill {}: taker #{}, maker #{}, {} lots @ {}, taxa {}",
             symbol(*instrument),
@@ -169,6 +170,7 @@ fn render(event: &Event) -> String {
             instrument,
             order,
             lots,
+            ..
         } => format!(
             "#{} cancelada: {} lots em {}",
             order.get(),
@@ -179,13 +181,14 @@ fn render(event: &Event) -> String {
             instrument,
             order,
             lots,
+            ..
         } => format!(
             "#{} expirou: {} lots em {}",
             order.get(),
             lots.get(),
             symbol(*instrument)
         ),
-        Event::Rejected { order, reason } => {
+        Event::Rejected { order, reason, .. } => {
             format!("#{} rejeitada: {}", order.get(), reject_message(reason))
         }
         Event::Armed {
@@ -201,7 +204,9 @@ fn render(event: &Event) -> String {
             symbol(*instrument),
             trigger.get()
         ),
-        Event::Triggered { instrument, order } => {
+        Event::Triggered {
+            instrument, order, ..
+        } => {
             format!("#{} disparou em {}", order.get(), symbol(*instrument))
         }
     }

@@ -374,16 +374,31 @@ proptest! {
                 oracle.record_owner(INSTRUMENTS[*instrument], order, ACCOUNTS[*account], *side);
             }
 
+            let requester = match op {
+                Op::Deposit(account, ..) | Op::Submit { account, .. } | Op::Cancel { account, .. } => {
+                    ACCOUNTS[account]
+                }
+            };
             for event in engine.apply(command(&op, &mut next_id)) {
                 match event {
                     Event::Deposited { account, asset, amount } => {
                         oracle.deposit(account, asset, amount);
                     }
-                    Event::Fill { instrument, fill, .. } => {
+                    Event::Fill { instrument, fill, taker_account, maker_account, .. } => {
+                        prop_assert_eq!(taker_account, oracle.owner(instrument, fill.taker).0);
+                        prop_assert_eq!(maker_account, oracle.owner(instrument, fill.maker).0);
                         let spec = engine.instrument(instrument).expect("instrumento registrado");
                         oracle.apply_fill(spec, &fill);
                     }
-                    _ => {}
+                    Event::Rejected { account, .. } => prop_assert_eq!(account, requester),
+                    Event::Rested { instrument, order, account, .. }
+                    | Event::Cancelled { instrument, order, account, .. }
+                    | Event::Expired { instrument, order, account, .. }
+                    | Event::Armed { instrument, order, account, .. }
+                    | Event::Triggered { instrument, order, account } => {
+                        prop_assert_eq!(account, oracle.owner(instrument, order).0);
+                    }
+                    Event::DepositRejected { .. } => {}
                 }
             }
 
