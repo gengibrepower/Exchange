@@ -8,7 +8,16 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+criterion = "0.8"
 proptest = "1"
+
+[[bench]]
+name = "matching"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false
 
 [lints]
 workspace = true
