@@ -40,16 +40,20 @@ pub enum Event {
         asset: AssetId,
         amount: Amount,
     },
+    /// `fee` é do taker; o maker não paga taxa (decisão 7).
     Fill {
         instrument: InstrumentId,
         fill: Fill,
         fee: Amount,
+        taker_account: AccountId,
+        maker_account: AccountId,
     },
     /// A sobra de uma ordem limite que ficou no livro; lado e preço deixam quem só consome
     /// eventos (o feed de market data, seção 4.3) reconstruir o livro sem olhar o engine.
     Rested {
         instrument: InstrumentId,
         order: OrderId,
+        account: AccountId,
         side: Side,
         price: Price,
         lots: Lots,
@@ -57,21 +61,27 @@ pub enum Event {
     Cancelled {
         instrument: InstrumentId,
         order: OrderId,
+        account: AccountId,
         lots: Lots,
     },
     Expired {
         instrument: InstrumentId,
         order: OrderId,
+        account: AccountId,
         lots: Lots,
     },
+    /// `account` é de quem mandou o comando, não necessariamente o dono da ordem: um
+    /// cancelamento da ordem alheia é recusado para quem pediu.
     Rejected {
         order: OrderId,
+        account: AccountId,
         reason: RejectReason,
     },
     /// Stop aceito e dormente: reserva feita, fora do livro e do feed.
     Armed {
         instrument: InstrumentId,
         order: OrderId,
+        account: AccountId,
         side: Side,
         trigger: Price,
         lots: Lots,
@@ -81,6 +91,7 @@ pub enum Event {
     Triggered {
         instrument: InstrumentId,
         order: OrderId,
+        account: AccountId,
     },
 }
 
@@ -97,6 +108,27 @@ impl Event {
             Self::Fill { fill, .. } => Some(fill.taker),
             Self::Deposited { .. } | Self::DepositRejected { .. } => None,
         }
+    }
+
+    /// As contas a quem o evento diz respeito, sem repetir: o dono da ordem (ou quem pediu,
+    /// numa rejeição), as duas pontas de um fill, a conta de um depósito.
+    pub fn accounts(&self) -> impl Iterator<Item = AccountId> {
+        let (first, second) = match *self {
+            Self::Fill {
+                taker_account,
+                maker_account,
+                ..
+            } => (taker_account, Some(maker_account)),
+            Self::Deposited { account, .. }
+            | Self::DepositRejected { account, .. }
+            | Self::Rested { account, .. }
+            | Self::Cancelled { account, .. }
+            | Self::Expired { account, .. }
+            | Self::Rejected { account, .. }
+            | Self::Armed { account, .. }
+            | Self::Triggered { account, .. } => (account, None),
+        };
+        std::iter::once(first).chain(second.filter(|&other| other != first))
     }
 }
 
@@ -307,7 +339,13 @@ impl Engine {
             instrument,
             ..
         } = request;
-        let reject = |reason| vec![Event::Rejected { order: id, reason }];
+        let reject = |reason| {
+            vec![Event::Rejected {
+                order: id,
+                account,
+                reason,
+            }]
+        };
         let Ok(order) = Order::from_request(request) else {
             return reject(RejectReason::EmptyOrder);
         };
@@ -386,6 +424,7 @@ impl Engine {
             events.push(Event::Triggered {
                 instrument,
                 order: stop.id(),
+                account: stop.account(),
             });
             events.extend(fire(
                 listing,
@@ -407,6 +446,7 @@ impl Engine {
         let Some(listing) = self.listings.get_mut(&instrument) else {
             return vec![Event::Rejected {
                 order,
+                account,
                 reason: RejectReason::UnknownInstrument(instrument),
             }];
         };
@@ -424,15 +464,18 @@ impl Engine {
                 Event::Cancelled {
                     instrument,
                     order,
+                    account,
                     lots: cancelled.remaining(),
                 }
             }
             Err(CancelError::UnknownOrder) => Event::Rejected {
                 order,
+                account,
                 reason: RejectReason::UnknownOrder,
             },
             Err(CancelError::NotOwner) => Event::Rejected {
                 order,
+                account,
                 reason: RejectReason::NotOwner,
             },
         };
@@ -445,6 +488,7 @@ type Reservations = HashMap<(InstrumentId, OrderId), Reservation>;
 #[derive(Clone, Copy)]
 struct Taker {
     id: OrderId,
+    account: AccountId,
     side: Side,
 }
 
@@ -669,6 +713,7 @@ fn arm(
     let event = Event::Armed {
         instrument: listing.instrument.id(),
         order: order.id(),
+        account: order.account(),
         side,
         trigger,
         lots: order.remaining(),
@@ -691,12 +736,13 @@ fn fire(
     let instrument = listing.instrument.id();
     let key = (instrument, stop.id());
     let limit = stop.quoted_prices()[1];
-    let lots = stop.remaining();
+    let (lots, account) = (stop.remaining(), stop.account());
     let Ok(order) = pre_trade_risk(stop.triggered(), &listing.book, listing.risk) else {
         release_rest(ledger, reservations, key);
         return vec![Event::Cancelled {
             instrument,
             order: key.1,
+            account,
             lots,
         }];
     };
@@ -725,6 +771,7 @@ fn execute(
     let instrument = spec.id();
     let taker = Taker {
         id: order.id(),
+        account: order.account(),
         side: order.side(),
     };
     let outcome = listing.book.submit(order);
@@ -734,18 +781,21 @@ fn execute(
 
     let mut events = Vec::new();
     for fill in outcome.fills {
+        let maker_account = reservations[&(instrument, fill.maker)].account;
         let fee = settle_fill(ledger, reservations, &spec, fees, taker, &fill);
         events.push(Event::Fill {
             instrument,
             fill,
             fee,
+            taker_account: taker.account,
+            maker_account,
         });
     }
     events.extend(close_leftover(
         ledger,
         reservations,
         (instrument, taker.id),
-        taker.side,
+        taker,
         outcome.leftover,
     ));
     events
@@ -800,16 +850,18 @@ fn close_leftover(
     ledger: &mut Ledger,
     reservations: &mut Reservations,
     key: (InstrumentId, OrderId),
-    side: Side,
+    taker: Taker,
     leftover: Leftover,
 ) -> Option<Event> {
     let (instrument, order) = key;
+    let account = taker.account;
     match leftover {
         Leftover::None => None,
         Leftover::Rested { price, lots } => Some(Event::Rested {
             instrument,
             order,
-            side,
+            account,
+            side: taker.side,
             price,
             lots,
         }),
@@ -818,6 +870,7 @@ fn close_leftover(
             Some(Event::Cancelled {
                 instrument,
                 order,
+                account,
                 lots,
             })
         }
@@ -826,6 +879,7 @@ fn close_leftover(
             Some(Event::Expired {
                 instrument,
                 order,
+                account,
                 lots,
             })
         }
@@ -1097,6 +1151,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: HOUSE,
                 reason: RejectReason::HouseCannotTrade,
             }]
         );
@@ -1148,6 +1203,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::InsufficientFunds {
                     asset: BRL,
                     available: amount(1_000),
@@ -1260,6 +1316,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::NoReferencePrice,
             }]
         );
@@ -1323,6 +1380,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::OrderTooLarge {
                     lots: lots(6),
                     max: lots(5),
@@ -1343,6 +1401,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(2),
+                account: ALICE,
                 reason: RejectReason::OutsideCollar {
                     bound: price(1_000),
                     edge: price(110),
@@ -1498,6 +1557,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::OffTick {
                     price: Price::new(105).expect("preço de teste válido"),
                     tick: Price::new(10).expect("tick de teste válido"),
@@ -1554,6 +1614,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::UnknownInstrument(unknown),
             }]
         );
@@ -1569,6 +1630,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::EmptyOrder,
             }]
         );
@@ -1597,6 +1659,7 @@ mod tests {
             vec![Event::Cancelled {
                 instrument: TESTE_BRL,
                 order: OrderId::new(1),
+                account: ALICE,
                 lots: lots(3),
             }]
         );
@@ -1615,6 +1678,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::UnknownInstrument(unknown),
             }]
         );
@@ -1630,6 +1694,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(7),
+                account: ALICE,
                 reason: RejectReason::UnknownOrder,
             }]
         );
@@ -1646,6 +1711,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: BOB,
                 reason: RejectReason::NotOwner,
             }]
         );
@@ -1664,6 +1730,7 @@ mod tests {
             events,
             vec![Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::DuplicateOrderId,
             }]
         );
@@ -1711,6 +1778,7 @@ mod tests {
             vec![Event::Expired {
                 instrument: TESTE_BRL,
                 order: OrderId::new(2),
+                account: ALICE,
                 lots: lots(5),
             }]
         );
@@ -1729,6 +1797,7 @@ mod tests {
             vec![Event::Rested {
                 instrument: TESTE_BRL,
                 order: OrderId::new(1),
+                account: ALICE,
                 side: Side::Bid,
                 price: Price::new(100).expect("preço de teste válido"),
                 lots: lots(5),
@@ -1749,6 +1818,7 @@ mod tests {
             vec![Event::Rested {
                 instrument: TESTE_BRL,
                 order: OrderId::new(1),
+                account: ALICE,
                 side: Side::Ask,
                 price: Price::new(120).expect("preço de teste válido"),
                 lots: lots(4),
@@ -1775,10 +1845,13 @@ mod tests {
                         lots: lots(2),
                     },
                     fee: Amount::ZERO,
+                    taker_account: ALICE,
+                    maker_account: ALICE,
                 },
                 Event::Rested {
                     instrument: TESTE_BRL,
                     order: OrderId::new(2),
+                    account: ALICE,
                     side: Side::Bid,
                     price: Price::new(100).expect("preço de teste válido"),
                     lots: lots(3),
@@ -1930,6 +2003,7 @@ mod tests {
             submit(&mut engine, stop(ALICE, 3, Side::Bid, 100, None, 1)),
             [Event::Rejected {
                 order: OrderId::new(3),
+                account: ALICE,
                 reason: reached
             }]
         );
@@ -1937,6 +2011,7 @@ mod tests {
             submit(&mut engine, stop(ALICE, 4, Side::Ask, 100, None, 1)),
             [Event::Rejected {
                 order: OrderId::new(4),
+                account: ALICE,
                 reason: reached
             }]
         );
@@ -1967,6 +2042,7 @@ mod tests {
             engine.apply(cancel(BOB)),
             [Event::Rejected {
                 order: OrderId::new(1),
+                account: BOB,
                 reason: RejectReason::NotOwner
             }]
         );
@@ -2070,6 +2146,7 @@ mod tests {
             submit(&mut engine, stop(ALICE, 1, Side::Bid, 103, None, 1)),
             [Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: off_tick(103)
             }]
         );
@@ -2077,6 +2154,7 @@ mod tests {
             submit(&mut engine, stop(ALICE, 2, Side::Bid, 105, Some(108), 1)),
             [Event::Rejected {
                 order: OrderId::new(2),
+                account: ALICE,
                 reason: off_tick(108)
             }]
         );
@@ -2091,6 +2169,7 @@ mod tests {
             submit(&mut engine, order_for(ALICE, 1, Side::Bid, 100, 1)),
             [Event::Rejected {
                 order: OrderId::new(1),
+                account: ALICE,
                 reason: RejectReason::DuplicateOrderId
             }]
         );
@@ -2112,5 +2191,20 @@ mod tests {
         let events = submit(&mut engine, order_for(ALICE, 3, Side::Bid, 100, 1));
 
         assert_eq!(trace(&events), ["fill #3 @100 x1"]);
+    }
+
+    #[test]
+    fn fill_concerns_both_accounts_and_a_self_trade_only_once() {
+        let mut engine = engine(&[TESTE_BRL]);
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 2));
+        submit(&mut engine, order_for(ALICE, 2, Side::Ask, 100, 1));
+
+        let events = submit(&mut engine, order_for(ALICE, 3, Side::Bid, 100, 3));
+
+        let accounts: Vec<Vec<AccountId>> = events
+            .iter()
+            .map(|event| event.accounts().collect())
+            .collect();
+        assert_eq!(accounts, [vec![ALICE, BOB], vec![ALICE]]);
     }
 }

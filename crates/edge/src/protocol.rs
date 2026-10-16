@@ -545,6 +545,7 @@ impl From<&Event> for ServerMessage {
                 instrument,
                 fill,
                 fee,
+                ..
             } => Self::Fill {
                 instrument: symbol(instrument).to_string(),
                 taker: fill.taker,
@@ -567,6 +568,7 @@ impl From<&Event> for ServerMessage {
                 instrument,
                 order,
                 lots,
+                ..
             } => Self::Cancelled {
                 instrument: symbol(instrument).to_string(),
                 order,
@@ -576,12 +578,13 @@ impl From<&Event> for ServerMessage {
                 instrument,
                 order,
                 lots,
+                ..
             } => Self::Expired {
                 instrument: symbol(instrument).to_string(),
                 order,
                 lots,
             },
-            Event::Rejected { order, reason } => Self::Rejected {
+            Event::Rejected { order, reason, .. } => Self::Rejected {
                 order,
                 code: reject_code(&reason).to_string(),
                 message: reject_message(&reason),
@@ -592,6 +595,7 @@ impl From<&Event> for ServerMessage {
                 side,
                 trigger,
                 lots,
+                ..
             } => Self::Armed {
                 instrument: symbol(instrument).to_string(),
                 order,
@@ -599,7 +603,9 @@ impl From<&Event> for ServerMessage {
                 trigger,
                 lots,
             },
-            Event::Triggered { instrument, order } => Self::Triggered {
+            Event::Triggered {
+                instrument, order, ..
+            } => Self::Triggered {
                 instrument: symbol(instrument).to_string(),
                 order,
             },
@@ -979,7 +985,9 @@ mod tests {
                     price: price(10_000),
                     lots: lots(3)
                 },
-                fee: amount(30)
+                fee: amount(30),
+                taker_account: ACCOUNT,
+                maker_account: AccountId::new(2)
             }),
             "{\"type\":\"fill\",\"instrument\":\"TESTE/BRL\",\"taker\":2,\"maker\":1,\"lots\":3,\"price\":10000,\"fee\":30}\n"
         );
@@ -987,6 +995,7 @@ mod tests {
             line(&Event::Rested {
                 instrument: TESTE_BRL,
                 order: OrderId::new(1),
+                account: ACCOUNT,
                 side: CoreSide::Bid,
                 price: price(10_000),
                 lots: lots(5)
@@ -997,6 +1006,7 @@ mod tests {
             line(&Event::Cancelled {
                 instrument: TESTE_BRL,
                 order: OrderId::new(2),
+                account: ACCOUNT,
                 lots: lots(2)
             }),
             "{\"type\":\"cancelled\",\"instrument\":\"TESTE/BRL\",\"order\":2,\"lots\":2}\n"
@@ -1005,6 +1015,7 @@ mod tests {
             line(&Event::Expired {
                 instrument: TESTE_BRL,
                 order: OrderId::new(4),
+                account: ACCOUNT,
                 lots: lots(5)
             }),
             "{\"type\":\"expired\",\"instrument\":\"TESTE/BRL\",\"order\":4,\"lots\":5}\n"
@@ -1015,6 +1026,7 @@ mod tests {
     fn rejection_carries_a_stable_code_and_a_human_message() {
         let event = Event::Rejected {
             order: OrderId::new(4),
+            account: ACCOUNT,
             reason: RejectReason::InsufficientFunds {
                 asset: AssetId::new(2),
                 available: amount(0),

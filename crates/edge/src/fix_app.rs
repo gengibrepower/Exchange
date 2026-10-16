@@ -297,7 +297,7 @@ impl FixOrders {
             return Vec::new();
         };
         if let Some(reason) = events.iter().find_map(|event| match event {
-            Event::Rejected { order, reason } if *order == id => Some(reason),
+            Event::Rejected { order, reason, .. } if *order == id => Some(reason),
             _ => None,
         }) {
             let code = ord_rej_reason(reason);
@@ -362,7 +362,7 @@ impl FixOrders {
                     };
                     return vec![self.execution(id, &cancelled)];
                 }
-                Event::Rejected { order, reason } if *order == id => {
+                Event::Rejected { order, reason, .. } if *order == id => {
                     let reason = match reason {
                         RejectReason::UnknownOrder => CancelReason::TooLate,
                         _ => CancelReason::Other,
