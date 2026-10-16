@@ -15,15 +15,25 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::market_data::{Feed, MarketData, Snapshot, Update};
 use crate::sequencer::{Intent, Sequencer, SequencerError};
 
+/// Quantos pedidos o núcleo tira da fila por rodada. Limita o lote e, com ele, quanto o
+/// último pedido espera pelo `fsync` dos que vieram antes.
+const MAX_BATCH: usize = 256;
+
 /// Um pedido com o endereço de volta: o núcleo responde pelo `oneshot` e nunca espera
 /// ninguém para isso.
 enum Request {
-    Submit {
-        intent: Intent,
-        reply: oneshot::Sender<Vec<Event>>,
-    },
+    Submit(Submission),
     /// Consulta não vai para o log, mas passa pela mesma fila para ver o estado numa
     /// posição bem definida: depois de tudo que entrou antes dela.
+    Query(Query),
+}
+
+struct Submission {
+    intent: Intent,
+    reply: oneshot::Sender<Vec<Event>>,
+}
+
+enum Query {
     Balance {
         account: AccountId,
         asset: AssetId,
@@ -69,7 +79,7 @@ impl CoreHandle {
     pub async fn submit(&self, intent: Intent) -> Result<Vec<Event>, CoreError> {
         let (reply, response) = oneshot::channel();
         self.requests
-            .send(Request::Submit { intent, reply })
+            .send(Request::Submit(Submission { intent, reply }))
             .await
             .map_err(|_| CoreError::Stopped)?;
         response.await.map_err(|_| CoreError::Stopped)
@@ -80,11 +90,11 @@ impl CoreHandle {
     pub async fn balance(&self, account: AccountId, asset: AssetId) -> Result<Balance, CoreError> {
         let (reply, response) = oneshot::channel();
         self.requests
-            .send(Request::Balance {
+            .send(Request::Query(Query::Balance {
                 account,
                 asset,
                 reply,
-            })
+            }))
             .await
             .map_err(|_| CoreError::Stopped)?;
         response.await.map_err(|_| CoreError::Stopped)
@@ -111,11 +121,11 @@ impl CoreHandle {
     ) -> Result<Option<Snapshot>, CoreError> {
         let (reply, response) = oneshot::channel();
         self.requests
-            .send(Request::Snapshot {
+            .send(Request::Query(Query::Snapshot {
                 instrument,
                 feed,
                 reply,
-            })
+            }))
             .await
             .map_err(|_| CoreError::Stopped)?;
         response.await.map_err(|_| CoreError::Stopped)
@@ -146,45 +156,92 @@ pub fn spawn_core(
     Ok((CoreHandle { requests, updates }, thread))
 }
 
-/// O laço do single writer: um pedido por vez, na ordem da fila. O feed é alimentado no
-/// mesmo laço, com os mesmos eventos, logo depois de cada comando: núcleo e feed nunca
-/// divergem.
+/// O laço do single writer. A cada rodada tira da fila o que já chegou (até
+/// [`MAX_BATCH`]) e o processa na ordem da fila: submissões seguidas viram um lote com um
+/// único `fsync` (group commit, decisão 5); cada consulta fecha o lote anterior, para ver o
+/// estado depois de tudo que entrou antes dela e de nada que entrou depois.
+///
+/// O feed é alimentado no mesmo laço, com os mesmos eventos, logo depois de cada comando:
+/// núcleo e feed nunca divergem.
 fn run_core(
     mut sequencer: Sequencer,
     mut market_data: MarketData,
     mut requests: mpsc::Receiver<Request>,
     updates: &broadcast::Sender<Update>,
 ) -> Result<Sequencer, SequencerError> {
-    while let Some(request) = requests.blocking_recv() {
-        match request {
-            Request::Submit { intent, reply } => {
-                let events = sequencer.submit(intent)?;
-                for update in market_data.apply(&events) {
-                    // Sem assinante, o send falha; com assinante atrasado, ele perde
-                    // mensagens. Em nenhum caso o núcleo espera.
-                    let _ = updates.send(update);
+    while let Some(round) = next_round(&mut requests) {
+        for step in steps(round) {
+            match step {
+                Step::Batch(batch) => {
+                    let intents: Vec<Intent> = batch.iter().map(|pending| pending.intent).collect();
+                    let results = sequencer.submit_batch(&intents)?;
+                    for (pending, events) in batch.into_iter().zip(results) {
+                        for update in market_data.apply(&events) {
+                            // Sem assinante, o send falha; com assinante atrasado, ele perde
+                            // mensagens. Em nenhum caso o núcleo espera.
+                            let _ = updates.send(update);
+                        }
+                        // Cliente que já foi embora: o comando aconteceu (está no log e
+                        // aplicado), só a resposta não tem para onde ir.
+                        let _ = pending.reply.send(events);
+                    }
                 }
-                // Cliente que já foi embora: o comando aconteceu (está no log e aplicado),
-                // só a resposta não tem para onde ir. O núcleo não espera ninguém.
-                let _ = reply.send(events);
-            }
-            Request::Balance {
-                account,
-                asset,
-                reply,
-            } => {
-                let _ = reply.send(sequencer.balance(account, asset));
-            }
-            Request::Snapshot {
-                instrument,
-                feed,
-                reply,
-            } => {
-                let _ = reply.send(market_data.snapshot(instrument, feed));
+                Step::Query(query) => answer(&sequencer, &market_data, query),
             }
         }
     }
     Ok(sequencer)
+}
+
+/// Espera o primeiro pedido e junta, sem esperar, os que já estão na fila. `None` quando
+/// todos os [`CoreHandle`] sumiram e a fila esvaziou.
+fn next_round(requests: &mut mpsc::Receiver<Request>) -> Option<Vec<Request>> {
+    let mut round = vec![requests.blocking_recv()?];
+    while round.len() < MAX_BATCH {
+        match requests.try_recv() {
+            Ok(request) => round.push(request),
+            Err(_) => break,
+        }
+    }
+    Some(round)
+}
+
+enum Step {
+    Batch(Vec<Submission>),
+    Query(Query),
+}
+
+/// Agrupa as submissões seguidas em lotes, mantendo a ordem; cada consulta fica sozinha
+/// entre o lote de antes e o de depois.
+fn steps(round: Vec<Request>) -> Vec<Step> {
+    let mut steps = Vec::new();
+    for request in round {
+        match (request, steps.last_mut()) {
+            (Request::Submit(pending), Some(Step::Batch(batch))) => batch.push(pending),
+            (Request::Submit(pending), _) => steps.push(Step::Batch(vec![pending])),
+            (Request::Query(query), _) => steps.push(Step::Query(query)),
+        }
+    }
+    steps
+}
+
+fn answer(sequencer: &Sequencer, market_data: &MarketData, query: Query) {
+    match query {
+        Query::Balance {
+            account,
+            asset,
+            reply,
+        } => {
+            let _ = reply.send(sequencer.balance(account, asset));
+        }
+        Query::Snapshot {
+            instrument,
+            feed,
+            reply,
+        } => {
+            let _ = reply.send(market_data.snapshot(instrument, feed));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -348,10 +405,10 @@ mod tests {
 
         handle
             .requests
-            .send(Request::Submit {
+            .send(Request::Submit(Submission {
                 intent: fund(ALICE, BRL, 500),
                 reply,
-            })
+            }))
             .await
             .unwrap();
 
@@ -545,5 +602,97 @@ mod tests {
             Ok(None)
         );
         shut_down(handle, thread);
+    }
+
+    fn submission(intent: Intent) -> (Request, oneshot::Receiver<Vec<Event>>) {
+        let (reply, response) = oneshot::channel();
+        (Request::Submit(Submission { intent, reply }), response)
+    }
+
+    fn balance_query(account: AccountId, asset: AssetId) -> (Request, oneshot::Receiver<Balance>) {
+        let (reply, response) = oneshot::channel();
+        let query = Query::Balance {
+            account,
+            asset,
+            reply,
+        };
+        (Request::Query(query), response)
+    }
+
+    /// O tamanho de cada lote, com `0` no lugar de cada consulta.
+    fn shape(steps: &[Step]) -> Vec<usize> {
+        steps
+            .iter()
+            .map(|step| match step {
+                Step::Batch(batch) => batch.len(),
+                Step::Query(_) => 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queries_split_the_round_into_batches_in_order() {
+        let submit = || submission(fund(ALICE, BRL, 1)).0;
+        let query = || balance_query(ALICE, BRL).0;
+
+        assert_eq!(shape(&steps(vec![])), Vec::<usize>::new());
+        assert_eq!(shape(&steps(vec![submit(), submit(), submit()])), [3]);
+        assert_eq!(shape(&steps(vec![query(), query()])), [0, 0]);
+        assert_eq!(
+            shape(&steps(vec![submit(), submit(), query(), submit()])),
+            [2, 0, 1]
+        );
+        assert_eq!(shape(&steps(vec![query(), submit(), query()])), [0, 1, 0]);
+    }
+
+    #[test]
+    fn round_takes_at_most_max_batch_requests() {
+        let extra = 10;
+        let (sender, mut receiver) = mpsc::channel(MAX_BATCH + extra);
+        for _ in 0..MAX_BATCH + extra {
+            assert!(sender.try_send(submission(fund(ALICE, BRL, 1)).0).is_ok());
+        }
+        drop(sender);
+
+        assert_eq!(
+            next_round(&mut receiver).map(|round| round.len()),
+            Some(MAX_BATCH)
+        );
+        assert_eq!(
+            next_round(&mut receiver).map(|round| round.len()),
+            Some(extra)
+        );
+        assert!(next_round(&mut receiver).is_none());
+    }
+
+    // Tudo já está na fila quando o núcleo começa, então sai numa rodada só: a consulta do
+    // meio precisa ver o primeiro depósito e não o segundo, mesmo com os dois no mesmo
+    // `next_round`.
+    #[test]
+    fn query_inside_a_round_sees_exactly_what_came_before_it() {
+        let (sender, receiver) = mpsc::channel(8);
+        let (first, first_reply) = submission(fund(ALICE, BRL, 100));
+        let (between, between_reply) = balance_query(ALICE, BRL);
+        let (second, second_reply) = submission(fund(ALICE, BRL, 50));
+        let (after, after_reply) = balance_query(ALICE, BRL);
+        for request in [first, between, second, after] {
+            assert!(sender.try_send(request).is_ok());
+        }
+        drop(sender);
+        let (updates, _) = broadcast::channel(16);
+
+        run_core(
+            Sequencer::in_memory(),
+            new_market_data(),
+            receiver,
+            &updates,
+        )
+        .unwrap();
+
+        let available = |mut reply: oneshot::Receiver<Balance>| reply.try_recv().unwrap().available;
+        assert_eq!(available(between_reply), Amount::new(100).unwrap());
+        assert_eq!(available(after_reply), Amount::new(150).unwrap());
+        assert!(first_reply.blocking_recv().is_ok());
+        assert!(second_reply.blocking_recv().is_ok());
     }
 }
