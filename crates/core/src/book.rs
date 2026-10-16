@@ -163,7 +163,8 @@ impl OrderBook {
                         lots: remaining,
                     }
                 }
-                (TimeInForce::Ioc, _) | (TimeInForce::Gtc, OrderKind::Market { .. }) => {
+                (TimeInForce::Ioc, _)
+                | (TimeInForce::Gtc, OrderKind::Market { .. } | OrderKind::Stop { .. }) => {
                     taker
                         .transition(OrderStatus::Cancelled)
                         .expect("sobra aceita ou parcial pode ser cancelada");

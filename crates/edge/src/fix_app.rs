@@ -444,9 +444,10 @@ fn new_order_id(event: &Event) -> Option<OrderId> {
         Event::Rejected { order, .. }
         | Event::Rested { order, .. }
         | Event::Expired { order, .. }
-        | Event::Cancelled { order, .. } => Some(order),
+        | Event::Cancelled { order, .. }
+        | Event::Armed { order, .. } => Some(order),
         Event::Fill { fill, .. } => Some(fill.taker),
-        Event::Deposited { .. } | Event::DepositRejected { .. } => None,
+        Event::Deposited { .. } | Event::DepositRejected { .. } | Event::Triggered { .. } => None,
     }
 }
 

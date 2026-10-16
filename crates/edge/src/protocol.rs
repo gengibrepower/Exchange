@@ -314,6 +314,19 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
+    /// Stop aceito, dormente até o último negócio chegar ao gatilho.
+    Armed {
+        instrument: String,
+        order: OrderId,
+        side: Side,
+        trigger: Price,
+        lots: Lots,
+    },
+    /// O stop disparou; os eventos dele como ordem comum vêm em seguida.
+    Triggered {
+        instrument: String,
+        order: OrderId,
+    },
     Balances {
         balances: Vec<AssetBalance>,
     },
@@ -545,6 +558,23 @@ impl From<&Event> for ServerMessage {
                 code: reject_code(&reason).to_string(),
                 message: reject_message(&reason),
             },
+            Event::Armed {
+                instrument,
+                order,
+                side,
+                trigger,
+                lots,
+            } => Self::Armed {
+                instrument: symbol(instrument).to_string(),
+                order,
+                side: side.into(),
+                trigger,
+                lots,
+            },
+            Event::Triggered { instrument, order } => Self::Triggered {
+                instrument: symbol(instrument).to_string(),
+                order,
+            },
         }
     }
 }
@@ -563,6 +593,7 @@ pub fn reject_code(reason: &RejectReason) -> &'static str {
         RejectReason::InsufficientFunds { .. } => "insufficient_funds",
         RejectReason::UnknownOrder => "unknown_order",
         RejectReason::NotOwner => "not_owner",
+        RejectReason::StopAlreadyTriggered { .. } => "stop_already_triggered",
     }
 }
 
@@ -599,6 +630,11 @@ pub fn reject_message(reason: &RejectReason) -> String {
         RejectReason::HouseCannotTrade => "a conta da casa não negocia".to_string(),
         RejectReason::UnknownOrder => "ordem não está no livro".to_string(),
         RejectReason::NotOwner => "ordem pertence a outra conta".to_string(),
+        RejectReason::StopAlreadyTriggered { trigger, last } => format!(
+            "gatilho {} já alcançado pelo último negócio ({})",
+            trigger.get(),
+            last.get()
+        ),
     }
 }
 

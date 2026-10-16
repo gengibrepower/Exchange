@@ -17,6 +17,8 @@ fn kind() -> impl Strategy<Value = OrderKind> {
     prop_oneof![
         price().prop_map(OrderKind::Limit),
         proptest::option::of(price()).prop_map(|protection| OrderKind::Market { protection }),
+        (price(), proptest::option::of(price()))
+            .prop_map(|(trigger, limit)| OrderKind::Stop { trigger, limit }),
     ]
 }
 

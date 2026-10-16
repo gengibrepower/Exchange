@@ -390,6 +390,14 @@ pub enum OrderKind {
     Market {
         protection: Option<Price>,
     },
+    /// Dormente fora do livro até o último negócio do instrumento chegar a `trigger` (na
+    /// compra, `último >= trigger`; na venda, `último <= trigger`); aí entra como ordem
+    /// limite em `limit` ou, sem ele, a mercado. Variante nova no fim do enum: o postcard
+    /// grava o índice da variante, então logs antigos continuam legíveis.
+    Stop {
+        trigger: Price,
+        limit: Option<Price>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -507,29 +515,84 @@ impl Order {
         self.kind
     }
 
-    /// Preço em que a ordem descansaria: só ordem limite tem.
+    /// Preço em que a ordem descansaria: só ordem limite tem. Um stop, enquanto dorme,
+    /// não descansa em preço nenhum.
     pub fn limit_price(&self) -> Option<Price> {
         match self.kind {
             OrderKind::Limit(price) => Some(price),
-            OrderKind::Market { .. } => None,
+            OrderKind::Market { .. } | OrderKind::Stop { .. } => None,
         }
     }
 
+    /// Os preços que o cliente escreveu e que precisam cair no tick: o limite, ou o
+    /// gatilho e o limite de um stop. A proteção de ordem a mercado é trava, não preço.
+    pub fn quoted_prices(&self) -> [Option<Price>; 2] {
+        match self.kind {
+            OrderKind::Limit(price) => [Some(price), None],
+            OrderKind::Market { .. } => [None, None],
+            OrderKind::Stop { trigger, limit } => [Some(trigger), limit],
+        }
+    }
+
+    /// O gatilho, se a ordem for um stop.
+    pub fn trigger(&self) -> Option<Price> {
+        match self.kind {
+            OrderKind::Stop { trigger, .. } => Some(trigger),
+            OrderKind::Limit(_) | OrderKind::Market { .. } => None,
+        }
+    }
+
+    /// O stop acordado: vira ordem limite no seu limite ou a mercado sem proteção (o
+    /// núcleo dá a proteção do colar na hora, como a qualquer ordem que chega). Mantém id,
+    /// restante, status e seq. Qualquer outra ordem volta inalterada.
+    #[must_use]
+    pub(crate) fn triggered(mut self) -> Self {
+        if let OrderKind::Stop { limit, .. } = self.kind {
+            self.kind = match limit {
+                Some(price) => OrderKind::Limit(price),
+                None => OrderKind::Market { protection: None },
+            };
+        }
+        self
+    }
+
+    /// Aperta a proteção de uma ordem a mercado para no máximo `cap` na compra (no mínimo,
+    /// na venda). É o que mantém um stop disparado dentro da reserva feita na entrada.
+    #[must_use]
+    pub(crate) fn with_protection_within(mut self, cap: Price) -> Self {
+        if let OrderKind::Market {
+            protection: Some(bound),
+        } = self.kind
+        {
+            let tighter = match self.side {
+                Side::Bid => bound.min(cap),
+                Side::Ask => bound.max(cap),
+            };
+            self.kind = OrderKind::Market {
+                protection: Some(tighter),
+            };
+        }
+        self
+    }
+
     /// Pior preço que a ordem aceita: o limite, ou a proteção de uma ordem a mercado.
+    /// Um stop dormente ainda não aceita preço nenhum.
     pub fn price_bound(&self) -> Option<Price> {
         match self.kind {
             OrderKind::Limit(bound)
             | OrderKind::Market {
                 protection: Some(bound),
             } => Some(bound),
-            OrderKind::Market { protection: None } => None,
+            OrderKind::Market { protection: None } | OrderKind::Stop { .. } => None,
         }
     }
 
-    /// Esta ordem, como taker, cruza com um maker parado em `maker_price`?
+    /// Esta ordem, como taker, cruza com um maker parado em `maker_price`? Um stop
+    /// dormente não cruza nada: só depois de disparado ele vira taker.
     pub fn crosses(&self, maker_price: Price) -> bool {
         match (self.side, self.kind) {
             (_, OrderKind::Market { protection: None }) => true,
+            (_, OrderKind::Stop { .. }) => false,
             (
                 Side::Bid,
                 OrderKind::Limit(bound)
