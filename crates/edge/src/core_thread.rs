@@ -727,7 +727,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_sessions_are_all_answered_and_the_log_replays_to_the_same_state() {
         let path = TempPath::new("concurrent");
-        let (sequencer, _) = Sequencer::open(&path.0).unwrap();
+        let (sequencer, _) = Sequencer::open(&path.0, None).unwrap();
         let (handle, thread) = spawn_core(
             sequencer,
             new_market_data(),
@@ -746,7 +746,7 @@ mod tests {
         }
         let live = shut_down(handle, thread);
 
-        let (replayed, report) = Sequencer::open(&path.0).unwrap();
+        let (replayed, report) = Sequencer::open(&path.0, None).unwrap();
         assert_eq!(answered, 8 * 42);
         assert_eq!(report.replayed, answered);
         assert_eq!(replayed.engine(), live.engine());

@@ -1,7 +1,9 @@
 use exchange_core::domain::{
     AccountId, Amount, AssetId, Bps, Instrument, InstrumentId, Lots, Price,
 };
-use exchange_core::engine::{Engine, FeeSchedule, ListingConfig, RiskLimits};
+use exchange_core::engine::{
+    Engine, EngineState, FeeSchedule, ListingConfig, RestoreError, RiskLimits,
+};
 
 use crate::market_data::MarketData;
 
@@ -46,20 +48,36 @@ fn listing(
     ListingConfig { instrument, risk }
 }
 
+// Taxa de taker de 10 bps (0,1%) para a casa: pequena, mas exercita o caminho (decisão 7).
+fn fees() -> FeeSchedule {
+    FeeSchedule {
+        house: HOUSE,
+        taker_bps: Bps::new(10).expect("10 bps é menos que 100%"),
+    }
+}
+
 /// # Panics
 /// Nunca: a configuração é fixa e válida, e os `expect` só registram isso.
 pub fn new_engine() -> Engine {
-    // Taxa de taker de 10 bps (0,1%) para a casa: pequena, mas exercita o caminho (decisão 7).
-    let fees = FeeSchedule {
-        house: HOUSE,
-        taker_bps: Bps::new(10).expect("10 bps é menos que 100%"),
-    };
-    Engine::new(listings(), fees).expect("instrumentos fixos não se repetem")
+    Engine::new(listings(), fees()).expect("instrumentos fixos não se repetem")
+}
+
+/// O engine de um snapshot sobre a configuração de agora (decisão 6).
+///
+/// # Errors
+/// [`RestoreError`] se o estado não for válido nesta configuração.
+pub fn restore_engine(state: &EngineState) -> Result<Engine, RestoreError> {
+    Engine::restore(listings(), fees(), state)
 }
 
 /// O feed de market data com todos os instrumentos do mercado registrados, vazios.
 pub fn new_market_data() -> MarketData {
     MarketData::new(INSTRUMENTS.iter().map(|&(_, instrument)| instrument))
+}
+
+/// O feed de todos os instrumentos do mercado com os livros de `state`.
+pub fn restore_market_data(state: &EngineState) -> MarketData {
+    MarketData::restore(INSTRUMENTS.iter().map(|&(_, instrument)| instrument), state)
 }
 
 pub fn asset_id(name: &str) -> Option<AssetId> {
