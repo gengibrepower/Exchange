@@ -29,7 +29,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Em andamento: F7** — endurecimento: benchmark do matching feito; faltam benchmark do WAL, snapshots, stop orders e múltiplos instrumentos.
+- **Em andamento: F7** — endurecimento: benchmarks do matching e do WAL feitos; faltam group commit no WAL, snapshots, stop orders e múltiplos instrumentos.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -197,6 +197,32 @@ Numa AMD Ryzen 5 PRO 5650U, perfil `bench`:
 | `with_cancels` | 2,14 M comandos/s | 251 ns | 2,26 µs | 3,67 µs | 230 µs |
 
 A referência da seção 12 do escopo é mais de 100 mil ordens/s numa thread. O máximo, na casa dos milissegundos, é uma amostra isolada; o p99.9 mostra que a cauda fica em poucos microssegundos.
+
+### WAL
+
+```
+cargo bench -p exchange-wal
+```
+
+Mede o custo de um registro durável com payload do tamanho de um comando real (21 bytes). Os arquivos ficam em `target/tmp`, no disco: num `tmpfs` o `fsync` não faz nada e o número seria falso.
+
+- `append`: o `Wal::append` de hoje, um `fsync` por registro.
+- `no_fsync`: o mesmo frame sem `fsync`. Só para comparação, nunca uma opção: sem ele o registro não sobrevive a queda de energia.
+- `batch/{1,8,64}`: N frames num `write` e um `fsync`, simulando group commit.
+- `latency`: p50/p99/p99.9/máx de 5 mil `append`.
+
+Num NVMe SK Hynix com btrfs, em várias rodadas (o `fsync` oscila bastante de uma rodada para outra):
+
+| Cenário | Por registro | Registros/s |
+|---|---|---|
+| `append` | 2–4 ms | 250–450 |
+| `no_fsync` | 6–7 µs | ~150 mil |
+| `batch/8` | 0,3–0,6 ms | 1,8–3,5 mil |
+| `batch/64` | 25–75 µs | 14–41 mil |
+
+Latência do `append`: p50 de 0,7 a 4,4 ms, p99 em torno de 5 ms, máximo de dezenas de ms.
+
+O `fsync` é praticamente todo o custo, e um lote o divide pelo número de registros. Com um `fsync` por comando, o servidor com `--wal` fica em centenas de comandos/s, enquanto o núcleo faz milhões: é o caso que a decisão 5 previa para adotar group commit.
 
 ## Licença
 

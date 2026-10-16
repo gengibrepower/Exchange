@@ -7,7 +7,16 @@ edition = "2024"
 crc32fast = "1"
 
 [dev-dependencies]
+criterion = "0.8"
 proptest = "1"
+
+[[bench]]
+name = "append"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false
 
 [lints]
 workspace = true
