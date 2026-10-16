@@ -29,8 +29,8 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Em andamento: F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento, stop orders e relatórios privados feitos; faltam snapshots.
-- **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
+- **F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento, stop orders, relatórios privados e snapshots que encurtam o boot: concluída.
+- **Próxima: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
 
@@ -105,13 +105,42 @@ fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20
 
 Cada registro é `[tamanho u32][crc32 u32][comando em postcard]`, com o crc cobrindo tamanho e comando. Um registro cortado por crash é descartado no boot. Um registro íntegro mas inválido interrompe o boot com erro, em vez de seguir com um estado que não corresponde ao log. Sem `--wal`, tudo fica só em memória.
 
+#### Snapshots
+
+Com `--snapshot-every <n>` (só junto com `--wal`), o estado inteiro é gravado em `<wal>.snapshot` a cada `n` comandos e também no boot, se algo foi reaplicado. No boot seguinte, o estado sai do snapshot e só os comandos depois dele são reaplicados:
+
+```
+$ cargo run -p edge -- --wal exchange.wal --snapshot-every 2
+log: 0 comandos reaplicados, 0 bytes descartados
+deposit BRL 100000000
+depósito: 100000000 BRL
+deposit TESTE 100000
+depósito: 100000 TESTE
+sell TESTE/BRL 10000 5
+#1 descansou: 5 lots em TESTE/BRL
+quit
+
+$ cargo run -p edge -- --wal exchange.wal
+log: 1 comandos reaplicados, 0 bytes descartados
+snapshot: carregado, cobre 2 comandos
+buy TESTE/BRL 10000 2
+fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20
+```
+
+O snapshot é só um atalho: o log continua inteiro e é ele a verdade. O snapshot guarda o que não dá para reconstruir — ordens abertas na ordem da fila, stops dormentes, último negócio, saldos e os contadores de `seq` e de id de ordem —, e o resto (índices, reservas, oferta de cada ativo, livro do feed) é recalculado na carga. A carga confere as invariantes da seção 3.5 do escopo antes de aceitar o estado.
+
+- A gravação é atômica: vai para um temporário, que é sincronizado e renomeado por cima do anterior, e o diretório é sincronizado em seguida. Um crash em qualquer ponto deixa o snapshot antigo ou o novo inteiro. O arquivo é `[EXSNAP01][tamanho][crc32][payload]`.
+- Snapshot ausente, danificado ou recusado pela configuração atual: o boot avisa e reaplica o log inteiro. Snapshot que cobre mais comandos do que o log tem interrompe o boot, porque aí não há como saber qual dos dois é a verdade.
+- Falha ao gravar um snapshot só gera um aviso: o log está íntegro, e o atalho volta na próxima tentativa.
+- As sequências do feed recomeçam do zero em todo boot: as conexões caíram, e todo assinante começa por um snapshot do feed.
+
 ## Servidor
 
 ```
-cargo run -p edge --bin server -- [--listen <endereço:porta>] [--fix <endereço:porta>] [--wal <caminho>]
+cargo run -p edge --bin server -- [--listen <endereço:porta>] [--fix <endereço:porta>] [--wal <caminho> [--snapshot-every <n>]]
 ```
 
-Escuta JSON em `127.0.0.1:7000` e FIX em `127.0.0.1:7001` por padrão — só a própria máquina; para expor na rede, passe `--listen` explicitamente. Com `--wal`, persiste e retoma como o CLI. Cada linha enviada é uma mensagem JSON; cada resposta também. Qualquer cliente TCP serve, como `socat` ou `nc`:
+Escuta JSON em `127.0.0.1:7000` e FIX em `127.0.0.1:7001` por padrão — só a própria máquina; para expor na rede, passe `--listen` explicitamente. Com `--wal` e `--snapshot-every`, persiste e retoma como o CLI. Cada linha enviada é uma mensagem JSON; cada resposta também. Qualquer cliente TCP serve, como `socat` ou `nc`:
 
 ```
 $ socat - TCP:127.0.0.1:7000
@@ -261,6 +290,28 @@ Com uma sessão, a fila nunca tem mais de um pedido e cada comando paga um `fsyn
 | 64 | 450–660 mil cmd/s | 7–21 mil cmd/s |
 
 Com 64 sessões, o WAL atende de 10 a 30 vezes mais comandos por segundo que com uma, e cada cliente continua esperando mais ou menos um `fsync` por comando. A coluna de memória é o teto sem disco: o custo dos canais e da troca de thread. Por ela, uma sessão sozinha passa uns 15–20 µs só indo e voltando do núcleo.
+
+### Boot com snapshot
+
+```
+cargo bench -p edge --bench boot
+```
+
+Monta um log com um fluxo determinístico de 16 contas negociando TESTE/BRL — ordens limite dos dois lados, um quinto delas cruzando o spread, 10% de cancelamentos — e mede o boot de três jeitos: replay completo, snapshot cobrindo o log todo e snapshot com 1% do log depois dele. Mede também as duas metades de gravar um snapshot: montar o estado em bytes e gravar o arquivo com os `fsync`. Cada caso roda 5 vezes, com o log já no cache de páginas, e fica a mediana.
+
+Na mesma máquina e no mesmo NVMe:
+
+| Log | Ordens abertas no fim | Log / snapshot | Replay completo | Snapshot | Snapshot + 1% | Só ler o log |
+|---|---|---|---|---|---|---|
+| 100 mil comandos | 51 mil | 2,7 MB / 0,8 MB | 67 ms | 28 ms | 27–33 ms | 6 ms |
+| 1 milhão de comandos | 510 mil | 28 MB / 8,1 MB | 1,33 s | 370 ms | 390 ms | 83 ms |
+
+Com 1 milhão de comandos, o boot fica 3,5 vezes mais rápido. O que sobra tem duas partes:
+
+- **Ler o log inteiro** (~83 ms): o WAL confere o crc de todo quadro, inclusive dos que o snapshot cobre. Cortar o log depois do snapshot tiraria esse custo, mas mudaria a decisão 6, que guarda o log inteiro; fica para quando o tamanho do log pedir.
+- **Carregar o snapshot** (~280 ms, cerca de 0,55 µs por ordem aberta): decodificar o estado, validar cada ordem e reconstruir livro, índices e reservas. Cresce com o livro, não com o log: um log de 10 milhões de comandos com o mesmo livro custaria o mesmo.
+
+Gravar um snapshot desse tamanho custa uns 25 ms para montar o estado e 15 ms para gravar o arquivo, na thread do núcleo: é o pico de latência que aparece a cada `--snapshot-every` comandos.
 
 ## Licença
 

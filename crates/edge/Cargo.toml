@@ -18,5 +18,9 @@ proptest = "1"
 name = "group_commit"
 harness = false
 
+[[bench]]
+name = "boot"
+harness = false
+
 [lints]
 workspace = true
