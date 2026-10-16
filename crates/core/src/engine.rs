@@ -9,6 +9,10 @@ use crate::domain::{
 };
 use crate::ledger::{Balance, Ledger, LedgerError, Transfer};
 
+mod stops;
+
+use stops::StopBook;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Command {
     Deposit {
@@ -64,6 +68,20 @@ pub enum Event {
         order: OrderId,
         reason: RejectReason,
     },
+    /// Stop aceito e dormente: reserva feita, fora do livro e do feed.
+    Armed {
+        instrument: InstrumentId,
+        order: OrderId,
+        side: Side,
+        trigger: Price,
+        lots: Lots,
+    },
+    /// O último negócio chegou ao gatilho: o stop entra agora como ordem limite ou a
+    /// mercado, e os eventos dele vêm logo depois deste.
+    Triggered {
+        instrument: InstrumentId,
+        order: OrderId,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +111,12 @@ pub enum RejectReason {
     },
     UnknownOrder,
     NotOwner,
+    /// O gatilho já foi alcançado pelo último negócio: o stop dispararia ao nascer, o que
+    /// quase sempre é lado ou preço trocado.
+    StopAlreadyTriggered {
+        trigger: Price,
+        last: Price,
+    },
 }
 
 /// Taxa de taker em bps para a conta da casa; maker isento (decisão 7).
@@ -127,6 +151,10 @@ struct Listing {
     instrument: Instrument,
     risk: RiskLimits,
     book: OrderBook,
+    stops: StopBook,
+    /// O preço do último negócio, que dispara os stops (decisão de F7: último negócio, não
+    /// o topo do livro, que se move sem ninguém negociar).
+    last_trade: Option<Price>,
 }
 
 /// O que uma ordem aberta ainda trava no ledger. Soma, por conta e ativo, igual ao
@@ -185,6 +213,8 @@ impl Engine {
                 instrument: config.instrument,
                 risk: config.risk,
                 book: OrderBook::new(),
+                stops: StopBook::default(),
+                last_trade: None,
             };
             if listings.insert(id, listing).is_some() {
                 return Err(ConfigError::DuplicateInstrument(id));
@@ -240,12 +270,21 @@ impl Engine {
         }
     }
 
-    /// # Panics
-    /// Nunca por entrada: a reserva cobre todo débito da liquidação e a oferta limitada
-    /// do ledger impede estouro nos créditos. Se a liquidação falhar, o invariante
-    /// quebrou e parar é o certo (fail-stop). O aceite também não falha: a ordem acabou
-    /// de nascer do pedido e só pode estar em `New`.
+    /// Aceita a ordem (arma o stop ou executa) e depois dispara os stops que o novo
+    /// último negócio alcançou, um de cada vez, até nenhum mais ser alcançado: um stop
+    /// disparado pode mover o preço e disparar outros (cascata). Tudo dentro do mesmo
+    /// comando e derivado só do estado, então o replay reproduz exatamente.
     fn submit(&mut self, request: OrderRequest) -> Vec<Event> {
+        let instrument = request.instrument;
+        let mut events = self.accept(request);
+        self.fire_stops(instrument, &mut events);
+        events
+    }
+
+    /// # Panics
+    /// Nunca por entrada: o aceite não falha, a ordem acabou de nascer do pedido e só pode
+    /// estar em `New`.
+    fn accept(&mut self, request: OrderRequest) -> Vec<Event> {
         let OrderRequest {
             id,
             account,
@@ -266,17 +305,35 @@ impl Engine {
         };
         let spec = listing.instrument;
 
-        if let Some(price) = order.limit_price()
-            && !spec.accepts_price(price)
+        if let Some(price) = order
+            .quoted_prices()
+            .into_iter()
+            .flatten()
+            .find(|&price| !spec.accepts_price(price))
         {
             return reject(RejectReason::OffTick {
                 price,
                 tick: spec.tick(),
             });
         }
-        if listing.book.contains(id) {
+        if listing.book.contains(id) || listing.stops.contains(id) {
             return reject(RejectReason::DuplicateOrderId);
         }
+
+        if let Some(trigger) = order.trigger() {
+            return match arm(
+                listing,
+                &mut self.ledger,
+                &mut self.reservations,
+                self.fees,
+                order,
+                trigger,
+            ) {
+                Ok(event) => vec![event],
+                Err(reason) => reject(reason),
+            };
+        }
+
         let mut order = match pre_trade_risk(order, &listing.book, listing.risk) {
             Ok(order) => order,
             Err(reason) => return reject(reason),
@@ -284,65 +341,45 @@ impl Engine {
         order
             .transition(OrderStatus::Accepted)
             .expect("ordem recém-construída está em New, e New → Accepted é legal");
-        let (asset, per_lot) = match reservation_per_lot(&order, &spec, self.fees.taker_bps) {
-            Ok(reservation) => reservation,
-            Err(reason) => return reject(reason),
-        };
-        let Some(required) = per_lot.times(order.remaining()) else {
-            return reject(RejectReason::ValueOverflow);
-        };
-        match self.ledger.reserve(account, asset, required) {
-            Ok(()) => {}
-            Err(LedgerError::InsufficientAvailable { available, .. }) => {
-                return reject(RejectReason::InsufficientFunds {
-                    asset,
-                    available,
-                    required,
-                });
-            }
-            Err(other) => unreachable!("oferta limitada impede estouro do reservado: {other:?}"),
-        }
-        self.reservations.insert(
-            (instrument, id),
-            Reservation {
-                account,
-                asset,
-                amount: required,
-                per_lot,
-            },
-        );
-
-        let taker = Taker {
-            id,
-            side: order.side(),
-        };
-        let outcome = listing.book.submit(order);
-
-        let mut events = Vec::new();
-        for fill in outcome.fills {
-            let fee = settle_fill(
-                &mut self.ledger,
-                &mut self.reservations,
-                &spec,
-                self.fees,
-                taker,
-                &fill,
-            );
-            events.push(Event::Fill {
-                instrument,
-                fill,
-                fee,
-            });
-        }
-
-        events.extend(close_leftover(
+        if let Err(reason) = reserve(
             &mut self.ledger,
             &mut self.reservations,
-            (instrument, id),
-            taker.side,
-            outcome.leftover,
-        ));
-        events
+            &spec,
+            self.fees.taker_bps,
+            &order,
+            order.price_bound(),
+        ) {
+            return reject(reason);
+        }
+        execute(
+            listing,
+            &mut self.ledger,
+            &mut self.reservations,
+            self.fees,
+            order,
+        )
+    }
+
+    fn fire_stops(&mut self, instrument: InstrumentId, events: &mut Vec<Event>) {
+        let Some(listing) = self.listings.get_mut(&instrument) else {
+            return;
+        };
+        while let Some(last) = listing.last_trade
+            && let Some((stop, trigger)) = listing.stops.pop_triggered(last)
+        {
+            events.push(Event::Triggered {
+                instrument,
+                order: stop.id(),
+            });
+            events.extend(fire(
+                listing,
+                &mut self.ledger,
+                &mut self.reservations,
+                self.fees,
+                stop,
+                trigger,
+            ));
+        }
     }
 
     fn cancel(
@@ -357,7 +394,11 @@ impl Engine {
                 reason: RejectReason::UnknownInstrument(instrument),
             }];
         };
-        let event = match listing.book.cancel(order, account) {
+        let cancelled = match listing.book.cancel(order, account) {
+            Err(CancelError::UnknownOrder) => listing.stops.cancel(order, account),
+            other => other,
+        };
+        let event = match cancelled {
             Ok(cancelled) => {
                 release_rest(
                     &mut self.ledger,
@@ -500,11 +541,12 @@ fn collar_edge(side: Side, reference: Price, collar: Bps) -> Price {
 }
 
 fn reservation_per_lot(
-    order: &Order,
+    side: Side,
+    bound: Option<Price>,
     instrument: &Instrument,
     taker_bps: Bps,
 ) -> Result<(AssetId, Amount), RejectReason> {
-    match (order.side(), order.price_bound()) {
+    match (side, bound) {
         (Side::Bid, Some(bound)) => {
             let price = Amount::new(bound.get()).expect("preço é positivo");
             price
@@ -512,9 +554,185 @@ fn reservation_per_lot(
                 .map(|per_lot| (instrument.quote(), per_lot))
                 .ok_or(RejectReason::ValueOverflow)
         }
-        (Side::Bid, None) => unreachable!("o risco pré-trade dá proteção a toda ordem a mercado"),
+        (Side::Bid, None) => unreachable!(
+            "o risco pré-trade dá proteção a toda ordem a mercado, e o stop de compra arma com preço"
+        ),
         (Side::Ask, _) => Ok((instrument.base(), instrument.lot_size())),
     }
+}
+
+/// Trava o que `order` pode gastar, com `bound` como pior preço na compra, e registra a
+/// reserva dela. Sem saldo, nada muda.
+fn reserve(
+    ledger: &mut Ledger,
+    reservations: &mut Reservations,
+    spec: &Instrument,
+    taker_bps: Bps,
+    order: &Order,
+    bound: Option<Price>,
+) -> Result<(), RejectReason> {
+    let (asset, per_lot) = reservation_per_lot(order.side(), bound, spec, taker_bps)?;
+    let required = per_lot
+        .times(order.remaining())
+        .ok_or(RejectReason::ValueOverflow)?;
+    match ledger.reserve(order.account(), asset, required) {
+        Ok(()) => {}
+        Err(LedgerError::InsufficientAvailable { available, .. }) => {
+            return Err(RejectReason::InsufficientFunds {
+                asset,
+                available,
+                required,
+            });
+        }
+        Err(other) => unreachable!("oferta limitada impede estouro do reservado: {other:?}"),
+    }
+    reservations.insert(
+        (spec.id(), order.id()),
+        Reservation {
+            account: order.account(),
+            asset,
+            amount: required,
+            per_lot,
+        },
+    );
+    Ok(())
+}
+
+/// O pior preço que um stop de compra pode pagar depois de disparado, e com o qual ele
+/// reserva ao armar: o limite, ou, num stop a mercado, a borda do colar medida sobre o
+/// próprio gatilho. A venda trava lots de base e não precisa de preço.
+fn stop_bound(side: Side, trigger: Price, limit: Option<Price>, risk: RiskLimits) -> Option<Price> {
+    match side {
+        Side::Bid => Some(limit.unwrap_or_else(|| collar_edge(Side::Bid, trigger, risk.collar))),
+        Side::Ask => limit,
+    }
+}
+
+/// Arma um stop: tamanho máximo, gatilho ainda não alcançado e reserva na entrada (o stop
+/// nunca falha por saldo no disparo, que é quando o cliente mais conta com ele).
+///
+/// # Panics
+/// Nunca: a ordem acabou de nascer do pedido e só pode estar em `New`.
+fn arm(
+    listing: &mut Listing,
+    ledger: &mut Ledger,
+    reservations: &mut Reservations,
+    fees: FeeSchedule,
+    mut order: Order,
+    trigger: Price,
+) -> Result<Event, RejectReason> {
+    if order.total() > listing.risk.max_lots {
+        return Err(RejectReason::OrderTooLarge {
+            lots: order.total(),
+            max: listing.risk.max_lots,
+        });
+    }
+    let side = order.side();
+    if let Some(last) = listing.last_trade {
+        let reached = match side {
+            Side::Bid => last >= trigger,
+            Side::Ask => last <= trigger,
+        };
+        if reached {
+            return Err(RejectReason::StopAlreadyTriggered { trigger, last });
+        }
+    }
+    order
+        .transition(OrderStatus::Accepted)
+        .expect("ordem recém-construída está em New, e New → Accepted é legal");
+    let limit = order.quoted_prices()[1];
+    let bound = stop_bound(side, trigger, limit, listing.risk);
+    reserve(
+        ledger,
+        reservations,
+        &listing.instrument,
+        fees.taker_bps,
+        &order,
+        bound,
+    )?;
+    let event = Event::Armed {
+        instrument: listing.instrument.id(),
+        order: order.id(),
+        side,
+        trigger,
+        lots: order.remaining(),
+    };
+    listing.stops.arm(order, trigger);
+    Ok(event)
+}
+
+/// Um stop disparado entra como ordem que acabou de chegar: passa pelo risco pré-trade
+/// contra o livro de agora. Recusado, ele é cancelado e a reserva volta inteira; um stop
+/// de compra a mercado tem a proteção apertada para caber no que reservou ao armar.
+fn fire(
+    listing: &mut Listing,
+    ledger: &mut Ledger,
+    reservations: &mut Reservations,
+    fees: FeeSchedule,
+    stop: Order,
+    trigger: Price,
+) -> Vec<Event> {
+    let instrument = listing.instrument.id();
+    let key = (instrument, stop.id());
+    let limit = stop.quoted_prices()[1];
+    let lots = stop.remaining();
+    let Ok(order) = pre_trade_risk(stop.triggered(), &listing.book, listing.risk) else {
+        release_rest(ledger, reservations, key);
+        return vec![Event::Cancelled {
+            instrument,
+            order: key.1,
+            lots,
+        }];
+    };
+    let order = match stop_bound(order.side(), trigger, limit, listing.risk) {
+        Some(cap) if limit.is_none() => order.with_protection_within(cap),
+        _ => order,
+    };
+    execute(listing, ledger, reservations, fees, order)
+}
+
+/// Uma ordem aceita e já reservada contra o livro: liquida cada fill, atualiza o último
+/// negócio e fecha a sobra.
+///
+/// # Panics
+/// Nunca por entrada: a reserva cobre todo débito da liquidação e a oferta limitada do
+/// ledger impede estouro nos créditos. Se a liquidação falhar, o invariante quebrou e
+/// parar é o certo (fail-stop).
+fn execute(
+    listing: &mut Listing,
+    ledger: &mut Ledger,
+    reservations: &mut Reservations,
+    fees: FeeSchedule,
+    order: Order,
+) -> Vec<Event> {
+    let spec = listing.instrument;
+    let instrument = spec.id();
+    let taker = Taker {
+        id: order.id(),
+        side: order.side(),
+    };
+    let outcome = listing.book.submit(order);
+    if let Some(last) = outcome.fills.last() {
+        listing.last_trade = Some(last.price);
+    }
+
+    let mut events = Vec::new();
+    for fill in outcome.fills {
+        let fee = settle_fill(ledger, reservations, &spec, fees, taker, &fill);
+        events.push(Event::Fill {
+            instrument,
+            fill,
+            fee,
+        });
+    }
+    events.extend(close_leftover(
+        ledger,
+        reservations,
+        (instrument, taker.id),
+        taker.side,
+        outcome.leftover,
+    ));
+    events
 }
 
 fn fill_settlement(
@@ -1578,5 +1796,305 @@ mod tests {
         let outro = engine.book(OUTRO_BRL).expect("instrumento registrado");
         assert_eq!(teste.best_ask(), Price::new(100).ok());
         assert_eq!(outro.best_bid(), Price::new(100).ok());
+    }
+
+    fn stop(
+        account: AccountId,
+        id: u64,
+        side: Side,
+        trigger: i64,
+        limit: Option<i64>,
+        quantity: i64,
+    ) -> OrderRequest {
+        let kind = OrderKind::Stop {
+            trigger: price(trigger),
+            limit: limit.map(price),
+        };
+        request(account, id, TESTE_BRL, side, kind, quantity)
+    }
+
+    /// Os eventos num formato curto, para comparar a sequência inteira de uma vez.
+    fn trace(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                Event::Fill { fill, .. } => format!(
+                    "fill #{} @{} x{}",
+                    fill.taker.get(),
+                    fill.price.get(),
+                    fill.lots.get()
+                ),
+                Event::Armed { order, .. } => format!("armed #{}", order.get()),
+                Event::Triggered { order, .. } => format!("triggered #{}", order.get()),
+                Event::Rested {
+                    order, price, lots, ..
+                } => format!("rested #{} @{} x{}", order.get(), price.get(), lots.get()),
+                Event::Cancelled { order, lots, .. } => {
+                    format!("cancelled #{} x{}", order.get(), lots.get())
+                }
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    // Stop de compra a mercado reserva na entrada a borda do colar sobre o próprio
+    // gatilho: 105 + ⌈105 × 10%⌉ = 116 por lot, e fica fora do livro.
+    #[test]
+    fn stop_arms_with_its_reserve_and_stays_out_of_the_book() {
+        let mut engine = guarded_engine();
+
+        let events = submit(&mut engine, stop(ALICE, 1, Side::Bid, 105, None, 2));
+
+        assert_eq!(trace(&events), ["armed #1"]);
+        assert_eq!(engine.balance(ALICE, BRL).reserved, amount(232));
+        assert_eq!(engine.book(TESTE_BRL).unwrap().best_bid(), None);
+    }
+
+    #[test]
+    fn stop_waits_for_a_trade_and_fires_after_the_order_that_reached_it() {
+        let mut engine = engine(&[TESTE_BRL]);
+        for (id, ask) in [(1, 100), (2, 105)] {
+            submit(&mut engine, order_for(BOB, id, Side::Ask, ask, 1));
+        }
+        submit(&mut engine, order_for(BOB, 3, Side::Ask, 110, 5));
+        assert_eq!(
+            trace(&submit(
+                &mut engine,
+                stop(ALICE, 4, Side::Bid, 105, None, 2)
+            )),
+            ["armed #4"]
+        );
+
+        let events = submit(&mut engine, order_for(ALICE, 5, Side::Bid, 105, 2));
+
+        assert_eq!(
+            trace(&events),
+            [
+                "fill #5 @100 x1",
+                "fill #5 @105 x1",
+                "triggered #4",
+                "fill #4 @110 x2"
+            ]
+        );
+    }
+
+    #[test]
+    fn fired_stop_limit_rests_its_remainder_at_the_limit() {
+        let mut engine = engine(&[TESTE_BRL]);
+        for (id, bid) in [(1, 96), (2, 95), (3, 94)] {
+            submit(&mut engine, order_for(ALICE, id, Side::Bid, bid, 1));
+        }
+        submit(&mut engine, stop(BOB, 4, Side::Ask, 95, Some(94), 3));
+
+        let events = submit(&mut engine, order_for(BOB, 5, Side::Ask, 95, 2));
+
+        assert_eq!(
+            trace(&events),
+            [
+                "fill #5 @96 x1",
+                "fill #5 @95 x1",
+                "triggered #4",
+                "fill #4 @94 x1",
+                "rested #4 @94 x2"
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_already_reached_by_the_last_trade_is_rejected() {
+        let mut engine = engine(&[TESTE_BRL]);
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 1));
+        submit(&mut engine, order_for(ALICE, 2, Side::Bid, 100, 1));
+        let reached = RejectReason::StopAlreadyTriggered {
+            trigger: price(100),
+            last: price(100),
+        };
+
+        assert_eq!(
+            submit(&mut engine, stop(ALICE, 3, Side::Bid, 100, None, 1)),
+            [Event::Rejected {
+                order: OrderId::new(3),
+                reason: reached
+            }]
+        );
+        assert_eq!(
+            submit(&mut engine, stop(ALICE, 4, Side::Ask, 100, None, 1)),
+            [Event::Rejected {
+                order: OrderId::new(4),
+                reason: reached
+            }]
+        );
+        assert_eq!(
+            trace(&submit(
+                &mut engine,
+                stop(ALICE, 5, Side::Bid, 101, None, 1)
+            )),
+            ["armed #5"]
+        );
+        assert_eq!(
+            trace(&submit(&mut engine, stop(ALICE, 6, Side::Ask, 99, None, 1))),
+            ["armed #6"]
+        );
+    }
+
+    #[test]
+    fn cancelling_a_dormant_stop_releases_its_reserve_and_checks_the_owner() {
+        let mut engine = guarded_engine();
+        submit(&mut engine, stop(ALICE, 1, Side::Bid, 105, None, 2));
+        let cancel = |account| Command::Cancel {
+            instrument: TESTE_BRL,
+            account,
+            order: OrderId::new(1),
+        };
+
+        assert_eq!(
+            engine.apply(cancel(BOB)),
+            [Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::NotOwner
+            }]
+        );
+        assert_eq!(trace(&engine.apply(cancel(ALICE))), ["cancelled #1 x2"]);
+        assert_eq!(engine.balance(ALICE, BRL), balance(PLENTY, 0));
+    }
+
+    // Os stops de venda em 97 (chegou antes) e em 99: o negócio em 99 dispara o de 99,
+    // cuja venda negocia em 97 e dispara o de 97 — cascata, do gatilho mais perto ao mais
+    // longe, dentro do mesmo comando.
+    #[test]
+    fn cascade_fires_stops_from_the_closest_trigger_out() {
+        let mut engine = engine(&[TESTE_BRL]);
+        submit(&mut engine, order_for(ALICE, 1, Side::Bid, 99, 1));
+        submit(&mut engine, order_for(ALICE, 2, Side::Bid, 97, 1));
+        submit(&mut engine, order_for(ALICE, 3, Side::Bid, 95, 5));
+        submit(&mut engine, stop(BOB, 4, Side::Ask, 97, None, 1));
+        submit(&mut engine, stop(BOB, 5, Side::Ask, 99, None, 1));
+
+        let events = submit(&mut engine, order_for(BOB, 6, Side::Ask, 99, 1));
+
+        assert_eq!(
+            trace(&events),
+            [
+                "fill #6 @99 x1",
+                "triggered #5",
+                "fill #5 @97 x1",
+                "triggered #4",
+                "fill #4 @95 x1"
+            ]
+        );
+    }
+
+    #[test]
+    fn stops_with_the_same_trigger_fire_in_arrival_order() {
+        let mut engine = engine(&[TESTE_BRL]);
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 1));
+        submit(&mut engine, order_for(BOB, 2, Side::Ask, 101, 5));
+        submit(&mut engine, stop(ALICE, 3, Side::Bid, 100, None, 1));
+        submit(&mut engine, stop(BOB, 4, Side::Bid, 100, None, 1));
+
+        let events = submit(&mut engine, order_for(ALICE, 5, Side::Bid, 100, 1));
+
+        assert_eq!(
+            trace(&events),
+            [
+                "fill #5 @100 x1",
+                "triggered #3",
+                "fill #3 @101 x1",
+                "triggered #4",
+                "fill #4 @101 x1"
+            ]
+        );
+    }
+
+    // Disparado, o stop é uma ordem chegando agora: sem ninguém do outro lado, a ordem a
+    // mercado não tem referência, e o stop é cancelado com a reserva devolvida.
+    #[test]
+    fn fired_stop_that_fails_pre_trade_risk_is_cancelled_and_released() {
+        let mut engine = engine(&[TESTE_BRL]);
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 105, 1));
+        submit(&mut engine, stop(ALICE, 2, Side::Bid, 105, None, 2));
+
+        let events = submit(&mut engine, order_for(ALICE, 3, Side::Bid, 105, 1));
+
+        assert_eq!(
+            trace(&events),
+            ["fill #3 @105 x1", "triggered #2", "cancelled #2 x2"]
+        );
+        assert_eq!(engine.balance(ALICE, BRL).reserved, Amount::ZERO);
+    }
+
+    // Reservou a 110 (gatilho 100 + 10%); no disparo o colar do livro iria até 134, mas a
+    // proteção fica em 110 e a oferta de 121 não é alcançada: sem isso, a liquidação
+    // passaria da reserva.
+    #[test]
+    fn fired_buy_stop_never_pays_above_what_it_reserved() {
+        let mut engine = guarded_engine();
+        submit(&mut engine, order_for(BOB, 1, Side::Ask, 100, 1));
+        submit(&mut engine, order_for(BOB, 2, Side::Ask, 121, 1));
+        submit(&mut engine, stop(ALICE, 3, Side::Bid, 100, None, 1));
+
+        let events = submit(&mut engine, order_for(ALICE, 4, Side::Bid, 100, 1));
+
+        assert_eq!(
+            trace(&events),
+            ["fill #4 @100 x1", "triggered #3", "cancelled #3 x1"]
+        );
+        assert_eq!(engine.balance(ALICE, BRL).reserved, Amount::ZERO);
+    }
+
+    #[test]
+    fn stop_prices_must_be_on_the_tick() {
+        let mut engine = engine_with(&[spec(TESTE_BRL, 5)]);
+        let off_tick = |value| RejectReason::OffTick {
+            price: price(value),
+            tick: price(5),
+        };
+
+        assert_eq!(
+            submit(&mut engine, stop(ALICE, 1, Side::Bid, 103, None, 1)),
+            [Event::Rejected {
+                order: OrderId::new(1),
+                reason: off_tick(103)
+            }]
+        );
+        assert_eq!(
+            submit(&mut engine, stop(ALICE, 2, Side::Bid, 105, Some(108), 1)),
+            [Event::Rejected {
+                order: OrderId::new(2),
+                reason: off_tick(108)
+            }]
+        );
+    }
+
+    #[test]
+    fn id_of_a_dormant_stop_cannot_be_reused() {
+        let mut engine = engine(&[TESTE_BRL]);
+        submit(&mut engine, stop(ALICE, 1, Side::Bid, 105, None, 1));
+
+        assert_eq!(
+            submit(&mut engine, order_for(ALICE, 1, Side::Bid, 100, 1)),
+            [Event::Rejected {
+                order: OrderId::new(1),
+                reason: RejectReason::DuplicateOrderId
+            }]
+        );
+    }
+
+    #[test]
+    fn trades_in_one_instrument_do_not_fire_stops_of_another() {
+        let mut engine = engine(&[TESTE_BRL, OUTRO_BRL]);
+        let stop_kind = OrderKind::Stop {
+            trigger: price(100),
+            limit: None,
+        };
+        submit(
+            &mut engine,
+            request(ALICE, 1, OUTRO_BRL, Side::Bid, stop_kind, 1),
+        );
+        submit(&mut engine, order_for(BOB, 2, Side::Ask, 100, 1));
+
+        let events = submit(&mut engine, order_for(ALICE, 3, Side::Bid, 100, 1));
+
+        assert_eq!(trace(&events), ["fill #3 @100 x1"]);
     }
 }

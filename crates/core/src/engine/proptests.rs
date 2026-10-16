@@ -42,6 +42,8 @@ enum Op {
         side: Side,
         price: Option<i64>,
         protection: Option<i64>,
+        /// Com gatilho, é um stop: limite em `price`, ou a mercado sem ele.
+        trigger: Option<i64>,
         lots: i64,
         tif: TimeInForce,
     },
@@ -62,20 +64,23 @@ fn op(instruments: usize) -> impl Strategy<Value = Op> {
     ];
     let price = prop_oneof![4 => (95..=105_i64).prop_map(Some), 1 => Just(None)];
     let protection = prop_oneof![Just(None), (95..=105_i64).prop_map(Some)];
+    let trigger = prop_oneof![3 => Just(None), 1 => (95..=105_i64).prop_map(Some)];
     prop_oneof![
         2 => (0..2_usize, prop::sample::select(ASSETS.to_vec()), 0..=600_i64)
             .prop_map(|(account, asset, value)| Op::Deposit(account, asset, value)),
-        6 => (0..instruments, 0..2_usize, side, price, protection, 1..=10_i64, tif).prop_map(
-            |(instrument, account, side, price, protection, lots, tif)| Op::Submit {
-                instrument,
-                account,
-                side,
-                price,
-                protection,
-                lots,
-                tif,
-            }
-        ),
+        6 => (0..instruments, 0..2_usize, side, price, protection, trigger, 1..=10_i64, tif)
+            .prop_map(|(instrument, account, side, price, protection, trigger, lots, tif)| {
+                Op::Submit {
+                    instrument,
+                    account,
+                    side,
+                    price,
+                    protection,
+                    trigger,
+                    lots,
+                    tif,
+                }
+            }),
         2 => (0..instruments, 0..2_usize, any::<prop::sample::Index>())
             .prop_map(|(instrument, account, target)| Op::Cancel { instrument, account, target }),
     ]
@@ -94,6 +99,7 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
             side,
             price,
             protection,
+            trigger,
             lots,
             tif,
         } => {
@@ -101,10 +107,15 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
             let id = *next_id;
             *next_id += 1;
             let lots = Lots::new(*lots).expect("faixa positiva");
-            let kind = match price {
-                Some(price) => OrderKind::Limit(Price::new(*price).expect("faixa positiva")),
-                None => OrderKind::Market {
-                    protection: protection.map(|bound| Price::new(bound).expect("faixa positiva")),
+            let price_of = |value: i64| Price::new(value).expect("faixa positiva");
+            let kind = match (trigger, price) {
+                (Some(trigger), limit) => OrderKind::Stop {
+                    trigger: price_of(*trigger),
+                    limit: limit.map(price_of),
+                },
+                (None, Some(price)) => OrderKind::Limit(price_of(*price)),
+                (None, None) => OrderKind::Market {
+                    protection: protection.map(price_of),
                 },
             };
             Command::Submit(OrderRequest {
@@ -136,7 +147,7 @@ fn command(op: &Op, next_id: &mut u64) -> Command {
 /// Pega o que a conservação agregada não pega: valor certo na conta errada.
 struct BalanceOracle {
     totals: HashMap<(AccountId, AssetId), i128>,
-    owners: HashMap<(InstrumentId, OrderId), AccountId>,
+    owners: HashMap<(InstrumentId, OrderId), (AccountId, Side)>,
     house: AccountId,
     taker_bps: u32,
 }
@@ -151,11 +162,17 @@ impl BalanceOracle {
         }
     }
 
-    fn record_owner(&mut self, instrument: InstrumentId, order: OrderId, account: AccountId) {
-        self.owners.insert((instrument, order), account);
+    fn record_owner(
+        &mut self,
+        instrument: InstrumentId,
+        order: OrderId,
+        account: AccountId,
+        side: Side,
+    ) {
+        self.owners.insert((instrument, order), (account, side));
     }
 
-    fn owner(&self, instrument: InstrumentId, order: OrderId) -> AccountId {
+    fn owner(&self, instrument: InstrumentId, order: OrderId) -> (AccountId, Side) {
         self.owners[&(instrument, order)]
     }
 
@@ -167,11 +184,13 @@ impl BalanceOracle {
         self.credit(account, asset, i128::from(amount.get()));
     }
 
-    /// Seção 4.2 do lado de quem confere: o que cada parte de um fill ganha e perde.
-    fn apply_fill(&mut self, spec: &Instrument, fill: &Fill, taker_side: Side) {
+    /// Seção 4.2 do lado de quem confere: o que cada parte de um fill ganha e perde. O
+    /// lado do taker vem da própria ordem, não do comando: num stop disparado, o taker não
+    /// é quem mandou o comando.
+    fn apply_fill(&mut self, spec: &Instrument, fill: &Fill) {
         let instrument = spec.id();
-        let taker = self.owner(instrument, fill.taker);
-        let maker = self.owner(instrument, fill.maker);
+        let (taker, taker_side) = self.owner(instrument, fill.taker);
+        let (maker, _) = self.owner(instrument, fill.maker);
         let (buyer, seller) = match taker_side {
             Side::Bid => (taker, maker),
             Side::Ask => (maker, taker),
@@ -231,7 +250,10 @@ proptest! {
         let listing = ListingConfig { instrument: spec(), risk };
         let mut engine = Engine::new([listing], fees).expect("config válida");
         let mut next_id = 1;
+        let mut armed: HashMap<OrderId, (Side, Price)> = HashMap::new();
+        let mut last_trade: Option<Price> = None;
         for op in ops {
+            let submitted = OrderId::new(next_id);
             let book = engine.book(TESTE_BRL).expect("instrumento registrado");
             let edge = match &op {
                 Op::Submit { side: Side::Bid, .. } => book
@@ -245,9 +267,13 @@ proptest! {
 
             let events = engine.apply(command(&op, &mut next_id));
 
+            // O colar medido antes do comando vale para a ordem que chegou; um stop disparado
+            // depois dela é medido contra o livro do momento do disparo.
             if let Some((side, edge)) = edge {
                 for event in &events {
-                    if let Event::Fill { fill, .. } = event {
+                    if let Event::Fill { fill, .. } = event
+                        && fill.taker == submitted
+                    {
                         let inside = match side {
                             Side::Bid => i128::from(fill.price.get()) <= edge,
                             Side::Ask => i128::from(fill.price.get()) >= edge,
@@ -286,12 +312,45 @@ proptest! {
                 }
             }
 
-            let book = engine.book(TESTE_BRL).expect("instrumento registrado");
-            let mut resting: Vec<u64> = book.resting_ids().map(OrderId::get).collect();
+            // Um stop dispara exatamente quando o último negócio alcança o gatilho: nunca
+            // antes (cada `Triggered` tem o gatilho alcançado pelo último negócio até ali) e
+            // nunca depois (ao fim do comando, nenhum dormente tem o gatilho alcançado).
+            let reached = |side, trigger, last: Option<Price>| match side {
+                Side::Bid => last.is_some_and(|last| last >= trigger),
+                Side::Ask => last.is_some_and(|last| last <= trigger),
+            };
+            for event in &events {
+                match *event {
+                    Event::Armed { order, side, trigger, .. } => {
+                        prop_assert!(!reached(side, trigger, last_trade), "stop armado já alcançado: {:?}", op);
+                        armed.insert(order, (side, trigger));
+                    }
+                    Event::Triggered { order, .. } => {
+                        let (side, trigger) = armed.remove(&order).expect("só dispara stop armado");
+                        prop_assert!(reached(side, trigger, last_trade), "stop {:?} disparou antes do gatilho", order);
+                    }
+                    Event::Cancelled { order, .. } => {
+                        armed.remove(&order);
+                    }
+                    Event::Fill { fill, .. } => last_trade = Some(fill.price),
+                    _ => {}
+                }
+            }
+            for (order, &(side, trigger)) in &armed {
+                prop_assert!(!reached(side, trigger, last_trade), "stop {:?} alcançado e não disparou", order);
+            }
+
+            let listing = &engine.listings[&TESTE_BRL];
+            let mut resting: Vec<u64> = listing
+                .book
+                .resting_ids()
+                .chain(listing.stops.ids())
+                .map(OrderId::get)
+                .collect();
             let mut reserved: Vec<u64> = engine.reservations.keys().map(|(_, id)| id.get()).collect();
             resting.sort_unstable();
             reserved.sort_unstable();
-            prop_assert_eq!(resting, reserved, "reserva sem ordem no livro, ou o contrário");
+            prop_assert_eq!(resting, reserved, "reserva sem ordem no livro ou stop dormente, ou o contrário");
         }
     }
 
@@ -310,14 +369,10 @@ proptest! {
         let mut oracle = BalanceOracle::new(HOUSE, taker_bps);
         let mut next_id = 1;
         for op in ops {
-            let taker_side = match &op {
-                Op::Submit { instrument, account, side, .. } => {
-                    let order = OrderId::new(next_id);
-                    oracle.record_owner(INSTRUMENTS[*instrument], order, ACCOUNTS[*account]);
-                    Some(*side)
-                }
-                _ => None,
-            };
+            if let Op::Submit { instrument, account, side, .. } = &op {
+                let order = OrderId::new(next_id);
+                oracle.record_owner(INSTRUMENTS[*instrument], order, ACCOUNTS[*account], *side);
+            }
 
             for event in engine.apply(command(&op, &mut next_id)) {
                 match event {
@@ -326,8 +381,7 @@ proptest! {
                     }
                     Event::Fill { instrument, fill, .. } => {
                         let spec = engine.instrument(instrument).expect("instrumento registrado");
-                        let side = taker_side.expect("só submissão gera fill");
-                        oracle.apply_fill(spec, &fill, side);
+                        oracle.apply_fill(spec, &fill);
                     }
                     _ => {}
                 }

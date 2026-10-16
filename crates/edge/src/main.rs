@@ -188,6 +188,22 @@ fn render(event: &Event) -> String {
         Event::Rejected { order, reason } => {
             format!("#{} rejeitada: {}", order.get(), reject_message(reason))
         }
+        Event::Armed {
+            instrument,
+            order,
+            trigger,
+            lots,
+            ..
+        } => format!(
+            "#{} armada: {} lots em {}, gatilho {}",
+            order.get(),
+            lots.get(),
+            symbol(*instrument),
+            trigger.get()
+        ),
+        Event::Triggered { instrument, order } => {
+            format!("#{} disparou em {}", order.get(), symbol(*instrument))
+        }
     }
 }
 

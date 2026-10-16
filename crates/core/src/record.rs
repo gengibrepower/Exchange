@@ -207,6 +207,32 @@ mod tests {
         assert_eq!(record.to_bytes(), [7, 0, 0, 1, 2, 0xD8, 0x04]);
     }
 
+    // Bytes gravados pelo formato de antes dos stops (variante `Stop` acrescentada no fim
+    // do `OrderKind`): o registro de uma ordem a mercado protegida continua lido igual.
+    #[test]
+    fn record_written_before_stops_existed_still_reads() {
+        // seq 3 | Instrument(1) | Submit | id 3 | conta 1 | instrumento 1 | Ask |
+        // Market(Some(9500), zigzag 19000) | lots 2 (zigzag 4) | seq 3 | Ioc
+        let bytes = [3, 1, 1, 1, 3, 1, 1, 1, 1, 1, 184, 148, 1, 4, 3, 1];
+        let request = OrderRequest {
+            id: OrderId::new(3),
+            account: AccountId::new(1),
+            instrument: InstrumentId::new(1),
+            side: Side::Ask,
+            kind: OrderKind::Market {
+                protection: Some(Price::new(9_500).unwrap()),
+            },
+            total: Lots::new(2).unwrap(),
+            seq: Seq::new(3),
+            time_in_force: TimeInForce::Ioc,
+        };
+
+        assert_eq!(
+            LogRecord::from_bytes(&bytes),
+            Ok(LogRecord::new(Seq::new(3), Command::Submit(request)))
+        );
+    }
+
     #[test]
     fn roundtrip_of_a_known_record() {
         let record = LogRecord::new(Seq::new(9), submit(1));
