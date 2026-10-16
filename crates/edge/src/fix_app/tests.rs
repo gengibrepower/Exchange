@@ -1,7 +1,7 @@
 use exchange_core::domain::Amount;
 
 use super::*;
-use crate::market::{BRL, TESTE};
+use crate::market::{BRL, OUTRO, TESTE};
 use crate::sequencer::Sequencer;
 
 const SELLER: AccountId = AccountId::new(1);
@@ -16,7 +16,7 @@ impl Exchange {
     fn new() -> Self {
         let mut core = Sequencer::in_memory();
         for account in [SELLER, BUYER] {
-            for asset in [TESTE, BRL] {
+            for asset in [TESTE, OUTRO, BRL] {
                 let amount = Amount::new(10_000_000).expect("quantia de teste válida");
                 core.submit(Intent::Deposit {
                     account,
@@ -55,11 +55,15 @@ fn message(msg_type: &str, fields: &[(u32, &str)]) -> AppMessage {
 }
 
 fn limit(cl_ord_id: &str, side: &str, lots: &str, price: &str) -> AppMessage {
+    limit_on("TESTE/BRL", cl_ord_id, side, lots, price)
+}
+
+fn limit_on(symbol: &str, cl_ord_id: &str, side: &str, lots: &str, price: &str) -> AppMessage {
     message(
         "D",
         &[
             (11, cl_ord_id),
-            (55, "TESTE/BRL"),
+            (55, symbol),
             (54, side),
             (38, lots),
             (40, "2"),
@@ -109,6 +113,23 @@ fn resting_limit_order_is_acknowledged_as_new() {
     assert_eq!(get(&reports[0], 55), Some("TESTE/BRL"));
     assert_eq!(get(&reports[0], 54), Some("2"));
     assert_eq!(get(&reports[0], 38), Some("5"));
+}
+
+// 2005 não cai no tick de 10 do TESTE/BRL, mas cai no de 5 do OUTRO/BRL: se o símbolo
+// fosse parar no instrumento errado, a ordem seria rejeitada.
+#[test]
+fn second_instrument_trades_under_its_own_symbol_and_tick() {
+    let mut exchange = Exchange::new();
+    let mut seller = FixOrders::new(SELLER);
+    let mut buyer = FixOrders::new(BUYER);
+    exchange.send(&mut seller, &limit_on("OUTRO/BRL", "v1", "2", "3", "2005"));
+    let reports = exchange.send(&mut buyer, &limit_on("OUTRO/BRL", "c1", "1", "2", "2005"));
+    assert_eq!(
+        executions(&reports),
+        vec![("0", "0", "0", "2"), ("F", "2", "2", "0")]
+    );
+    assert_eq!(get(&reports[1], 55), Some("OUTRO/BRL"));
+    assert_eq!(get(&reports[1], 31), Some("2005"));
 }
 
 #[test]

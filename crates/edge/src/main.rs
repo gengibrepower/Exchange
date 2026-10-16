@@ -221,7 +221,8 @@ mod tests {
             "depósito: 50000 BRL\n\
              #1 descansou: 2 lots em TESTE/BRL\n\
              TESTE: disponível 0, reservado 0\n\
-             BRL: disponível 29980, reservado 20020\n"
+             BRL: disponível 29980, reservado 20020\n\
+             OUTRO: disponível 0, reservado 0\n"
         );
     }
 
