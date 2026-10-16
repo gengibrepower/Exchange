@@ -148,7 +148,7 @@ fn recover(file: &mut File) -> io::Result<(Vec<Vec<u8>>, u64)> {
 
 /// O nome de um arquivo novo mora na entrada do diretório; sem sincronizá-lo, um crash
 /// pode deixar os dados gravados sem nome nenhum apontando para eles.
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
