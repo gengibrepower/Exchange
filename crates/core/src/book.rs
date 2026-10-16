@@ -80,6 +80,15 @@ impl OrderBook {
         }
     }
 
+    /// As ordens descansando de um lado na ordem em que seriam executadas: do melhor preço
+    /// para o pior e, dentro do preço, da primeira da fila para a última.
+    pub(crate) fn resting(&self, side: Side) -> Vec<&Order> {
+        match side {
+            Side::Bid => self.bids.values().rev().flatten().collect(),
+            Side::Ask => self.asks.values().flatten().collect(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn resting_ids(&self) -> impl Iterator<Item = OrderId> + '_ {
         self.index.keys().copied()
@@ -250,7 +259,9 @@ impl OrderBook {
         Ok(order)
     }
 
-    fn rest(&mut self, order: Order, price: Price) {
+    /// Põe `order` no fim da fila de `price`. Também é como um snapshot repõe o livro, uma
+    /// ordem por vez na ordem de [`OrderBook::resting`]; quem chama valida a ordem.
+    pub(crate) fn rest(&mut self, order: Order, price: Price) {
         self.index.insert(order.id(), (order.side(), price));
         let side = match order.side() {
             Side::Bid => &mut self.bids,

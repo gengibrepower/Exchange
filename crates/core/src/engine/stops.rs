@@ -75,6 +75,10 @@ impl StopBook {
         Some((order, trigger))
     }
 
+    pub(super) fn orders(&self) -> impl Iterator<Item = &Order> {
+        self.buys.values().chain(self.sells.values())
+    }
+
     #[cfg(test)]
     pub(super) fn ids(&self) -> impl Iterator<Item = OrderId> + '_ {
         self.index.keys().copied()

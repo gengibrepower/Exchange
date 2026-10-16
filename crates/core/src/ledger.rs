@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::{AccountId, Amount, AssetId};
 
 /// Seção 3.5, não-negatividade: garantida pelo tipo. `Amount` só nasce de
 /// `Amount::new`, que recusa negativo, ou de aritmética `checked_*` que devolve `None`
 /// em vez de ficar abaixo de zero — não há como um saldo negativo existir.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct Balance {
     pub available: Amount,
     pub reserved: Amount,
@@ -66,6 +68,38 @@ impl Ledger {
             .get(&(account, asset))
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Todo saldo já tocado, inclusive os que voltaram a zero, em ordem de conta e ativo.
+    pub fn balances(&self) -> Vec<(AccountId, AssetId, Balance)> {
+        let mut balances: Vec<_> = self
+            .balances
+            .iter()
+            .map(|(&(account, asset), &balance)| (account, asset, balance))
+            .collect();
+        balances.sort_by_key(|&(account, asset, _)| (account.get(), asset.get()));
+        balances
+    }
+
+    /// Um ledger com estes saldos. A oferta de cada ativo não vem de fora: é a soma dos
+    /// saldos, o que torna a conservação verdadeira por construção.
+    ///
+    /// # Errors
+    /// O ativo cuja soma passa de `i64::MAX`.
+    pub fn restore(
+        balances: impl IntoIterator<Item = (AccountId, AssetId, Balance)>,
+    ) -> Result<Self, AssetId> {
+        let mut ledger = Self::new();
+        for (account, asset, balance) in balances {
+            let supply = ledger
+                .supply(asset)
+                .checked_add(balance.available)
+                .and_then(|supply| supply.checked_add(balance.reserved))
+                .ok_or(asset)?;
+            ledger.supply.insert(asset, supply);
+            ledger.balances.insert((account, asset), balance);
+        }
+        Ok(ledger)
     }
 
     pub fn supply(&self, asset: AssetId) -> Amount {
