@@ -337,15 +337,17 @@ mod tests {
     use std::fs;
 
     use exchange_core::domain::Price;
+    use exchange_core::engine::RejectReason;
     use proptest::prelude::*;
 
     use super::*;
-    use crate::market::{BRL, TESTE};
+    use crate::market::{BRL, OUTRO, TESTE};
     use crate::market_data::{Feed, MarketData, Quote};
     use crate::test_support::TempPath;
 
     const ACCOUNT: AccountId = AccountId::new(1);
     const TESTE_BRL: InstrumentId = market::INSTRUMENTS[0].1;
+    const OUTRO_BRL: InstrumentId = market::INSTRUMENTS[1].1;
 
     fn deposit(seq: u64) -> Vec<u8> {
         let command = Command::Deposit {
@@ -426,6 +428,17 @@ mod tests {
             lots,
             time_in_force,
         )
+    }
+
+    fn limit_on(instrument: InstrumentId, side: Side, price: i64, lots: i64) -> Intent {
+        Intent::Order {
+            account: ACCOUNT,
+            instrument,
+            side,
+            kind: OrderKind::Limit(Price::new(price).unwrap()),
+            lots: Lots::new(lots).unwrap(),
+            time_in_force: TimeInForce::Gtc,
+        }
     }
 
     fn cancel(id: u64) -> Intent {
@@ -715,5 +728,73 @@ mod tests {
             drop((single, grouped));
             prop_assert_eq!(fs::read(&batched.0).unwrap(), fs::read(&one_by_one.0).unwrap());
         }
+    }
+
+    // Os dois livros num log só, intercalados: o replay devolve cada ordem ao seu livro,
+    // e o estado reconstruído é o mesmo de quem nunca reiniciou.
+    #[test]
+    fn both_books_survive_a_restart() {
+        let intents = [
+            fund(BRL, 100_000_000),
+            fund(TESTE, 100_000),
+            fund(OUTRO, 10_000),
+            limit_on(TESTE_BRL, Side::Ask, 10_000, 5),
+            limit_on(OUTRO_BRL, Side::Ask, 2_005, 3),
+            limit_on(TESTE_BRL, Side::Bid, 9_900, 4),
+            limit_on(OUTRO_BRL, Side::Bid, 2_005, 1),
+            limit_on(OUTRO_BRL, Side::Bid, 1_995, 2),
+        ];
+        let path = TempPath::new("two-books");
+        let mut live = Sequencer::in_memory();
+        {
+            let (mut durable, _) = Sequencer::open(&path.0).unwrap();
+            for intent in intents {
+                assert_eq!(
+                    durable.submit(intent).unwrap(),
+                    live.submit(intent).unwrap()
+                );
+            }
+        }
+
+        let (restarted, report) = Sequencer::open(&path.0).unwrap();
+
+        assert_eq!(report.replayed, intents.len());
+        assert_eq!(restarted.engine(), live.engine());
+        let depth = |instrument, side| restarted.engine().book(instrument).unwrap().depth(side);
+        assert_eq!(depth(TESTE_BRL, Side::Ask), [(price(10_000), lots(5))]);
+        assert_eq!(depth(TESTE_BRL, Side::Bid), [(price(9_900), lots(4))]);
+        assert_eq!(depth(OUTRO_BRL, Side::Ask), [(price(2_005), lots(2))]);
+        assert_eq!(depth(OUTRO_BRL, Side::Bid), [(price(1_995), lots(2))]);
+    }
+
+    // Um ledger para todos os livros (decisão 10b): o BRL travado por uma compra num livro
+    // não está disponível para comprar no outro.
+    #[test]
+    fn quote_reserved_in_one_book_is_not_available_to_the_other() {
+        let mut sequencer = Sequencer::in_memory();
+        sequencer.submit(fund(BRL, 10_000)).unwrap();
+        sequencer
+            .submit(limit_on(TESTE_BRL, Side::Bid, 3_000, 3))
+            .unwrap();
+
+        let events = sequencer
+            .submit(limit_on(OUTRO_BRL, Side::Bid, 2_000, 1))
+            .unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Rejected {
+                reason: RejectReason::InsufficientFunds { asset, .. },
+                ..
+            }] if *asset == BRL
+        ));
+    }
+
+    fn price(value: i64) -> Price {
+        Price::new(value).unwrap()
+    }
+
+    fn lots(value: i64) -> Lots {
+        Lots::new(value).unwrap()
     }
 }

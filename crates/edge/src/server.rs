@@ -476,7 +476,7 @@ mod tests {
         bob.send(r#"{"type":"balance"}"#).await;
         assert_eq!(
             bob.recv().await,
-            r#"{"type":"balances","balances":[{"asset":"TESTE","available":100200,"reserved":0},{"asset":"BRL","available":99979980,"reserved":0}]}"#
+            r#"{"type":"balances","balances":[{"asset":"TESTE","available":100200,"reserved":0},{"asset":"BRL","available":99979980,"reserved":0},{"asset":"OUTRO","available":0,"reserved":0}]}"#
         );
     }
 
@@ -881,6 +881,87 @@ mod tests {
         r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":5}"#;
     const FEED_BUY: &str =
         r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":2}"#;
+
+    // O segundo instrumento pela rede, com a especificação dele (tick 5, lot 10, colar 5%):
+    // - a compra a mercado de Bob em OUTRO/BRL precisa travar 2.109 por lot (proteção
+    //   2005 + ⌈2005 × 5%⌉ = 2106, mais a taxa de 1 lot, 3), mas os 10.000 de BRL dele
+    //   têm 9.009 travados pela compra em TESTE/BRL (3 × (3000 + 3)): sobra 991, rejeita;
+    // - cancelada a compra em TESTE/BRL, 2 lots a 2005 custam 4.010 mais 5 de taxa;
+    // - quem assina OUTRO/BRL vê só os incrementos dele, com sequência própria, e nada do
+    //   que Bob fez em TESTE/BRL.
+    #[tokio::test]
+    async fn second_instrument_trades_on_its_own_book_and_feed() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut watcher = Client::connect(address).await;
+        watcher
+            .send(r#"{"type":"subscribe","instrument":"OUTRO/BRL","feed":"l2"}"#)
+            .await;
+        assert_eq!(
+            watcher.recv().await,
+            r#"{"type":"snapshot","instrument":"OUTRO/BRL","feed":"l2","seq":0,"bids":[],"asks":[]}"#
+        );
+
+        let mut alice = Client::login(address, 1).await;
+        alice
+            .send(r#"{"type":"deposit","asset":"OUTRO","amount":1000}"#)
+            .await;
+        assert_eq!(
+            alice.recv().await,
+            r#"{"type":"deposited","asset":"OUTRO","amount":1000}"#
+        );
+        alice
+            .send(
+                r#"{"type":"limit","instrument":"OUTRO/BRL","side":"sell","price":2005,"lots":3}"#,
+            )
+            .await;
+        assert_eq!(
+            alice.recv().await,
+            r#"{"type":"rested","instrument":"OUTRO/BRL","order":1,"lots":3}"#
+        );
+
+        let mut bob = Client::login(address, 2).await;
+        bob.send(r#"{"type":"deposit","asset":"BRL","amount":10000}"#)
+            .await;
+        bob.recv().await;
+        bob.send(r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":3000,"lots":3}"#)
+            .await;
+        assert_eq!(
+            bob.recv().await,
+            r#"{"type":"rested","instrument":"TESTE/BRL","order":2,"lots":3}"#
+        );
+        bob.send(r#"{"type":"market","instrument":"OUTRO/BRL","side":"buy","lots":1}"#)
+            .await;
+        assert!(
+            bob.recv()
+                .await
+                .starts_with(r#"{"type":"rejected","order":3,"code":"insufficient_funds""#)
+        );
+        bob.send(r#"{"type":"cancel","instrument":"TESTE/BRL","order":2}"#)
+            .await;
+        assert_eq!(
+            bob.recv().await,
+            r#"{"type":"cancelled","instrument":"TESTE/BRL","order":2,"lots":3}"#
+        );
+        bob.send(r#"{"type":"market","instrument":"OUTRO/BRL","side":"buy","lots":2}"#)
+            .await;
+        assert_eq!(
+            bob.recv().await,
+            r#"{"type":"fill","instrument":"OUTRO/BRL","taker":4,"maker":1,"lots":2,"price":2005,"fee":5}"#
+        );
+        bob.send(r#"{"type":"balance"}"#).await;
+        assert_eq!(
+            bob.recv().await,
+            r#"{"type":"balances","balances":[{"asset":"TESTE","available":0,"reserved":0},{"asset":"BRL","available":5985,"reserved":0},{"asset":"OUTRO","available":20,"reserved":0}]}"#
+        );
+
+        for expected in [
+            r#"{"type":"depth","instrument":"OUTRO/BRL","feed":"l2","seq":1,"side":"sell","price":2005,"lots":3}"#,
+            r#"{"type":"trade","instrument":"OUTRO/BRL","feed":"l2","seq":2,"price":2005,"lots":2}"#,
+            r#"{"type":"depth","instrument":"OUTRO/BRL","feed":"l2","seq":3,"side":"sell","price":2005,"lots":1}"#,
+        ] {
+            assert_eq!(watcher.recv().await, expected);
+        }
+    }
 
     async fn subscriber(address: SocketAddr, feed: &str) -> Client {
         let mut client = Client::connect(address).await;

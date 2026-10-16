@@ -5,24 +5,45 @@ use exchange_core::engine::{Engine, FeeSchedule, ListingConfig, RiskLimits};
 
 use crate::market_data::MarketData;
 
-pub const INSTRUMENTS: [(&str, InstrumentId); 1] = [("TESTE/BRL", InstrumentId::new(1))];
+pub const INSTRUMENTS: [(&str, InstrumentId); 2] = [
+    ("TESTE/BRL", InstrumentId::new(1)),
+    ("OUTRO/BRL", InstrumentId::new(2)),
+];
 pub const HOUSE: AccountId = AccountId::new(0);
 pub const TESTE: AssetId = AssetId::new(1);
 pub const BRL: AssetId = AssetId::new(2);
-pub const ASSETS: [(&str, AssetId); 2] = [("TESTE", TESTE), ("BRL", BRL)];
+pub const OUTRO: AssetId = AssetId::new(3);
+pub const ASSETS: [(&str, AssetId); 3] = [("TESTE", TESTE), ("BRL", BRL), ("OUTRO", OUTRO)];
 
-// TESTE/BRL: preço em centavos por lot, tick de 10 centavos, 1 lot = 100 unidades de TESTE.
-// Risco: no máximo 1.000 lots por ordem e colar de 10% sobre o melhor preço oposto.
-fn listings() -> [ListingConfig; 1] {
-    let tick = Price::new(10).expect("tick fixo é positivo");
-    let lot_size = Amount::new(100).expect("lot fixo é positivo");
-    let instrument = Instrument::new(INSTRUMENTS[0].1, TESTE, BRL, tick, lot_size)
-        .expect("especificação fixa é válida");
+// Preço em centavos por lot; colar sobre o melhor preço oposto.
+// TESTE/BRL: tick de 10 centavos, 1 lot = 100 unidades de TESTE, até 1.000 lots, colar de 10%.
+// OUTRO/BRL: tick de 5 centavos, 1 lot = 10 unidades de OUTRO, até 500 lots, colar de 5%.
+// Especificações diferentes de propósito: usar a de um instrumento no outro quebra testes.
+fn listings() -> [ListingConfig; 2] {
+    [
+        listing(INSTRUMENTS[0].1, TESTE, 10, 100, 1_000, 1_000),
+        listing(INSTRUMENTS[1].1, OUTRO, 5, 10, 500, 500),
+    ]
+}
+
+/// Um par `base/BRL`; os `expect` registram que os números fixos acima são válidos.
+fn listing(
+    id: InstrumentId,
+    base: AssetId,
+    tick: i64,
+    lot_size: i64,
+    max_lots: i64,
+    collar_bps: u32,
+) -> ListingConfig {
+    let tick = Price::new(tick).expect("tick fixo é positivo");
+    let lot_size = Amount::new(lot_size).expect("lot fixo é positivo");
+    let instrument =
+        Instrument::new(id, base, BRL, tick, lot_size).expect("especificação fixa é válida");
     let risk = RiskLimits {
-        max_lots: Lots::new(1_000).expect("limite fixo é válido"),
-        collar: Bps::new(1_000).expect("10% é menos que 100%"),
+        max_lots: Lots::new(max_lots).expect("limite fixo é válido"),
+        collar: Bps::new(collar_bps).expect("colar fixo é menos que 100%"),
     };
-    [ListingConfig { instrument, risk }]
+    ListingConfig { instrument, risk }
 }
 
 /// # Panics

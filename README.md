@@ -29,7 +29,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **Em andamento: F7** — endurecimento: benchmarks e group commit no WAL feitos; faltam snapshots, stop orders e múltiplos instrumentos.
+- **Em andamento: F7** — endurecimento: benchmarks, group commit no WAL e segundo instrumento feitos; faltam stop orders e snapshots.
 - **Depois das fases F4–F7: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
@@ -46,14 +46,21 @@ Um comando por linha:
 
 | Comando | Efeito |
 |---|---|
-| `deposit <ativo> <quantia>` | credita a conta (ativos: `TESTE`, `BRL`) |
+| `deposit <ativo> <quantia>` | credita a conta (ativos: `TESTE`, `OUTRO`, `BRL`) |
 | `buy\|sell <instrumento> <preço> <lots> [gtc\|ioc\|fok]` | ordem limite |
 | `buy\|sell <instrumento> mkt <lots> [max <proteção>] [gtc\|ioc\|fok]` | ordem a mercado; sem `max`, a proteção vem do colar de preço |
 | `cancel <instrumento> <id>` | cancela uma ordem descansando |
 | `balance` | saldos disponível e reservado |
 | `quit` | sai |
 
-Unidades inteiras, sem casas decimais: preço em centavos por lot, quantidade em lots, quantias em unidades-mínimas do ativo. Só existe o instrumento `TESTE/BRL` (tick de 10 centavos, 1 lot = 100 unidades de TESTE), com taxa de taker de 10 bps, no máximo 1.000 lots por ordem e colar de 10%.
+Unidades inteiras, sem casas decimais: preço em centavos por lot, quantidade em lots, quantias em unidades-mínimas do ativo. Há dois instrumentos, com taxa de taker de 10 bps nos dois:
+
+| Instrumento | Tick | 1 lot | Máximo por ordem | Colar |
+|---|---|---|---|---|
+| `TESTE/BRL` | 10 centavos | 100 unidades de TESTE | 1.000 lots | 10% |
+| `OUTRO/BRL` | 5 centavos | 10 unidades de OUTRO | 500 lots | 5% |
+
+Cada instrumento tem o seu livro e o seu feed, e os dois dividem o mesmo ledger: o BRL travado por uma ordem num livro não pode ser usado no outro.
 
 ```
 deposit BRL 10000000
