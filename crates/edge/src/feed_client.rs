@@ -6,12 +6,13 @@ use std::io;
 use std::ops::ControlFlow;
 
 use exchange_core::domain::InstrumentId;
+use exchange_protocol::{ClientMessage, ServerMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::market::{instrument_id, symbol};
 use crate::market_data::{Feed, Gap, LocalBook};
-use crate::protocol::{self, FeedMessage, ServerMessage};
+use crate::protocol::{FeedMessage, wire_feed};
 
 /// O que fazer depois de uma mensagem do servidor.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -53,7 +54,7 @@ impl Tracker {
         if let ServerMessage::Error { message } = message {
             return Action::ServerError(message);
         }
-        match message.into_feed() {
+        match FeedMessage::from_wire(message) {
             Some(FeedMessage::Snapshot(snapshot))
                 if snapshot.instrument == self.instrument && snapshot.feed == self.feed =>
             {
@@ -80,12 +81,11 @@ impl Tracker {
 }
 
 fn subscribe_line(instrument: &str, feed: Feed) -> String {
-    let message = serde_json::json!({
-        "type": "subscribe",
-        "instrument": instrument,
-        "feed": protocol::Feed::from(feed),
-    });
-    format!("{message}\n")
+    ClientMessage::Subscribe {
+        instrument: instrument.to_string(),
+        feed: wire_feed(feed),
+    }
+    .to_line()
 }
 
 /// Assina `instrument` no fluxo `feed` e segue o livro até o servidor fechar a conexão ou
@@ -114,7 +114,7 @@ pub async fn follow(
     let mut tracker = Tracker::new(id, feed);
     while let Some(line) = lines.next_line().await? {
         // Mensagem que este cliente não entende (de um servidor mais novo) é ignorada.
-        let Ok(message) = serde_json::from_str::<ServerMessage>(&line) else {
+        let Ok(message) = ServerMessage::from_line(&line) else {
             continue;
         };
         let action = tracker.handle(message);
@@ -282,9 +282,7 @@ mod tests {
         });
         assert_eq!(tracker.handle(l1), Action::Ignore);
         assert_eq!(
-            tracker.handle(ServerMessage::LoggedIn {
-                account: exchange_core::domain::AccountId::new(1)
-            }),
+            tracker.handle(ServerMessage::LoggedIn { account: 1 }),
             Action::Ignore
         );
         assert_eq!(tracker.book().unwrap().seq(), 0);
@@ -310,13 +308,11 @@ mod tests {
             ServerMessage::Error {
                 message: "x".to_string(),
             },
-            ServerMessage::LoggedIn {
-                account: exchange_core::domain::AccountId::new(3),
-            },
+            ServerMessage::LoggedIn { account: 3 },
         ];
         for message in messages {
             let line = message.to_line();
-            let back: ServerMessage = serde_json::from_str(line.trim_end()).unwrap();
+            let back = ServerMessage::from_line(line.trim_end()).unwrap();
             assert_eq!(back, message, "{line}");
         }
     }
@@ -425,7 +421,7 @@ mod tests {
             ]
         );
         assert_eq!(final_asks, Some(vec![quote(10_000, 5), quote(10_100, 2)]));
-        let subscribe = r#"{"feed":"l2","instrument":"TESTE/BRL","type":"subscribe"}"#;
+        let subscribe = r#"{"type":"subscribe","instrument":"TESTE/BRL","feed":"l2"}"#;
         assert_eq!(
             server.await.unwrap(),
             vec![subscribe.to_string(), subscribe.to_string()]

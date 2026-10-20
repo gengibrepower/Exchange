@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exchange_core::domain::{AccountId, InstrumentId};
+use exchange_protocol::{AssetBalance, ClientMessage, ServerMessage};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
@@ -19,7 +20,7 @@ use tokio::time::Instant;
 use crate::core_thread::{CoreError, CoreHandle, Reports};
 use crate::market::{ASSETS, HOUSE};
 use crate::market_data::{Feed, Update};
-use crate::protocol::{self, AssetBalance, ClientMessage, Inbound, ServerMessage};
+use crate::protocol::{self, Inbound};
 
 /// Linha maior que isso sem `\n` não é protocolo: é erro e a conexão fecha, para um
 /// cliente não fazer o servidor acumular memória sem fim (seção 6).
@@ -142,14 +143,17 @@ pub async fn respond(
         let ClientMessage::Login { account } = message else {
             return Ok(vec![error("faça login primeiro")]);
         };
+        let account = AccountId::new(account);
         if account == HOUSE {
             return Ok(vec![error("a conta da casa não negocia")]);
         }
         *state = Session::Active(core.reports(account).await?);
-        return Ok(vec![ServerMessage::LoggedIn { account }]);
+        return Ok(vec![ServerMessage::LoggedIn {
+            account: account.get(),
+        }]);
     };
     let account = reports.account();
-    match message.resolve(account) {
+    match protocol::resolve(message, account) {
         Err(problem) => Ok(vec![error(problem.to_string())]),
         Ok(Inbound::Login(_)) => Ok(vec![error(format!(
             "sessão já autenticada como conta {}",
@@ -163,7 +167,7 @@ pub async fn respond(
                 .iter()
                 .chain([&submitted.events])
                 .flatten()
-                .flat_map(|event| ServerMessage::from_event(account, event))
+                .flat_map(|event| protocol::from_event(account, event))
                 .collect())
         }
         Ok(Inbound::Subscribe { instrument, feed }) => {
@@ -238,8 +242,8 @@ async fn balances(core: &CoreHandle, account: AccountId) -> Result<ServerMessage
         let balance = core.balance(account, asset).await?;
         balances.push(AssetBalance {
             asset: name.to_string(),
-            available: balance.available,
-            reserved: balance.reserved,
+            available: balance.available.get(),
+            reserved: balance.reserved.get(),
         });
     }
     Ok(ServerMessage::Balances { balances })
@@ -301,7 +305,7 @@ async fn next_report(state: &mut Session) -> Result<Vec<ServerMessage>, CoreErro
     let events = reports.next().await?;
     Ok(events
         .iter()
-        .flat_map(|event| ServerMessage::from_event(account, event))
+        .flat_map(|event| protocol::from_event(account, event))
         .collect())
 }
 
