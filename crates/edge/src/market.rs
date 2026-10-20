@@ -21,7 +21,7 @@ pub const ASSETS: [(&str, AssetId); 3] = [("TESTE", TESTE), ("BRL", BRL), ("OUTR
 // TESTE/BRL: tick de 10 centavos, 1 lot = 100 unidades de TESTE, até 1.000 lots, colar de 10%.
 // OUTRO/BRL: tick de 5 centavos, 1 lot = 10 unidades de OUTRO, até 500 lots, colar de 5%.
 // Especificações diferentes de propósito: usar a de um instrumento no outro quebra testes.
-fn listings() -> [ListingConfig; 2] {
+pub fn listings() -> [ListingConfig; 2] {
     [
         listing(INSTRUMENTS[0].1, TESTE, 10, 100, 1_000, 1_000),
         listing(INSTRUMENTS[1].1, OUTRO, 5, 10, 500, 500),

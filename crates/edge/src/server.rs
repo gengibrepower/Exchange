@@ -138,6 +138,7 @@ pub async fn respond(
                     Err(problem) => Ok(vec![error(problem.to_string())]),
                 };
             }
+            ClientMessage::Instruments {} => return Ok(vec![protocol::instruments()]),
             other => other,
         };
         let ClientMessage::Login { account } = message else {
@@ -160,6 +161,7 @@ pub async fn respond(
             account.get()
         ))]),
         Ok(Inbound::Balance) => Ok(vec![balances(core, account).await?]),
+        Ok(Inbound::Instruments) => Ok(vec![protocol::instruments()]),
         Ok(Inbound::Submit(intent)) => {
             let submitted = reports.submit(intent).await?;
             Ok(submitted
@@ -524,6 +526,21 @@ mod tests {
             client.recv().await,
             r#"{"type":"error","message":"faça login primeiro"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn instruments_are_listed_before_and_after_login() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut client = Client::connect(address).await;
+        let listing = r#"{"type":"instruments","instruments":[{"symbol":"TESTE/BRL","base":"TESTE","quote":"BRL","tick":10,"lot_size":100,"max_lots":1000},{"symbol":"OUTRO/BRL","base":"OUTRO","quote":"BRL","tick":5,"lot_size":10,"max_lots":500}]}"#;
+
+        client.send(r#"{"type":"instruments"}"#).await;
+        assert_eq!(client.recv().await, listing);
+
+        client.send(r#"{"type":"login","account":1}"#).await;
+        client.recv().await;
+        client.send(r#"{"type":"instruments"}"#).await;
+        assert_eq!(client.recv().await, listing);
     }
 
     #[tokio::test]
