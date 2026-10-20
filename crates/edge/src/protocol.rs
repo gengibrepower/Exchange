@@ -13,9 +13,11 @@ use exchange_core::domain::{
     Side as CoreSide, TimeInForce,
 };
 use exchange_core::engine::{Event, RejectReason};
-use exchange_protocol::{ClientMessage, Feed, Level, Role, ServerMessage, Side, Tif};
+use exchange_protocol::{
+    ClientMessage, Feed, InstrumentSpec, Level, Role, ServerMessage, Side, Tif,
+};
 
-use crate::market::{asset_id, asset_name, instrument_id, symbol};
+use crate::market::{asset_id, asset_name, instrument_id, listings, symbol};
 use crate::market_data::{Body, Feed as CoreFeed, Quote, Snapshot, Update};
 use crate::sequencer::Intent;
 
@@ -60,6 +62,7 @@ fn time_in_force(tif: Tif) -> TimeInForce {
 pub enum Inbound {
     Login(AccountId),
     Balance,
+    Instruments,
     Submit(Intent),
     Subscribe {
         instrument: InstrumentId,
@@ -109,6 +112,7 @@ pub fn resolve(message: ClientMessage, account: AccountId) -> Result<Inbound, Pr
     let intent = match message {
         ClientMessage::Login { account } => return Ok(Inbound::Login(AccountId::new(account))),
         ClientMessage::Balance {} => return Ok(Inbound::Balance),
+        ClientMessage::Instruments {} => return Ok(Inbound::Instruments),
         ClientMessage::Subscribe { instrument, feed } => {
             let (instrument, feed) = subscription(instrument, feed)?;
             return Ok(Inbound::Subscribe { instrument, feed });
@@ -184,6 +188,25 @@ pub fn subscription(
     feed: Feed,
 ) -> Result<(InstrumentId, CoreFeed), ProtocolError> {
     Ok((known_instrument(instrument)?, core_feed(feed)))
+}
+
+/// A especificação de cada instrumento, tirada da mesma configuração que monta o engine.
+pub fn instruments() -> ServerMessage {
+    let instruments = listings()
+        .iter()
+        .map(|listing| {
+            let instrument = listing.instrument;
+            InstrumentSpec {
+                symbol: symbol(instrument.id()).to_string(),
+                base: asset_name(instrument.base()).to_string(),
+                quote: asset_name(instrument.quote()).to_string(),
+                tick: instrument.tick().get(),
+                lot_size: instrument.lot_size().get(),
+                max_lots: listing.risk.max_lots.get(),
+            }
+        })
+        .collect();
+    ServerMessage::Instruments { instruments }
 }
 
 fn known_instrument(name: String) -> Result<InstrumentId, ProtocolError> {
@@ -653,6 +676,10 @@ mod tests {
             Ok(Inbound::Login(AccountId::new(1)))
         );
         assert_eq!(resolved(r#"{"type":"balance"}"#), Ok(Inbound::Balance));
+        assert_eq!(
+            resolved(r#"{"type":"instruments"}"#),
+            Ok(Inbound::Instruments)
+        );
     }
 
     #[test]

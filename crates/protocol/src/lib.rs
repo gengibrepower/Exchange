@@ -95,12 +95,27 @@ pub enum ClientMessage {
         instrument: String,
         feed: Feed,
     },
+    /// Pública, como o feed: a especificação de cada instrumento negociado, para o cliente
+    /// não precisar repetir tick e tamanho de lot que só o servidor sabe.
+    Instruments {},
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Level {
     pub price: i64,
     pub lots: i64,
+}
+
+/// Preço em unidades-mínimas da quote por lot, sempre múltiplo de `tick`; um lot vale
+/// `lot_size` unidades-mínimas da base.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct InstrumentSpec {
+    pub symbol: String,
+    pub base: String,
+    pub quote: String,
+    pub tick: i64,
+    pub lot_size: i64,
+    pub max_lots: i64,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -174,6 +189,9 @@ pub enum ServerMessage {
     },
     Balances {
         balances: Vec<AssetBalance>,
+    },
+    Instruments {
+        instruments: Vec<InstrumentSpec>,
     },
     Error {
         message: String,
@@ -331,6 +349,10 @@ mod tests {
                 feed: Feed::L2
             })
         );
+        assert_eq!(
+            decode(r#"{"type":"instruments"}"#),
+            Ok(ClientMessage::Instruments {})
+        );
     }
 
     #[test]
@@ -375,6 +397,7 @@ mod tests {
         );
         assert!(detail.contains("lot"), "{detail}");
         malformed(r#"{"type":"balance","account":1}"#);
+        malformed(r#"{"type":"instruments","symbol":"TESTE/BRL"}"#);
     }
 
     #[test]
@@ -486,6 +509,28 @@ mod tests {
             .to_line(),
             "{\"type\":\"error\",\"message\":\"x\"}\n"
         );
+    }
+
+    #[test]
+    fn instruments_serialize_as_documented() {
+        let instruments = ServerMessage::Instruments {
+            instruments: vec![InstrumentSpec {
+                symbol: "TESTE/BRL".to_string(),
+                base: "TESTE".to_string(),
+                quote: "BRL".to_string(),
+                tick: 10,
+                lot_size: 100,
+                max_lots: 1_000,
+            }],
+        };
+        let line = instruments.to_line();
+
+        assert_eq!(
+            line,
+            "{\"type\":\"instruments\",\"instruments\":[{\"symbol\":\"TESTE/BRL\",\"base\":\"TESTE\",\
+             \"quote\":\"BRL\",\"tick\":10,\"lot_size\":100,\"max_lots\":1000}]}\n"
+        );
+        assert_eq!(ServerMessage::from_line(&line).unwrap(), instruments);
     }
 
     #[test]
