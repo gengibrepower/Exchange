@@ -98,12 +98,49 @@ pub enum ClientMessage {
     /// Pública, como o feed: a especificação de cada instrumento negociado, para o cliente
     /// não precisar repetir tick e tamanho de lot que só o servidor sabe.
     Instruments {},
+    /// As ordens abertas da conta da sessão, inclusive as de antes da conexão.
+    Orders {},
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Level {
     pub price: i64,
     pub lots: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderType {
+    Limit,
+    Market,
+    Stop,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderState {
+    /// No livro, esperando contraparte.
+    Resting,
+    /// Stop dormente, fora do livro até o gatilho.
+    Armed,
+}
+
+/// Uma ordem aberta como foi pedida e quanto falta. `price` é o limite (de uma limite ou de
+/// um stop limite); `trigger`, o gatilho de um stop, que continua aparecendo depois do
+/// disparo.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct OpenOrder {
+    pub instrument: String,
+    pub order: u64,
+    pub side: Side,
+    #[serde(rename = "type")]
+    pub kind: OrderType,
+    pub price: Option<i64>,
+    pub trigger: Option<i64>,
+    pub tif: Tif,
+    pub lots: i64,
+    pub remaining: i64,
+    pub state: OrderState,
 }
 
 /// Preço em unidades-mínimas da quote por lot, sempre múltiplo de `tick`; um lot vale
@@ -157,6 +194,8 @@ pub enum ServerMessage {
     Rested {
         instrument: String,
         order: u64,
+        side: Side,
+        price: i64,
         lots: i64,
     },
     Cancelled {
@@ -192,6 +231,9 @@ pub enum ServerMessage {
     },
     Instruments {
         instruments: Vec<InstrumentSpec>,
+    },
+    Orders {
+        orders: Vec<OpenOrder>,
     },
     Error {
         message: String,
@@ -353,6 +395,7 @@ mod tests {
             decode(r#"{"type":"instruments"}"#),
             Ok(ClientMessage::Instruments {})
         );
+        assert_eq!(decode(r#"{"type":"orders"}"#), Ok(ClientMessage::Orders {}));
     }
 
     #[test]
@@ -398,6 +441,7 @@ mod tests {
         assert!(detail.contains("lot"), "{detail}");
         malformed(r#"{"type":"balance","account":1}"#);
         malformed(r#"{"type":"instruments","symbol":"TESTE/BRL"}"#);
+        malformed(r#"{"type":"orders","instrument":"TESTE/BRL"}"#);
     }
 
     #[test]
@@ -531,6 +575,33 @@ mod tests {
              \"quote\":\"BRL\",\"tick\":10,\"lot_size\":100,\"max_lots\":1000}]}\n"
         );
         assert_eq!(ServerMessage::from_line(&line).unwrap(), instruments);
+    }
+
+    #[test]
+    fn open_orders_serialize_as_documented() {
+        let orders = ServerMessage::Orders {
+            orders: vec![OpenOrder {
+                instrument: "TESTE/BRL".to_string(),
+                order: 4,
+                side: Side::Sell,
+                kind: OrderType::Stop,
+                price: Some(9_400),
+                trigger: Some(9_500),
+                tif: Tif::Gtc,
+                lots: 5,
+                remaining: 5,
+                state: OrderState::Armed,
+            }],
+        };
+        let line = orders.to_line();
+
+        assert_eq!(
+            line,
+            "{\"type\":\"orders\",\"orders\":[{\"instrument\":\"TESTE/BRL\",\"order\":4,\
+             \"side\":\"sell\",\"type\":\"stop\",\"price\":9400,\"trigger\":9500,\"tif\":\"gtc\",\
+             \"lots\":5,\"remaining\":5,\"state\":\"armed\"}]}\n"
+        );
+        assert_eq!(ServerMessage::from_line(&line).unwrap(), orders);
     }
 
     #[test]

@@ -162,6 +162,9 @@ pub async fn respond(
         ))]),
         Ok(Inbound::Balance) => Ok(vec![balances(core, account).await?]),
         Ok(Inbound::Instruments) => Ok(vec![protocol::instruments()]),
+        Ok(Inbound::Orders) => Ok(vec![protocol::open_orders(
+            &core.open_orders(account).await?,
+        )]),
         Ok(Inbound::Submit(intent)) => {
             let submitted = reports.submit(intent).await?;
             Ok(submitted
@@ -492,7 +495,7 @@ mod tests {
             .await;
         assert_eq!(
             alice.recv().await,
-            r#"{"type":"rested","instrument":"TESTE/BRL","order":1,"lots":5}"#
+            r#"{"type":"rested","instrument":"TESTE/BRL","order":1,"side":"sell","price":10000,"lots":5}"#
         );
 
         bob.send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2}"#)
@@ -541,6 +544,57 @@ mod tests {
         client.recv().await;
         client.send(r#"{"type":"instruments"}"#).await;
         assert_eq!(client.recv().await, listing);
+    }
+
+    #[tokio::test]
+    async fn orders_lists_what_the_account_left_open_even_from_another_session() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut alice = Client::login(address, 1).await;
+        let mut bob = Client::login(address, 2).await;
+        alice.fund().await;
+        bob.fund().await;
+        let orders = [
+            r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":5}"#,
+            r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":9500,"limit":9400,"lots":2}"#,
+            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":9000,"lots":1,"tif":"ioc"}"#,
+        ];
+        for order in orders {
+            alice.send(order).await;
+            alice.recv().await;
+        }
+        bob.send(r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":9900,"lots":4}"#)
+            .await;
+        bob.recv().await;
+        bob.send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2}"#)
+            .await;
+        bob.recv().await;
+        drop(alice);
+
+        let mut later = Client::login(address, 1).await;
+        later.send(r#"{"type":"orders"}"#).await;
+
+        assert_eq!(
+            later.recv().await,
+            concat!(
+                r#"{"type":"orders","orders":["#,
+                r#"{"instrument":"TESTE/BRL","order":1,"side":"sell","type":"limit","price":10000,"trigger":null,"tif":"gtc","lots":5,"remaining":3,"state":"resting"},"#,
+                r#"{"instrument":"TESTE/BRL","order":2,"side":"sell","type":"stop","price":9400,"trigger":9500,"tif":"gtc","lots":2,"remaining":2,"state":"armed"}"#,
+                r#"]}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn orders_needs_a_login() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut client = Client::connect(address).await;
+
+        client.send(r#"{"type":"orders"}"#).await;
+
+        assert_eq!(
+            client.recv().await,
+            r#"{"type":"error","message":"faça login primeiro"}"#
+        );
     }
 
     #[tokio::test]
@@ -960,7 +1014,7 @@ mod tests {
             .await;
         assert_eq!(
             alice.recv().await,
-            r#"{"type":"rested","instrument":"OUTRO/BRL","order":1,"lots":3}"#
+            r#"{"type":"rested","instrument":"OUTRO/BRL","order":1,"side":"sell","price":2005,"lots":3}"#
         );
 
         let mut bob = Client::login(address, 2).await;
@@ -971,7 +1025,7 @@ mod tests {
             .await;
         assert_eq!(
             bob.recv().await,
-            r#"{"type":"rested","instrument":"TESTE/BRL","order":2,"lots":3}"#
+            r#"{"type":"rested","instrument":"TESTE/BRL","order":2,"side":"buy","price":3000,"lots":3}"#
         );
         bob.send(r#"{"type":"market","instrument":"OUTRO/BRL","side":"buy","lots":1}"#)
             .await;

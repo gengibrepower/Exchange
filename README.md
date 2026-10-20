@@ -149,7 +149,7 @@ $ socat - TCP:127.0.0.1:7000
 {"type":"deposit","asset":"TESTE","amount":100000}
 {"type":"deposited","asset":"TESTE","amount":100000}
 {"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":5}
-{"type":"rested","instrument":"TESTE/BRL","order":1,"lots":5}
+{"type":"rested","instrument":"TESTE/BRL","order":1,"side":"sell","price":10000,"lots":5}
 ```
 
 Em outro terminal, outra conta compra parte dessa oferta:
@@ -185,8 +185,11 @@ Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
 | `balance` | — | saldos da conta da sessão |
 | `subscribe` | `instrument`, `feed` (`l1`/`l2`) | assina o feed (não exige login); assinar de novo traz um snapshot novo |
 | `instruments` | — | a especificação de cada instrumento: `symbol`, `base`, `quote`, `tick`, `lot_size` e `max_lots` (não exige login) |
+| `orders` | — | as ordens abertas da conta, inclusive as de antes da conexão |
 
-O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances`, `instruments` e `error`. O `fill` fala só da ordem de quem recebe: `role` diz se ela era `taker` ou `maker`, `fee` é o que essa conta pagou (o maker não paga), e um autonegócio vira duas linhas, uma por ordem.
+O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances`, `instruments`, `orders` e `error`. O `fill` fala só da ordem de quem recebe: `role` diz se ela era `taker` ou `maker`, `fee` é o que essa conta pagou (o maker não paga), e um autonegócio vira duas linhas, uma por ordem. O `rested` traz o `side` e o `price` em que a sobra ficou no livro.
+
+O `orders` lista as ordens descansando no livro (`"state":"resting"`) e os stops dormentes (`"armed"`), em ordem de id, com o pedido original (`type`, `price`, `trigger`, `tif`, `lots`) e o que falta (`remaining`). A resposta mostra o estado no ponto em que a consulta entrou na fila do núcleo; um relatório que já estava a caminho pode chegar depois dela e repetir o que ela mostra, então quem junta os dois junta pelo id da ordem.
 
 Cada sessão recebe tudo que acontece com a sua conta, inclusive o que vem do comando de outra sessão: o fill de uma ordem descansando, o disparo de um stop. Nunca recebe o que é de outra conta: quem dispara o stop alheio vê o próprio negócio e nada do stop. Tudo chega num fluxo só, na ordem do núcleo, então o fill que explica a recusa de um cancelamento chega antes dela. Uma sessão que acumula 1.024 entregas sem ler é desconectada com um `error`: o núcleo não espera ninguém, e descartar em silêncio perderia um fill que não há como pedir de novo.
 

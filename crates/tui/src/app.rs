@@ -347,7 +347,8 @@ impl App {
             | ServerMessage::Rejected { .. }
             | ServerMessage::Armed { .. }
             | ServerMessage::Triggered { .. }
-            | ServerMessage::Balances { .. } => Vec::new(),
+            | ServerMessage::Balances { .. }
+            | ServerMessage::Orders { .. } => Vec::new(),
         }
     }
 

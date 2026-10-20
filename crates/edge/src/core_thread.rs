@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 use std::thread::{self, JoinHandle};
 
 use exchange_core::domain::{AccountId, AssetId, InstrumentId};
-use exchange_core::engine::Event;
+use exchange_core::engine::{EngineState, Event, OpenOrder};
 use exchange_core::ledger::Balance;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -122,6 +122,17 @@ enum Query {
         feed: Feed,
         reply: oneshot::Sender<Option<Snapshot>>,
     },
+    OpenOrders {
+        account: AccountId,
+        reply: oneshot::Sender<Vec<AccountOrder>>,
+    },
+}
+
+/// Uma ordem aberta da conta: descansando no livro ou, se `armed`, um stop dormente.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AccountOrder {
+    pub order: OpenOrder,
+    pub armed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -224,6 +235,21 @@ impl CoreHandle {
                 asset,
                 reply,
             }))
+            .await
+            .map_err(|_| CoreError::Stopped)?;
+        response.await.map_err(|_| CoreError::Stopped)
+    }
+
+    /// As ordens abertas de `account`, em ordem de id, no ponto da fila em que a consulta
+    /// entrou. Relatórios ainda a caminho da sessão podem chegar depois e repetir o que a
+    /// resposta já mostra: quem junta os dois deve juntar pelo id.
+    ///
+    /// # Errors
+    /// [`CoreError::Stopped`] se o núcleo parou antes de receber ou de responder.
+    pub async fn open_orders(&self, account: AccountId) -> Result<Vec<AccountOrder>, CoreError> {
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .send(Request::Query(Query::OpenOrders { account, reply }))
             .await
             .map_err(|_| CoreError::Stopped)?;
         response.await.map_err(|_| CoreError::Stopped)
@@ -592,7 +618,34 @@ fn answer(sequencer: &Sequencer, market_data: &MarketData, query: Query) {
         } => {
             let _ = reply.send(market_data.snapshot(instrument, feed));
         }
+        Query::OpenOrders { account, reply } => {
+            let _ = reply.send(open_orders(sequencer.engine_state(), account));
+        }
     }
+}
+
+/// Copia o estado inteiro, o mesmo do snapshot, para filtrar uma conta: uma consulta rara
+/// (a TUI faz uma no login) não justifica um caminho próprio no núcleo.
+fn open_orders(state: EngineState, account: AccountId) -> Vec<AccountOrder> {
+    let mut orders: Vec<AccountOrder> = state
+        .instruments
+        .into_iter()
+        .flat_map(|instrument| {
+            let resting = instrument.bids.into_iter().chain(instrument.asks);
+            let resting = resting.map(|order| AccountOrder {
+                order,
+                armed: false,
+            });
+            let armed = instrument
+                .stops
+                .into_iter()
+                .map(|order| AccountOrder { order, armed: true });
+            resting.chain(armed)
+        })
+        .filter(|open| open.order.request.account == account)
+        .collect();
+    orders.sort_by_key(|open| open.order.request.id.get());
+    orders
 }
 
 #[cfg(test)]
