@@ -2,16 +2,30 @@
 //! [`App::update`], e o que precisa sair (uma mensagem ao servidor, o fim do programa) volta
 //! como [`Effect`] para o laço principal executar.
 
-use exchange_protocol::{ClientMessage, Feed, InstrumentSpec, Level, ServerMessage, Side};
+use std::collections::VecDeque;
+
+use exchange_protocol::{
+    AssetBalance, ClientMessage, Feed, InstrumentSpec, Level, Role, ServerMessage, Side,
+};
 
 use crate::book::{Book, Gap, Sequence};
+use crate::format::{brl, grouped};
+use crate::orders::Orders;
 
 /// Níveis por lado que o livro mostra e que o cursor alcança.
 pub const DEPTH: usize = 10;
 
+/// Negócios guardados por instrumento no painel Negócios.
+pub const TAPE: usize = 100;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Msg {
-    Server(ServerMessage),
+    /// `at` é a hora de chegada na TUI, como texto: o `trade` do feed não traz hora, e o
+    /// relógio fica do lado de fora do `update`, que continua determinístico.
+    Server {
+        message: ServerMessage,
+        at: String,
+    },
     Key(Key),
     /// O terminal mudou de tamanho: nada muda no estado, mas vale redesenhar.
     Resize,
@@ -39,6 +53,12 @@ pub enum Key {
 pub enum Effect {
     Send(ClientMessage),
     Quit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    Book,
+    Orders,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,6 +103,14 @@ pub struct Trade {
     pub tick: Tick,
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Print {
+    pub at: String,
+    pub price: i64,
+    pub lots: i64,
+    pub tick: Tick,
+}
+
 /// Uma linha do livro como a tela mostra: vendas em cima, do pior preço para o melhor, e
 /// compras embaixo, do melhor para o pior.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -107,6 +135,8 @@ pub struct Market {
     /// Fluxo L2: a profundidade, para a aba do instrumento.
     pub depth: Option<Book>,
     pub last: Option<Trade>,
+    /// Os negócios do fluxo L2, do mais recente para o mais antigo.
+    pub tape: VecDeque<Print>,
     pub selected: Option<Selection>,
 }
 
@@ -117,6 +147,7 @@ impl Market {
             top: None,
             depth: None,
             last: None,
+            tape: VecDeque::new(),
             selected: None,
         }
     }
@@ -152,6 +183,21 @@ impl Market {
             _ => Tick::Flat,
         };
         self.last = Some(Trade { price, lots, tick });
+    }
+
+    fn print(&mut self, at: &str, price: i64, lots: i64) {
+        let tick = match self.tape.front() {
+            Some(last) if price > last.price => Tick::Up,
+            Some(last) if price < last.price => Tick::Down,
+            _ => Tick::Flat,
+        };
+        self.tape.push_front(Print {
+            at: at.to_string(),
+            price,
+            lots,
+            tick,
+        });
+        self.tape.truncate(TAPE);
     }
 
     /// As linhas do livro L2 que a tela mostra, até [`DEPTH`] por lado.
@@ -216,6 +262,15 @@ pub struct App {
     pub market_cursor: usize,
     pub status: Option<Status>,
     pub help: bool,
+    pub focus: Focus,
+    pub orders: Orders,
+    /// A ordem sob o cursor no painel Minhas ordens, guardada pelo id.
+    pub order_cursor: Option<u64>,
+    pub balances: Vec<AssetBalance>,
+    /// O servidor só manda saldo quando pedido: um pedido por vez, e, se a conta mudou
+    /// enquanto ele estava no ar, outro logo depois da resposta.
+    balance_pending: bool,
+    balance_stale: bool,
 }
 
 impl App {
@@ -229,6 +284,12 @@ impl App {
             market_cursor: 0,
             status: None,
             help: false,
+            focus: Focus::Book,
+            orders: Orders::default(),
+            order_cursor: None,
+            balances: Vec::new(),
+            balance_pending: false,
+            balance_stale: false,
         }
     }
 
@@ -245,7 +306,7 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
-            Msg::Server(message) => self.on_server(message),
+            Msg::Server { message, at } => self.on_server(message, &at),
             Msg::Key(key) => self.on_key(key),
             Msg::Resize => Vec::new(),
             Msg::Disconnected(reason) => {
@@ -264,6 +325,25 @@ impl App {
         }
     }
 
+    /// Uma quantia de `asset` para gente: em reais se for a quote de algum instrumento, em
+    /// unidades inteiras se não.
+    pub fn amount(&self, asset: &str, value: i64) -> String {
+        if self.markets.iter().any(|market| market.spec.quote == asset) {
+            brl(value)
+        } else {
+            u64::try_from(value).map_or_else(|_| value.to_string(), grouped)
+        }
+    }
+
+    fn request_balance(&mut self) -> Vec<Effect> {
+        if self.balance_pending {
+            self.balance_stale = true;
+            return Vec::new();
+        }
+        self.balance_pending = true;
+        vec![Effect::Send(ClientMessage::Balance {})]
+    }
+
     fn say(&mut self, tone: Tone, text: impl Into<String>) {
         self.status = Some(Status {
             text: text.into(),
@@ -277,12 +357,14 @@ impl App {
             .find(|market| market.spec.symbol == symbol)
     }
 
-    fn on_server(&mut self, message: ServerMessage) -> Vec<Effect> {
+    fn on_server(&mut self, message: ServerMessage, at: &str) -> Vec<Effect> {
         match message {
             ServerMessage::LoggedIn { account } => {
                 self.connection = Connection::Online;
                 self.say(Tone::Ok, format!("conta {account} conectada"));
-                Vec::new()
+                let mut effects = vec![Effect::Send(ClientMessage::Orders {})];
+                effects.extend(self.request_balance());
+                effects
             }
             ServerMessage::Instruments { instruments } => self.on_instruments(instruments),
             ServerMessage::Error { message } => {
@@ -332,23 +414,167 @@ impl App {
                 seq,
                 price,
                 lots,
-            } => self.on_increment(&instrument, feed, seq, |market| {
-                if feed == Feed::L1 {
-                    market.record_trade(price, lots);
-                }
+            } => self.on_increment(&instrument, feed, seq, |market| match feed {
+                Feed::L1 => market.record_trade(price, lots),
+                Feed::L2 => market.print(at, price, lots),
             }),
-            // Os relatórios da conta e os saldos chegam à tela nas próximas versões.
-            ServerMessage::Deposited { .. }
-            | ServerMessage::DepositRejected { .. }
-            | ServerMessage::Fill { .. }
-            | ServerMessage::Rested { .. }
-            | ServerMessage::Cancelled { .. }
-            | ServerMessage::Expired { .. }
-            | ServerMessage::Rejected { .. }
-            | ServerMessage::Armed { .. }
-            | ServerMessage::Triggered { .. }
+            ServerMessage::Balances { balances } => {
+                self.balances = balances;
+                self.balance_pending = false;
+                if std::mem::take(&mut self.balance_stale) {
+                    self.request_balance()
+                } else {
+                    Vec::new()
+                }
+            }
+            ServerMessage::Orders { orders } => {
+                self.orders.open(orders);
+                Vec::new()
+            }
+            report => self.on_report(report),
+        }
+    }
+
+    /// Um relatório da conta: muda a lista de ordens, vai para a linha de status e deixa o
+    /// saldo velho, que é pedido de novo.
+    fn on_report(&mut self, report: ServerMessage) -> Vec<Effect> {
+        let Some((tone, text)) = self.describe(&report) else {
+            return Vec::new();
+        };
+        self.track(report);
+        self.say(tone, text);
+        self.request_balance()
+    }
+
+    /// O texto da linha de status; `None` para o que não é relatório da conta.
+    fn describe(&self, report: &ServerMessage) -> Option<(Tone, String)> {
+        Some(match report {
+            ServerMessage::Deposited { asset, amount } => (
+                Tone::Ok,
+                format!("depósito: {} {asset}", self.amount(asset, *amount)),
+            ),
+            ServerMessage::DepositRejected { asset, amount } => (
+                Tone::Error,
+                format!("depósito recusado: {} {asset}", self.amount(asset, *amount)),
+            ),
+            ServerMessage::Fill {
+                instrument,
+                role,
+                order,
+                lots,
+                price,
+                fee,
+            } => {
+                let role = match role {
+                    Role::Taker => "taker",
+                    Role::Maker => "maker",
+                };
+                (
+                    Tone::Ok,
+                    format!(
+                        "fill #{order} em {instrument}: {lots} lots @ {}, {role}, taxa {}",
+                        brl(*price),
+                        brl(*fee)
+                    ),
+                )
+            }
+            ServerMessage::Rested {
+                instrument,
+                order,
+                price,
+                lots,
+                ..
+            } => (
+                Tone::Info,
+                format!(
+                    "#{order} descansou: {lots} lots @ {} em {instrument}",
+                    brl(*price)
+                ),
+            ),
+            ServerMessage::Cancelled {
+                instrument,
+                order,
+                lots,
+            } => (
+                Tone::Info,
+                format!("#{order} cancelada: {lots} lots em {instrument}"),
+            ),
+            ServerMessage::Expired {
+                instrument,
+                order,
+                lots,
+            } => (
+                Tone::Info,
+                format!("#{order} expirou: {lots} lots em {instrument}"),
+            ),
+            ServerMessage::Rejected { order, message, .. } => {
+                (Tone::Error, format!("#{order} recusada: {message}"))
+            }
+            ServerMessage::Armed {
+                instrument,
+                order,
+                trigger,
+                lots,
+                ..
+            } => (
+                Tone::Info,
+                format!(
+                    "stop #{order} armado: {lots} lots em {instrument}, gatilho {}",
+                    brl(*trigger)
+                ),
+            ),
+            ServerMessage::Triggered { instrument, order } => (
+                Tone::Info,
+                format!("stop #{order} disparou em {instrument}"),
+            ),
+            ServerMessage::LoggedIn { .. }
+            | ServerMessage::Instruments { .. }
+            | ServerMessage::Error { .. }
+            | ServerMessage::Snapshot { .. }
+            | ServerMessage::Depth { .. }
+            | ServerMessage::Top { .. }
+            | ServerMessage::Trade { .. }
             | ServerMessage::Balances { .. }
-            | ServerMessage::Orders { .. } => Vec::new(),
+            | ServerMessage::Orders { .. } => return None,
+        })
+    }
+
+    fn track(&mut self, report: ServerMessage) {
+        let orders = &mut self.orders;
+        match report {
+            ServerMessage::Fill {
+                instrument,
+                order,
+                lots,
+                ..
+            } => orders.filled(&instrument, order, lots),
+            ServerMessage::Rested {
+                instrument,
+                order,
+                side,
+                price,
+                lots,
+            } => orders.rested(&instrument, order, side, price, lots),
+            ServerMessage::Cancelled {
+                instrument, order, ..
+            } => orders.cancelled(&instrument, order),
+            ServerMessage::Expired {
+                instrument, order, ..
+            } => orders.expired(&instrument, order),
+            ServerMessage::Rejected { order, code, .. } => orders.rejected(None, order, &code),
+            ServerMessage::Armed {
+                instrument,
+                order,
+                side,
+                trigger,
+                lots,
+            } => orders.armed(&instrument, order, side, trigger, lots),
+            ServerMessage::Triggered { instrument, order } => {
+                orders.triggered(&instrument, order);
+            }
+            // Os demais não mexem em ordem: depósitos só mudam saldo, e o resto nem chega
+            // aqui, porque o `describe` não o reconhece como relatório.
+            _ => {}
         }
     }
 
@@ -414,6 +640,12 @@ impl App {
         }
         match key {
             Key::Char('?') => self.help = true,
+            Key::Tab | Key::BackTab if matches!(self.tab, Tab::Instrument(_)) => {
+                self.focus = match self.focus {
+                    Focus::Book => Focus::Orders,
+                    Focus::Orders => Focus::Book,
+                };
+            }
             Key::Char(']') => self.tab = self.next_tab(true),
             Key::Char('[') => self.tab = self.next_tab(false),
             Key::Char('j') | Key::Down => self.move_cursor(true),
@@ -455,12 +687,38 @@ impl App {
                     self.market_cursor.saturating_sub(1)
                 };
             }
-            Tab::Instrument(index) => {
-                if let Some(market) = self.markets.get_mut(index) {
-                    market.move_selection(down);
+            Tab::Instrument(index) => match self.focus {
+                Focus::Book => {
+                    if let Some(market) = self.markets.get_mut(index) {
+                        market.move_selection(down);
+                    }
                 }
-            }
+                Focus::Orders => self.move_order_cursor(index, down),
+            },
         }
+    }
+
+    /// Sem ordem sob o cursor, ou se ela saiu da lista, começa pela primeira.
+    fn move_order_cursor(&mut self, market: usize, down: bool) {
+        let Some(market) = self.markets.get(market) else {
+            return;
+        };
+        let ids: Vec<u64> = self
+            .orders
+            .of(&market.spec.symbol)
+            .iter()
+            .map(|order| order.id)
+            .collect();
+        let Some(last) = ids.len().checked_sub(1) else {
+            self.order_cursor = None;
+            return;
+        };
+        let index = match ids.iter().position(|&id| Some(id) == self.order_cursor) {
+            Some(index) if down => (index + 1).min(last),
+            Some(index) => index.saturating_sub(1),
+            None => 0,
+        };
+        self.order_cursor = Some(ids[index]);
     }
 }
 
@@ -484,7 +742,10 @@ mod tests {
     }
 
     fn server(app: &mut App, message: ServerMessage) -> Vec<Effect> {
-        app.update(Msg::Server(message))
+        app.update(Msg::Server {
+            message,
+            at: "10:00:00".to_string(),
+        })
     }
 
     fn press(app: &mut App, keys: &str) {
@@ -783,6 +1044,192 @@ mod tests {
         assert_eq!(app.tab, Tab::Market);
         app.update(Msg::Key(Key::Esc));
         assert!(!app.help);
+    }
+
+    const BALANCE: Effect = Effect::Send(ClientMessage::Balance {});
+
+    fn balances(available: i64) -> ServerMessage {
+        ServerMessage::Balances {
+            balances: vec![AssetBalance {
+                asset: "BRL".to_string(),
+                available,
+                reserved: 0,
+            }],
+        }
+    }
+
+    fn rested(order: u64, price: i64, lots: i64) -> ServerMessage {
+        ServerMessage::Rested {
+            instrument: "TESTE/BRL".to_string(),
+            order,
+            side: Side::Sell,
+            price,
+            lots,
+        }
+    }
+
+    fn fill(order: u64, lots: i64) -> ServerMessage {
+        ServerMessage::Fill {
+            instrument: "TESTE/BRL".to_string(),
+            role: Role::Maker,
+            order,
+            lots,
+            price: 10_000,
+            fee: 0,
+        }
+    }
+
+    #[test]
+    fn login_asks_for_open_orders_and_balances() {
+        let mut app = App::new("x".to_string(), 1);
+
+        assert_eq!(
+            server(&mut app, ServerMessage::LoggedIn { account: 1 }),
+            [Effect::Send(ClientMessage::Orders {}), BALANCE]
+        );
+    }
+
+    #[test]
+    fn one_balance_request_at_a_time_and_another_if_the_account_moved_meanwhile() {
+        let mut app = ready();
+        server(&mut app, balances(1));
+
+        assert_eq!(server(&mut app, rested(1, 10_000, 5)), [BALANCE]);
+        assert_eq!(server(&mut app, fill(1, 2)), []);
+        assert_eq!(server(&mut app, fill(1, 1)), []);
+        assert_eq!(server(&mut app, balances(2)), [BALANCE]);
+        assert_eq!(server(&mut app, balances(3)), []);
+        assert_eq!(app.balances[0].available, 3);
+    }
+
+    #[test]
+    fn reports_move_the_orders_and_reach_the_status() {
+        let mut app = ready();
+
+        server(&mut app, rested(1, 10_050, 5));
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "#1 descansou: 5 lots @ 100,50 em TESTE/BRL"
+        );
+        server(&mut app, fill(1, 2));
+
+        let order = app.orders.get(1).unwrap();
+        assert_eq!(order.filled, 2);
+        assert_eq!(order.remaining, Some(3));
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "fill #1 em TESTE/BRL: 2 lots @ 100,00, maker, taxa 0,00"
+        );
+    }
+
+    #[test]
+    fn open_orders_answer_fills_the_list() {
+        let mut app = ready();
+
+        server(
+            &mut app,
+            ServerMessage::Orders {
+                orders: vec![exchange_protocol::OpenOrder {
+                    instrument: "TESTE/BRL".to_string(),
+                    order: 2,
+                    side: Side::Sell,
+                    kind: exchange_protocol::OrderType::Stop,
+                    price: Some(9_400),
+                    trigger: Some(9_500),
+                    tif: exchange_protocol::Tif::Gtc,
+                    lots: 2,
+                    remaining: 2,
+                    state: exchange_protocol::OrderState::Armed,
+                }],
+            },
+        );
+
+        assert_eq!(app.orders.of("TESTE/BRL").len(), 1);
+        assert_eq!(app.orders.get(2).unwrap().trigger, Some(9_500));
+    }
+
+    #[test]
+    fn rejection_goes_to_the_status_as_an_error() {
+        let mut app = ready();
+
+        server(
+            &mut app,
+            ServerMessage::Rejected {
+                order: 4,
+                code: "insufficient_funds".to_string(),
+                message: "saldo insuficiente".to_string(),
+            },
+        );
+
+        let status = app.status.as_ref().unwrap();
+        assert_eq!(status.tone, Tone::Error);
+        assert_eq!(status.text, "#4 recusada: saldo insuficiente");
+    }
+
+    #[test]
+    fn l2_trades_fill_the_tape_newest_first_with_their_arrival_time() {
+        let mut app = ready();
+
+        server(&mut app, trade(Feed::L2, 5, 10_000));
+        app.update(Msg::Server {
+            message: trade(Feed::L2, 6, 10_100),
+            at: "10:00:05".to_string(),
+        });
+
+        let tape = &teste(&app).tape;
+        assert_eq!(tape.len(), 2);
+        assert_eq!(tape[0].at, "10:00:05");
+        assert_eq!(tape[0].tick, Tick::Up);
+        assert_eq!(tape[1].price, 10_000);
+    }
+
+    #[test]
+    fn tape_keeps_only_the_latest() {
+        let mut app = ready();
+
+        for seq in 5..5 + u64::try_from(TAPE).unwrap() + 3 {
+            server(&mut app, trade(Feed::L2, seq, 10_000));
+        }
+
+        assert_eq!(teste(&app).tape.len(), TAPE);
+    }
+
+    #[test]
+    fn quote_amounts_are_reais_and_base_amounts_are_units() {
+        let app = ready();
+
+        assert_eq!(app.amount("BRL", 997_980), "9.979,80");
+        assert_eq!(app.amount("TESTE", 100_000), "100.000");
+    }
+
+    #[test]
+    fn tab_moves_the_focus_only_inside_an_instrument() {
+        let mut app = ready();
+
+        app.update(Msg::Key(Key::Tab));
+        assert_eq!(app.focus, Focus::Book);
+        press(&mut app, "]");
+        app.update(Msg::Key(Key::Tab));
+        assert_eq!(app.focus, Focus::Orders);
+        app.update(Msg::Key(Key::BackTab));
+        assert_eq!(app.focus, Focus::Book);
+    }
+
+    #[test]
+    fn order_cursor_walks_the_list_of_the_open_instrument() {
+        let mut app = ready();
+        server(&mut app, rested(1, 10_000, 5));
+        server(&mut app, rested(2, 10_100, 5));
+        press(&mut app, "]");
+        app.update(Msg::Key(Key::Tab));
+
+        press(&mut app, "j");
+        assert_eq!(app.order_cursor, Some(2));
+        press(&mut app, "jj");
+        assert_eq!(app.order_cursor, Some(1));
+        press(&mut app, "k");
+        assert_eq!(app.order_cursor, Some(2));
+        assert_eq!(teste(&app).selected, None);
     }
 
     #[test]

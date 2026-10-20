@@ -6,10 +6,11 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row as TableRow, Table, Tabs};
 
-use exchange_protocol::{Level, Side};
+use exchange_protocol::{Level, OrderType, Side, Tif};
 
-use crate::app::{App, Connection, Market, Row, Tab, Tick, Tone};
+use crate::app::{App, Connection, Focus, Market, Row, Tab, Tick, Tone};
 use crate::format::{brl, grouped};
+use crate::orders::{Order, State};
 use crate::theme;
 
 const PRICE_WIDTH: usize = 12;
@@ -31,7 +32,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     header(frame, header_area, app);
     match app.current() {
         None => market_tab(frame, body, app),
-        Some(market) => instrument_tab(frame, body, market),
+        Some(market) => instrument_tab(frame, body, app, market),
     }
     status(frame, status_area, app);
     footer(frame, footer_area, app);
@@ -158,8 +159,8 @@ fn lots(lots: i64) -> String {
     u64::try_from(lots).map_or_else(|_| lots.to_string(), grouped)
 }
 
-fn instrument_tab(frame: &mut Frame, area: Rect, market: &Market) {
-    let [main, bottom] = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).areas(area);
+fn instrument_tab(frame: &mut Frame, area: Rect, app: &App, market: &Market) {
+    let [main, bottom] = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).areas(area);
     let [book_area, right] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(main);
     let [trades, orders] =
@@ -167,23 +168,160 @@ fn instrument_tab(frame: &mut Frame, area: Rect, market: &Market) {
     let [ticket, balances] =
         Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(bottom);
 
-    book(frame, book_area, market);
-    for (title, area) in [
-        ("Negócios", trades),
-        ("Minhas ordens", orders),
-        ("Boleta", ticket),
-        ("Saldos", balances),
-    ] {
-        frame.render_widget(panel(title, false), area);
+    book(frame, book_area, market, app.focus == Focus::Book);
+    tape(frame, trades, market);
+    order_list(frame, orders, app, market);
+    frame.render_widget(panel("Boleta", false), ticket);
+    balance_list(frame, balances, app);
+}
+
+fn tape(frame: &mut Frame, area: Rect, market: &Market) {
+    let block = panel("Negócios", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if market.tape.is_empty() {
+        let waiting = Paragraph::new(Span::styled(" nenhum negócio ainda", theme::dim()));
+        frame.render_widget(waiting, inner);
+        return;
+    }
+    let lines: Vec<Line> = market
+        .tape
+        .iter()
+        .take(usize::from(inner.height))
+        .map(|print| {
+            let (style, arrow) = match print.tick {
+                Tick::Up => (theme::buy(), "▲"),
+                Tick::Down => (theme::sell(), "▼"),
+                Tick::Flat => (theme::base(), " "),
+            };
+            Line::from(vec![
+                Span::styled(format!(" {}  ", print.at), theme::dim()),
+                Span::styled(format!("{:>PRICE_WIDTH$}", brl(print.price)), style),
+                Span::raw(format!(" {:>LOTS_WIDTH$}  ", lots(print.lots))),
+                Span::styled(arrow, style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn order_list(frame: &mut Frame, area: Rect, app: &App, market: &Market) {
+    let block = panel("Minhas ordens", app.focus == Focus::Orders);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let orders = app.orders.of(&market.spec.symbol);
+    if orders.is_empty() {
+        let none = Paragraph::new(Span::styled(
+            " nenhuma ordem neste instrumento",
+            theme::dim(),
+        ));
+        frame.render_widget(none, inner);
+        return;
+    }
+    let shown = usize::from(inner.height);
+    let selected = orders
+        .iter()
+        .position(|order| Some(order.id) == app.order_cursor);
+    // A janela anda junto com o cursor quando a lista não cabe.
+    let start = selected.map_or(0, |index| (index + 1).saturating_sub(shown));
+    let lines: Vec<Line> = orders
+        .iter()
+        .skip(start)
+        .take(shown)
+        .map(|order| order_line(order, Some(order.id) == app.order_cursor))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn order_line(order: &Order, selected: bool) -> Line<'static> {
+    let open = order.state.is_open();
+    let tint = |style| if open { style } else { theme::dim() };
+    let (side, side_style) = match order.side {
+        Some(Side::Buy) => ("compra", theme::buy()),
+        Some(Side::Sell) => ("venda", theme::sell()),
+        None => ("—", theme::dim()),
+    };
+    let kind = match order.kind {
+        Some(OrderType::Limit) => "lim",
+        Some(OrderType::Market) => "mkt",
+        Some(OrderType::Stop) => "stop",
+        None => "—",
+    };
+    // Armado, o que importa é o gatilho: na compra dispara no gatilho ou acima, na venda no
+    // gatilho ou abaixo.
+    let price = match (&order.state, order.trigger, order.side) {
+        (State::Armed, Some(trigger), Some(Side::Buy)) => format!("≥{}", brl(trigger)),
+        (State::Armed, Some(trigger), Some(Side::Sell)) => format!("≤{}", brl(trigger)),
+        _ => order.price.map_or_else(|| "—".to_string(), brl),
+    };
+    let total = order.total.map_or_else(|| "?".to_string(), lots);
+    let tif = match order.tif {
+        Some(Tif::Gtc) => "GTC",
+        Some(Tif::Ioc) => "IOC",
+        Some(Tif::Fok) => "FOK",
+        None => "—",
+    };
+    let state = match order.state {
+        State::Resting => "aberta",
+        State::Armed => "armada",
+        State::Filled => "exec.",
+        State::Cancelled => "cancel.",
+        State::Expired => "expir.",
+        State::Rejected(_) => "recus.",
+    };
+    let marker = if selected { "▸ " } else { "  " };
+    let line = Line::from(vec![
+        Span::styled(marker, theme::key()),
+        Span::styled(format!("#{:<4} ", order.id), tint(theme::base())),
+        Span::styled(format!("{side:<6} "), tint(side_style)),
+        Span::styled(format!("{kind:<4} "), tint(theme::base())),
+        Span::styled(format!("{price:>10} "), tint(theme::base())),
+        Span::styled(
+            format!("{:>7} ", format!("{}/{total}", lots(order.filled))),
+            tint(theme::base()),
+        ),
+        Span::styled(format!("{tif} "), tint(theme::dim())),
+        Span::styled(state, tint(theme::key())),
+    ]);
+    if selected {
+        line.style(theme::selected())
+    } else {
+        line
     }
 }
 
-fn book(frame: &mut Frame, area: Rect, market: &Market) {
-    let block = panel(&format!("Livro {}", market.spec.symbol), true);
+fn balance_list(frame: &mut Frame, area: Rect, app: &App) {
+    let block = panel("Saldos", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.balances.is_empty() {
+        frame.render_widget(Paragraph::new(Span::styled(" …", theme::dim())), inner);
+        return;
+    }
+    let lines: Vec<Line> = app
+        .balances
+        .iter()
+        .map(|balance| {
+            Line::from(vec![
+                Span::styled(format!(" {:<6}", balance.asset), theme::title()),
+                Span::raw(format!(
+                    "{:>14}",
+                    app.amount(&balance.asset, balance.available)
+                )),
+                Span::styled("  res ", theme::dim()),
+                Span::styled(app.amount(&balance.asset, balance.reserved), theme::dim()),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn book(frame: &mut Frame, area: Rect, market: &Market, focused: bool) {
+    let block = panel(&format!("Livro {}", market.spec.symbol), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if market.depth.is_none() {
-        let waiting = Paragraph::new(Span::styled("aguardando snapshot…", theme::dim()));
+        let waiting = Paragraph::new(Span::styled(" aguardando snapshot…", theme::dim()));
         frame.render_widget(waiting, inner);
         return;
     }
@@ -197,7 +335,7 @@ fn book(frame: &mut Frame, area: Rect, market: &Market) {
     let visible = &ladder[asks - shown_asks..asks + shown_bids];
     let widest = visible.iter().map(|row| row.level.lots).max().unwrap_or(0);
     let bar_width =
-        usize::from(inner.width).saturating_sub(MARKER_WIDTH + PRICE_WIDTH + LOTS_WIDTH + 2);
+        usize::from(inner.width).saturating_sub(MARKER_WIDTH + PRICE_WIDTH + LOTS_WIDTH + 3);
 
     let mut lines = vec![Line::styled(
         format!(
@@ -302,7 +440,20 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
             ("[ ]", "aba"),
             ("q", "sair"),
         ],
-        Tab::Instrument(_) => &[("j/k", "nível"), ("[ ]", "aba"), ("q", "sair")],
+        Tab::Instrument(_) => match app.focus {
+            Focus::Book => &[
+                ("j/k", "nível"),
+                ("tab", "ordens"),
+                ("[ ]", "aba"),
+                ("q", "sair"),
+            ],
+            Focus::Orders => &[
+                ("j/k", "ordem"),
+                ("tab", "livro"),
+                ("[ ]", "aba"),
+                ("q", "sair"),
+            ],
+        },
     };
     let mut spans = vec![Span::raw(" ")];
     for (index, (key, action)) in hints.iter().enumerate() {
@@ -315,8 +466,9 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-const SHORTCUTS: [(&str, &str); 7] = [
+const SHORTCUTS: [(&str, &str); 8] = [
     ("j k ↓ ↑", "mover dentro do painel"),
+    ("tab", "trocar o foco entre livro e ordens"),
     ("[ ]", "aba anterior / próxima"),
     ("↵", "na aba Mercado, abrir o instrumento"),
     ("?", "abrir / fechar esta ajuda"),
@@ -405,7 +557,10 @@ mod tests {
             },
         ];
         for message in messages {
-            app.update(Msg::Server(message));
+            app.update(Msg::Server {
+                message,
+                at: "10:41:07".to_string(),
+            });
         }
         app
     }
@@ -434,6 +589,51 @@ mod tests {
         let ask = screen.find("10.050,00").unwrap();
         let bid = screen.find("99,90").unwrap();
         assert!(ask < bid, "vendas em cima: {screen}");
+    }
+
+    #[test]
+    fn instrument_tab_shows_tape_orders_and_balances() {
+        let mut app = trading();
+        let messages = [
+            ServerMessage::Trade {
+                instrument: "TESTE/BRL".to_string(),
+                feed: Feed::L2,
+                seq: 1,
+                price: 10_050,
+                lots: 3,
+            },
+            ServerMessage::Rested {
+                instrument: "TESTE/BRL".to_string(),
+                order: 12,
+                side: Side::Buy,
+                price: 9_990,
+                lots: 5,
+            },
+            ServerMessage::Balances {
+                balances: vec![exchange_protocol::AssetBalance {
+                    asset: "BRL".to_string(),
+                    available: 997_980,
+                    reserved: 49_950,
+                }],
+            },
+        ];
+        for message in messages {
+            app.update(Msg::Server {
+                message,
+                at: "10:41:07".to_string(),
+            });
+        }
+        app.update(Msg::Key(Key::Char(']')));
+
+        let screen = screen(&app);
+
+        assert!(screen.contains("10:41:07"), "{screen}");
+        assert!(screen.contains("#12"), "{screen}");
+        assert!(screen.contains("compra"), "{screen}");
+        assert!(screen.contains("0/5"), "{screen}");
+        assert!(screen.contains("aberta"), "{screen}");
+        assert!(screen.contains("9.979,80"), "{screen}");
+        assert!(screen.contains("res 499,50"), "{screen}");
     }
 
     #[test]

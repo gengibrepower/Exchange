@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 exchange-protocol = { path = "../protocol" }
+jiff = "0.2"
 ratatui = "0.30"
 
 [lints]

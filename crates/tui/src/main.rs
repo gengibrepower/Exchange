@@ -102,7 +102,9 @@ fn spawn_server_reader(stream: TcpStream, inbox: Sender<Msg>) {
                     let Ok(message) = ServerMessage::from_line(&line) else {
                         continue;
                     };
-                    if inbox.send(Msg::Server(message)).is_err() {
+                    // A hora de chegada, no fuso da máquina; sem fuso conhecido, UTC.
+                    let at = jiff::Zoned::now().strftime("%H:%M:%S").to_string();
+                    if inbox.send(Msg::Server { message, at }).is_err() {
                         return;
                     }
                 }
