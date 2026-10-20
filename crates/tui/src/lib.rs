@@ -6,5 +6,6 @@
 pub mod app;
 pub mod book;
 pub mod format;
+pub mod orders;
 pub mod theme;
 pub mod ui;
