@@ -14,9 +14,11 @@ use exchange_core::domain::{
 };
 use exchange_core::engine::{Event, RejectReason};
 use exchange_protocol::{
-    ClientMessage, Feed, InstrumentSpec, Level, Role, ServerMessage, Side, Tif,
+    ClientMessage, Feed, InstrumentSpec, Level, OpenOrder, OrderState, OrderType, Role,
+    ServerMessage, Side, Tif,
 };
 
+use crate::core_thread::AccountOrder;
 use crate::market::{asset_id, asset_name, instrument_id, listings, symbol};
 use crate::market_data::{Body, Feed as CoreFeed, Quote, Snapshot, Update};
 use crate::sequencer::Intent;
@@ -57,12 +59,21 @@ fn time_in_force(tif: Tif) -> TimeInForce {
     }
 }
 
+fn wire_tif(time_in_force: TimeInForce) -> Tif {
+    match time_in_force {
+        TimeInForce::Gtc => Tif::Gtc,
+        TimeInForce::Ioc => Tif::Ioc,
+        TimeInForce::Fok => Tif::Fok,
+    }
+}
+
 /// O que a sessão faz com uma mensagem já validada e com nomes traduzidos em ids.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Inbound {
     Login(AccountId),
     Balance,
     Instruments,
+    Orders,
     Submit(Intent),
     Subscribe {
         instrument: InstrumentId,
@@ -113,6 +124,7 @@ pub fn resolve(message: ClientMessage, account: AccountId) -> Result<Inbound, Pr
         ClientMessage::Login { account } => return Ok(Inbound::Login(AccountId::new(account))),
         ClientMessage::Balance {} => return Ok(Inbound::Balance),
         ClientMessage::Instruments {} => return Ok(Inbound::Instruments),
+        ClientMessage::Orders {} => return Ok(Inbound::Orders),
         ClientMessage::Subscribe { instrument, feed } => {
             let (instrument, feed) = subscription(instrument, feed)?;
             return Ok(Inbound::Subscribe { instrument, feed });
@@ -207,6 +219,37 @@ pub fn instruments() -> ServerMessage {
         })
         .collect();
     ServerMessage::Instruments { instruments }
+}
+
+pub fn open_orders(orders: &[AccountOrder]) -> ServerMessage {
+    let orders = orders
+        .iter()
+        .map(|open| {
+            let request = open.order.request;
+            let (kind, price, trigger) = match request.kind {
+                OrderKind::Limit(price) => (OrderType::Limit, Some(price), None),
+                OrderKind::Market { .. } => (OrderType::Market, None, None),
+                OrderKind::Stop { trigger, limit } => (OrderType::Stop, limit, Some(trigger)),
+            };
+            OpenOrder {
+                instrument: symbol(request.instrument).to_string(),
+                order: request.id.get(),
+                side: wire_side(request.side),
+                kind,
+                price: price.map(Price::get),
+                trigger: trigger.map(Price::get),
+                tif: wire_tif(request.time_in_force),
+                lots: request.total.get(),
+                remaining: open.order.remaining.get(),
+                state: if open.armed {
+                    OrderState::Armed
+                } else {
+                    OrderState::Resting
+                },
+            }
+        })
+        .collect();
+    ServerMessage::Orders { orders }
 }
 
 fn known_instrument(name: String) -> Result<InstrumentId, ProtocolError> {
@@ -404,11 +447,15 @@ pub fn from_event(viewer: AccountId, event: &Event) -> Vec<ServerMessage> {
         Event::Rested {
             instrument,
             order,
+            side,
+            price,
             lots,
             ..
         } => ServerMessage::Rested {
             instrument: symbol(instrument).to_string(),
             order: order.get(),
+            side: wire_side(side),
+            price: price.get(),
             lots: lots.get(),
         },
         Event::Cancelled {
@@ -755,7 +802,7 @@ mod tests {
                 price: price(10_000),
                 lots: lots(5)
             }),
-            "{\"type\":\"rested\",\"instrument\":\"TESTE/BRL\",\"order\":1,\"lots\":5}\n"
+            "{\"type\":\"rested\",\"instrument\":\"TESTE/BRL\",\"order\":1,\"side\":\"buy\",\"price\":10000,\"lots\":5}\n"
         );
         assert_eq!(
             line(&Event::Cancelled {
