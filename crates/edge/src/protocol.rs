@@ -1,153 +1,58 @@
-//! Protocolo da borda, fase 1 (seção 4.4): uma mensagem JSON por linha. Os tipos daqui são
-//! o contrato com o cliente e mudam devagar; os do núcleo podem ser refatorados sem quebrar
-//! ninguém, porque a tradução acontece só nesta fronteira.
+//! A tradução entre o fio ([`exchange_protocol`]) e o núcleo, só nesta fronteira
+//! (seção 4.4). Os números chegam crus e viram newtypes aqui: é este o saneamento antes do
+//! núcleo, e o que o domínio recusa (preço zero, lots negativo) volta como mensagem
+//! malformada.
+//!
+//! Funções livres, e não `From`: os dois lados de `Side`, `Feed` e `Tif` são de outras
+//! crates, e a regra do órfão proíbe implementar um trait de fora entre tipos de fora.
 
 use std::fmt;
 
 use exchange_core::domain::{
-    AccountId, Amount, AssetId, InstrumentId, Lots, OrderId, OrderKind, Price, Side as CoreSide,
-    TimeInForce,
+    AccountId, Amount, AssetId, DomainError, InstrumentId, Lots, OrderId, OrderKind, Price,
+    Side as CoreSide, TimeInForce,
 };
 use exchange_core::engine::{Event, RejectReason};
-use serde::{Deserialize, Serialize};
+use exchange_protocol::{ClientMessage, Feed, Level, Role, ServerMessage, Side, Tif};
 
 use crate::market::{asset_id, asset_name, instrument_id, symbol};
 use crate::market_data::{Body, Feed as CoreFeed, Quote, Snapshot, Update};
 use crate::sequencer::Intent;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-impl From<Side> for CoreSide {
-    fn from(side: Side) -> Self {
-        match side {
-            Side::Buy => Self::Bid,
-            Side::Sell => Self::Ask,
-        }
+pub fn core_side(side: Side) -> CoreSide {
+    match side {
+        Side::Buy => CoreSide::Bid,
+        Side::Sell => CoreSide::Ask,
     }
 }
 
-impl From<CoreSide> for Side {
-    fn from(side: CoreSide) -> Self {
-        match side {
-            CoreSide::Bid => Self::Buy,
-            CoreSide::Ask => Self::Sell,
-        }
+pub fn wire_side(side: CoreSide) -> Side {
+    match side {
+        CoreSide::Bid => Side::Buy,
+        CoreSide::Ask => Side::Sell,
     }
 }
 
-/// O lado de um fill: o taker chegou e cruzou, o maker estava no livro.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Taker,
-    Maker,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Feed {
-    L1,
-    L2,
-}
-
-impl From<Feed> for CoreFeed {
-    fn from(feed: Feed) -> Self {
-        match feed {
-            Feed::L1 => Self::L1,
-            Feed::L2 => Self::L2,
-        }
+pub fn core_feed(feed: Feed) -> CoreFeed {
+    match feed {
+        Feed::L1 => CoreFeed::L1,
+        Feed::L2 => CoreFeed::L2,
     }
 }
 
-impl From<CoreFeed> for Feed {
-    fn from(feed: CoreFeed) -> Self {
-        match feed {
-            CoreFeed::L1 => Self::L1,
-            CoreFeed::L2 => Self::L2,
-        }
+pub fn wire_feed(feed: CoreFeed) -> Feed {
+    match feed {
+        CoreFeed::L1 => Feed::L1,
+        CoreFeed::L2 => Feed::L2,
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Tif {
-    #[default]
-    Gtc,
-    Ioc,
-    Fok,
-}
-
-impl From<Tif> for TimeInForce {
-    fn from(tif: Tif) -> Self {
-        match tif {
-            Tif::Gtc => Self::Gtc,
-            Tif::Ioc => Self::Ioc,
-            Tif::Fok => Self::Fok,
-        }
+fn time_in_force(tif: Tif) -> TimeInForce {
+    match tif {
+        Tif::Gtc => TimeInForce::Gtc,
+        Tif::Ioc => TimeInForce::Ioc,
+        Tif::Fok => TimeInForce::Fok,
     }
-}
-
-/// Mensagem do cliente. `type` decide a variante e campo desconhecido é erro: nada é
-/// adivinhado. Ordem limite e a mercado são tipos distintos para que um `price` esquecido
-/// nunca transforme uma limite numa ordem a mercado.
-#[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ClientMessage {
-    Login {
-        account: AccountId,
-    },
-    Deposit {
-        asset: String,
-        amount: Amount,
-    },
-    Limit {
-        instrument: String,
-        side: Side,
-        price: Price,
-        lots: Lots,
-        #[serde(default)]
-        tif: Tif,
-    },
-    Market {
-        instrument: String,
-        side: Side,
-        lots: Lots,
-        #[serde(default)]
-        protection: Option<Price>,
-        #[serde(default)]
-        tif: Tif,
-    },
-    /// Dormente até o último negócio chegar a `trigger`; aí entra como limite em `limit`
-    /// ou, sem ele, a mercado. Tipo próprio, e não um campo em `limit`/`market`: um stop
-    /// não tem proteção explícita, e o `deny_unknown_fields` recusa a mistura.
-    Stop {
-        instrument: String,
-        side: Side,
-        trigger: Price,
-        #[serde(default)]
-        limit: Option<Price>,
-        lots: Lots,
-        #[serde(default)]
-        tif: Tif,
-    },
-    Cancel {
-        instrument: String,
-        order: OrderId,
-    },
-    /// Variante com chaves vazias, não unitária: só assim o `deny_unknown_fields` vale
-    /// para ela, e `{"type":"balance","account":1}` é erro em vez de ter o campo ignorado.
-    Balance {},
-    /// Pública: vale antes do login. Assinar de novo o mesmo fluxo devolve um snapshot novo,
-    /// que é como o cliente se recupera de um buraco na sequência.
-    Subscribe {
-        instrument: String,
-        feed: Feed,
-    },
 }
 
 /// O que a sessão faz com uma mensagem já validada e com nomes traduzidos em ids.
@@ -181,84 +86,93 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// # Errors
-/// [`ProtocolError::Malformed`] se a linha não for exatamente uma [`ClientMessage`]:
-/// JSON quebrado, `type` ou campo desconhecido, campo faltando, número com casas decimais
-/// ou valor que o domínio recusa (preço zero, lots negativo).
-pub fn decode(line: &str) -> Result<ClientMessage, ProtocolError> {
-    serde_json::from_str(line).map_err(|error| ProtocolError::Malformed(error.to_string()))
+impl From<DomainError> for ProtocolError {
+    fn from(error: DomainError) -> Self {
+        Self::Malformed(error.to_string())
+    }
 }
 
-impl ClientMessage {
-    /// Traduz nomes em ids e monta a intenção para a conta da sessão.
-    ///
-    /// # Errors
-    /// [`ProtocolError::UnknownInstrument`] ou [`ProtocolError::UnknownAsset`] se um nome
-    /// não existir no mercado.
-    pub fn resolve(self, account: AccountId) -> Result<Inbound, ProtocolError> {
-        let intent = match self {
-            Self::Login { account } => return Ok(Inbound::Login(account)),
-            Self::Balance {} => return Ok(Inbound::Balance),
-            Self::Subscribe { instrument, feed } => {
-                let (instrument, feed) = subscription(instrument, feed)?;
-                return Ok(Inbound::Subscribe { instrument, feed });
-            }
-            Self::Deposit { asset, amount } => Intent::Deposit {
-                account,
-                asset: known_asset(asset)?,
-                amount,
+/// # Errors
+/// [`ProtocolError::Malformed`] se a linha não for exatamente uma [`ClientMessage`]:
+/// JSON quebrado, `type` ou campo desconhecido, campo faltando, número com casas decimais.
+pub fn decode(line: &str) -> Result<ClientMessage, ProtocolError> {
+    ClientMessage::from_line(line).map_err(|error| ProtocolError::Malformed(error.to_string()))
+}
+
+/// Traduz nomes em ids, números em newtypes e monta a intenção para a conta da sessão.
+///
+/// # Errors
+/// [`ProtocolError::Malformed`] se um número for um valor que o domínio recusa (preço zero,
+/// lots ou quantia negativos); [`ProtocolError::UnknownInstrument`] ou
+/// [`ProtocolError::UnknownAsset`] se um nome não existir no mercado.
+pub fn resolve(message: ClientMessage, account: AccountId) -> Result<Inbound, ProtocolError> {
+    let intent = match message {
+        ClientMessage::Login { account } => return Ok(Inbound::Login(AccountId::new(account))),
+        ClientMessage::Balance {} => return Ok(Inbound::Balance),
+        ClientMessage::Subscribe { instrument, feed } => {
+            let (instrument, feed) = subscription(instrument, feed)?;
+            return Ok(Inbound::Subscribe { instrument, feed });
+        }
+        ClientMessage::Deposit { asset, amount } => Intent::Deposit {
+            account,
+            asset: known_asset(asset)?,
+            amount: Amount::new(amount)?,
+        },
+        ClientMessage::Limit {
+            instrument,
+            side,
+            price,
+            lots,
+            tif,
+        } => Intent::Order {
+            account,
+            instrument: known_instrument(instrument)?,
+            side: core_side(side),
+            kind: OrderKind::Limit(Price::new(price)?),
+            lots: Lots::new(lots)?,
+            time_in_force: time_in_force(tif),
+        },
+        ClientMessage::Market {
+            instrument,
+            side,
+            lots,
+            protection,
+            tif,
+        } => Intent::Order {
+            account,
+            instrument: known_instrument(instrument)?,
+            side: core_side(side),
+            kind: OrderKind::Market {
+                protection: protection.map(Price::new).transpose()?,
             },
-            Self::Limit {
-                instrument,
-                side,
-                price,
-                lots,
-                tif,
-            } => Intent::Order {
-                account,
-                instrument: known_instrument(instrument)?,
-                side: side.into(),
-                kind: OrderKind::Limit(price),
-                lots,
-                time_in_force: tif.into(),
+            lots: Lots::new(lots)?,
+            time_in_force: time_in_force(tif),
+        },
+        ClientMessage::Stop {
+            instrument,
+            side,
+            trigger,
+            limit,
+            lots,
+            tif,
+        } => Intent::Order {
+            account,
+            instrument: known_instrument(instrument)?,
+            side: core_side(side),
+            kind: OrderKind::Stop {
+                trigger: Price::new(trigger)?,
+                limit: limit.map(Price::new).transpose()?,
             },
-            Self::Market {
-                instrument,
-                side,
-                lots,
-                protection,
-                tif,
-            } => Intent::Order {
-                account,
-                instrument: known_instrument(instrument)?,
-                side: side.into(),
-                kind: OrderKind::Market { protection },
-                lots,
-                time_in_force: tif.into(),
-            },
-            Self::Stop {
-                instrument,
-                side,
-                trigger,
-                limit,
-                lots,
-                tif,
-            } => Intent::Order {
-                account,
-                instrument: known_instrument(instrument)?,
-                side: side.into(),
-                kind: OrderKind::Stop { trigger, limit },
-                lots,
-                time_in_force: tif.into(),
-            },
-            Self::Cancel { instrument, order } => Intent::Cancel {
-                account,
-                instrument: known_instrument(instrument)?,
-                order,
-            },
-        };
-        Ok(Inbound::Submit(intent))
-    }
+            lots: Lots::new(lots)?,
+            time_in_force: time_in_force(tif),
+        },
+        ClientMessage::Cancel { instrument, order } => Intent::Cancel {
+            account,
+            instrument: known_instrument(instrument)?,
+            order: OrderId::new(order),
+        },
+    };
+    Ok(Inbound::Submit(intent))
 }
 
 /// O alvo de uma assinatura, sem precisar de conta: o feed é público.
@@ -269,7 +183,7 @@ pub fn subscription(
     instrument: String,
     feed: Feed,
 ) -> Result<(InstrumentId, CoreFeed), ProtocolError> {
-    Ok((known_instrument(instrument)?, feed.into()))
+    Ok((known_instrument(instrument)?, core_feed(feed)))
 }
 
 fn known_instrument(name: String) -> Result<InstrumentId, ProtocolError> {
@@ -280,127 +194,11 @@ fn known_asset(name: String) -> Result<AssetId, ProtocolError> {
     asset_id(&name).ok_or(ProtocolError::UnknownAsset(name))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct Level {
-    pub price: Price,
-    pub lots: Lots,
-}
-
-impl From<Quote> for Level {
-    fn from(quote: Quote) -> Self {
-        Self {
-            price: quote.price,
-            lots: quote.lots,
-        }
+fn wire_level(quote: Quote) -> Level {
+    Level {
+        price: quote.price.get(),
+        lots: quote.lots.get(),
     }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct AssetBalance {
-    pub asset: String,
-    pub available: Amount,
-    pub reserved: Amount,
-}
-
-/// Mensagem do servidor. `code` dos rejeitados é estável, para máquina; `message` é texto
-/// para gente e pode mudar.
-///
-/// É o mesmo tipo dos dois lados: o servidor serializa, o cliente desserializa. Ao contrário
-/// de [`ClientMessage`], campo desconhecido é aceito: o servidor é rigoroso com o que recebe,
-/// o cliente é tolerante com o que lê, para que campos novos não quebrem clientes antigos.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMessage {
-    LoggedIn {
-        account: AccountId,
-    },
-    Deposited {
-        asset: String,
-        amount: Amount,
-    },
-    DepositRejected {
-        asset: String,
-        amount: Amount,
-    },
-    /// Fala só da ordem de quem recebe: `fee` é o que ele pagou, zero para o maker.
-    Fill {
-        instrument: String,
-        role: Role,
-        order: OrderId,
-        lots: Lots,
-        price: Price,
-        fee: Amount,
-    },
-    Rested {
-        instrument: String,
-        order: OrderId,
-        lots: Lots,
-    },
-    Cancelled {
-        instrument: String,
-        order: OrderId,
-        lots: Lots,
-    },
-    Expired {
-        instrument: String,
-        order: OrderId,
-        lots: Lots,
-    },
-    Rejected {
-        order: OrderId,
-        code: String,
-        message: String,
-    },
-    /// Stop aceito, dormente até o último negócio chegar ao gatilho.
-    Armed {
-        instrument: String,
-        order: OrderId,
-        side: Side,
-        trigger: Price,
-        lots: Lots,
-    },
-    /// O stop disparou; os eventos dele como ordem comum vêm em seguida.
-    Triggered {
-        instrument: String,
-        order: OrderId,
-    },
-    Balances {
-        balances: Vec<AssetBalance>,
-    },
-    Error {
-        message: String,
-    },
-    Snapshot {
-        instrument: String,
-        feed: Feed,
-        seq: u64,
-        bids: Vec<Level>,
-        asks: Vec<Level>,
-    },
-    /// Nível 2: quantidade absoluta no preço; zero quer dizer que o nível sumiu.
-    Depth {
-        instrument: String,
-        feed: Feed,
-        seq: u64,
-        side: Side,
-        price: Price,
-        lots: Lots,
-    },
-    /// Nível 1: o topo do livro, `null` no lado vazio.
-    Top {
-        instrument: String,
-        feed: Feed,
-        seq: u64,
-        bid: Option<Level>,
-        ask: Option<Level>,
-    },
-    Trade {
-        instrument: String,
-        feed: Feed,
-        seq: u64,
-        price: Price,
-        lots: Lots,
-    },
 }
 
 /// Uma mensagem do feed traduzida de volta para os tipos do [`crate::market_data`].
@@ -410,36 +208,43 @@ pub enum FeedMessage {
     Update(Update),
 }
 
-impl ServerMessage {
-    /// `None` se não for mensagem do feed ou se o instrumento não existir no mercado.
-    pub fn into_feed(self) -> Option<FeedMessage> {
-        let quote = |level: Level| Quote {
-            price: level.price,
-            lots: level.lots,
+impl FeedMessage {
+    /// `None` se não for mensagem do feed, se o instrumento não existir no mercado ou se um
+    /// número for um valor que o domínio recusa.
+    pub fn from_wire(message: ServerMessage) -> Option<Self> {
+        let quote = |level: Level| {
+            Some(Quote {
+                price: Price::new(level.price).ok()?,
+                lots: Lots::new(level.lots).ok()?,
+            })
         };
-        let update = |instrument: &str, feed: Feed, seq, body| {
-            Some(FeedMessage::Update(Update {
+        let optional = |level: Option<Level>| match level {
+            None => Some(None),
+            Some(level) => quote(level).map(Some),
+        };
+        let update = |instrument: &str, feed, seq, body| {
+            Some(Self::Update(Update {
                 instrument: instrument_id(instrument)?,
-                feed: feed.into(),
+                feed: core_feed(feed),
                 seq,
                 body,
             }))
         };
-        match self {
-            Self::Snapshot {
+        match message {
+            ServerMessage::Snapshot {
                 instrument,
                 feed,
                 seq,
                 bids,
                 asks,
-            } => Some(FeedMessage::Snapshot(Snapshot {
+            } => Some(Self::Snapshot(Snapshot {
                 instrument: instrument_id(&instrument)?,
-                feed: feed.into(),
+                feed: core_feed(feed),
                 seq,
-                bids: bids.into_iter().map(quote).collect(),
-                asks: asks.into_iter().map(quote).collect(),
+                bids: bids.into_iter().map(quote).collect::<Option<_>>()?,
+                asks: asks.into_iter().map(quote).collect::<Option<_>>()?,
             })),
-            Self::Depth {
+            ServerMessage::Depth {
                 instrument,
                 feed,
                 seq,
@@ -451,12 +256,12 @@ impl ServerMessage {
                 feed,
                 seq,
                 Body::Level {
-                    side: side.into(),
-                    price,
-                    lots,
+                    side: core_side(side),
+                    price: Price::new(price).ok()?,
+                    lots: Lots::new(lots).ok()?,
                 },
             ),
-            Self::Top {
+            ServerMessage::Top {
                 instrument,
                 feed,
                 seq,
@@ -467,17 +272,25 @@ impl ServerMessage {
                 feed,
                 seq,
                 Body::Top {
-                    bid: bid.map(quote),
-                    ask: ask.map(quote),
+                    bid: optional(bid)?,
+                    ask: optional(ask)?,
                 },
             ),
-            Self::Trade {
+            ServerMessage::Trade {
                 instrument,
                 feed,
                 seq,
                 price,
                 lots,
-            } => update(&instrument, feed, seq, Body::Trade { price, lots }),
+            } => update(
+                &instrument,
+                feed,
+                seq,
+                Body::Trade {
+                    price: Price::new(price).ok()?,
+                    lots: Lots::new(lots).ok()?,
+                },
+            ),
             _ => None,
         }
     }
@@ -485,10 +298,10 @@ impl ServerMessage {
 
 impl From<&Snapshot> for ServerMessage {
     fn from(snapshot: &Snapshot) -> Self {
-        let levels = |quotes: &[Quote]| quotes.iter().copied().map(Level::from).collect();
+        let levels = |quotes: &[Quote]| quotes.iter().copied().map(wire_level).collect();
         Self::Snapshot {
             instrument: symbol(snapshot.instrument).to_string(),
-            feed: snapshot.feed.into(),
+            feed: wire_feed(snapshot.feed),
             seq: snapshot.seq,
             bids: levels(&snapshot.bids),
             asks: levels(&snapshot.asks),
@@ -499,145 +312,132 @@ impl From<&Snapshot> for ServerMessage {
 impl From<&Update> for ServerMessage {
     fn from(update: &Update) -> Self {
         let instrument = symbol(update.instrument).to_string();
-        let feed = update.feed.into();
+        let feed = wire_feed(update.feed);
         let seq = update.seq;
         match update.body {
             Body::Level { side, price, lots } => Self::Depth {
                 instrument,
                 feed,
                 seq,
-                side: side.into(),
-                price,
-                lots,
+                side: wire_side(side),
+                price: price.get(),
+                lots: lots.get(),
             },
             Body::Top { bid, ask } => Self::Top {
                 instrument,
                 feed,
                 seq,
-                bid: bid.map(Level::from),
-                ask: ask.map(Level::from),
+                bid: bid.map(wire_level),
+                ask: ask.map(wire_level),
             },
             Body::Trade { price, lots } => Self::Trade {
                 instrument,
                 feed,
                 seq,
-                price,
-                lots,
+                price: price.get(),
+                lots: lots.get(),
             },
         }
     }
 }
 
-impl ServerMessage {
-    /// # Panics
-    /// Nunca: a mensagem só tem números, textos e enums, que o `serde_json` sempre
-    /// serializa.
-    pub fn to_line(&self) -> String {
-        let mut line = serde_json::to_string(self).expect("mensagem só tem números e textos");
-        line.push('\n');
-        line
-    }
-}
-
-impl ServerMessage {
-    /// O evento como `viewer` o vê; evento que não é dele não vira mensagem. Um fill vira
-    /// uma mensagem por ordem dele (as duas num autonegócio), com o papel e a taxa que ele
-    /// pagou: o maker não paga (decisão 7), e a ordem do outro lado não aparece.
-    pub fn from_event(viewer: AccountId, event: &Event) -> Vec<Self> {
-        let message = match *event {
-            Event::Deposited { asset, amount, .. } => Self::Deposited {
-                asset: asset_name(asset).to_string(),
-                amount,
-            },
-            Event::DepositRejected { asset, amount, .. } => Self::DepositRejected {
-                asset: asset_name(asset).to_string(),
-                amount,
-            },
-            Event::Fill {
-                instrument,
-                fill,
-                fee,
-                taker_account,
-                maker_account,
-            } => {
-                let sides = [
-                    (taker_account, Role::Taker, fill.taker, fee),
-                    (maker_account, Role::Maker, fill.maker, Amount::ZERO),
-                ];
-                return sides
-                    .into_iter()
-                    .filter(|&(account, ..)| account == viewer)
-                    .map(|(_, role, order, fee)| Self::Fill {
-                        instrument: symbol(instrument).to_string(),
-                        role,
-                        order,
-                        lots: fill.lots,
-                        price: fill.price,
-                        fee,
-                    })
-                    .collect();
-            }
-            Event::Rested {
-                instrument,
-                order,
-                lots,
-                ..
-            } => Self::Rested {
-                instrument: symbol(instrument).to_string(),
-                order,
-                lots,
-            },
-            Event::Cancelled {
-                instrument,
-                order,
-                lots,
-                ..
-            } => Self::Cancelled {
-                instrument: symbol(instrument).to_string(),
-                order,
-                lots,
-            },
-            Event::Expired {
-                instrument,
-                order,
-                lots,
-                ..
-            } => Self::Expired {
-                instrument: symbol(instrument).to_string(),
-                order,
-                lots,
-            },
-            Event::Rejected { order, reason, .. } => Self::Rejected {
-                order,
-                code: reject_code(&reason).to_string(),
-                message: reject_message(&reason),
-            },
-            Event::Armed {
-                instrument,
-                order,
-                side,
-                trigger,
-                lots,
-                ..
-            } => Self::Armed {
-                instrument: symbol(instrument).to_string(),
-                order,
-                side: side.into(),
-                trigger,
-                lots,
-            },
-            Event::Triggered {
-                instrument, order, ..
-            } => Self::Triggered {
-                instrument: symbol(instrument).to_string(),
-                order,
-            },
-        };
-        if event.accounts().any(|account| account == viewer) {
-            vec![message]
-        } else {
-            Vec::new()
+/// O evento como `viewer` o vê; evento que não é dele não vira mensagem. Um fill vira
+/// uma mensagem por ordem dele (as duas num autonegócio), com o papel e a taxa que ele
+/// pagou: o maker não paga (decisão 7), e a ordem do outro lado não aparece.
+pub fn from_event(viewer: AccountId, event: &Event) -> Vec<ServerMessage> {
+    let message = match *event {
+        Event::Deposited { asset, amount, .. } => ServerMessage::Deposited {
+            asset: asset_name(asset).to_string(),
+            amount: amount.get(),
+        },
+        Event::DepositRejected { asset, amount, .. } => ServerMessage::DepositRejected {
+            asset: asset_name(asset).to_string(),
+            amount: amount.get(),
+        },
+        Event::Fill {
+            instrument,
+            fill,
+            fee,
+            taker_account,
+            maker_account,
+        } => {
+            let sides = [
+                (taker_account, Role::Taker, fill.taker, fee),
+                (maker_account, Role::Maker, fill.maker, Amount::ZERO),
+            ];
+            return sides
+                .into_iter()
+                .filter(|&(account, ..)| account == viewer)
+                .map(|(_, role, order, fee)| ServerMessage::Fill {
+                    instrument: symbol(instrument).to_string(),
+                    role,
+                    order: order.get(),
+                    lots: fill.lots.get(),
+                    price: fill.price.get(),
+                    fee: fee.get(),
+                })
+                .collect();
         }
+        Event::Rested {
+            instrument,
+            order,
+            lots,
+            ..
+        } => ServerMessage::Rested {
+            instrument: symbol(instrument).to_string(),
+            order: order.get(),
+            lots: lots.get(),
+        },
+        Event::Cancelled {
+            instrument,
+            order,
+            lots,
+            ..
+        } => ServerMessage::Cancelled {
+            instrument: symbol(instrument).to_string(),
+            order: order.get(),
+            lots: lots.get(),
+        },
+        Event::Expired {
+            instrument,
+            order,
+            lots,
+            ..
+        } => ServerMessage::Expired {
+            instrument: symbol(instrument).to_string(),
+            order: order.get(),
+            lots: lots.get(),
+        },
+        Event::Rejected { order, reason, .. } => ServerMessage::Rejected {
+            order: order.get(),
+            code: reject_code(&reason).to_string(),
+            message: reject_message(&reason),
+        },
+        Event::Armed {
+            instrument,
+            order,
+            side,
+            trigger,
+            lots,
+            ..
+        } => ServerMessage::Armed {
+            instrument: symbol(instrument).to_string(),
+            order: order.get(),
+            side: wire_side(side),
+            trigger: trigger.get(),
+            lots: lots.get(),
+        },
+        Event::Triggered {
+            instrument, order, ..
+        } => ServerMessage::Triggered {
+            instrument: symbol(instrument).to_string(),
+            order: order.get(),
+        },
+    };
+    if event.accounts().any(|account| account == viewer) {
+        vec![message]
+    } else {
+        Vec::new()
     }
 }
 
@@ -722,120 +522,47 @@ mod tests {
         Amount::new(value).unwrap()
     }
 
-    fn malformed(line: &str) -> String {
-        match decode(line) {
+    fn resolved(line: &str) -> Result<Inbound, ProtocolError> {
+        resolve(decode(line).unwrap(), ACCOUNT)
+    }
+
+    fn refused(line: &str) -> String {
+        match resolved(line) {
             Err(ProtocolError::Malformed(detail)) => detail,
-            other => panic!("{line} deveria ser malformada, veio {other:?}"),
+            other => panic!("{line} deveria ser recusada, veio {other:?}"),
         }
     }
 
-    fn resolved(line: &str) -> Result<Inbound, ProtocolError> {
-        decode(line).unwrap().resolve(ACCOUNT)
+    #[test]
+    fn broken_line_is_malformed() {
+        assert!(matches!(
+            decode(r#"{"type":"login","account":1"#),
+            Err(ProtocolError::Malformed(_))
+        ));
     }
 
     #[test]
-    fn decodes_every_client_message() {
+    fn numbers_the_domain_refuses_are_malformed() {
         assert_eq!(
-            decode(r#"{"type":"login","account":1}"#),
-            Ok(ClientMessage::Login {
-                account: AccountId::new(1)
-            })
+            refused(r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":0,"lots":5}"#),
+            "preço 0 deve ser positivo"
         );
         assert_eq!(
-            decode(r#"{"type":"deposit","asset":"BRL","amount":500}"#),
-            Ok(ClientMessage::Deposit {
-                asset: "BRL".to_string(),
-                amount: amount(500)
-            })
-        );
-        assert_eq!(
-            decode(
-                r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":5,"tif":"ioc"}"#
+            refused(
+                r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":-1}"#
             ),
-            Ok(ClientMessage::Limit {
-                instrument: "TESTE/BRL".to_string(),
-                side: Side::Buy,
-                price: price(10_000),
-                lots: lots(5),
-                tif: Tif::Ioc
-            })
+            "lots -1 não pode ser negativo"
         );
         assert_eq!(
-            decode(
-                r#"{"type":"market","instrument":"TESTE/BRL","side":"sell","lots":2,"protection":9500}"#
-            ),
-            Ok(ClientMessage::Market {
-                instrument: "TESTE/BRL".to_string(),
-                side: Side::Sell,
-                lots: lots(2),
-                protection: Some(price(9_500)),
-                tif: Tif::Gtc
-            })
+            refused(r#"{"type":"deposit","asset":"BRL","amount":-5}"#),
+            "quantia -5 não pode ser negativa"
         );
-        assert_eq!(
-            decode(r#"{"type":"cancel","instrument":"TESTE/BRL","order":3}"#),
-            Ok(ClientMessage::Cancel {
-                instrument: "TESTE/BRL".to_string(),
-                order: OrderId::new(3)
-            })
+        refused(
+            r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":1,"protection":-1}"#,
         );
-        assert_eq!(
-            decode(r#"{"type":"balance"}"#),
-            Ok(ClientMessage::Balance {})
-        );
-    }
-
-    #[test]
-    fn optional_fields_take_their_defaults() {
-        assert_eq!(
-            decode(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":1}"#),
-            Ok(ClientMessage::Market {
-                instrument: "TESTE/BRL".to_string(),
-                side: Side::Buy,
-                lots: lots(1),
-                protection: None,
-                tif: Tif::Gtc
-            })
-        );
-    }
-
-    #[test]
-    fn field_order_and_whitespace_do_not_matter() {
-        assert_eq!(
-            decode(r#"  { "account" : 1 , "type" : "login" }  "#),
-            Ok(ClientMessage::Login {
-                account: AccountId::new(1)
-            })
-        );
-    }
-
-    #[test]
-    fn broken_json_is_malformed() {
-        malformed(r#"{"type":"login","account":1"#);
-        malformed("buy TESTE/BRL 10000 5");
-        malformed("");
-    }
-
-    #[test]
-    fn unknown_type_and_missing_type_are_malformed() {
-        malformed(r#"{"type":"withdraw","asset":"BRL","amount":1}"#);
-        malformed(r#"{"account":1}"#);
-    }
-
-    #[test]
-    fn unknown_field_is_malformed_not_ignored() {
-        let detail = malformed(
-            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lot":5}"#,
-        );
-        assert!(detail.contains("lot"), "{detail}");
-        malformed(r#"{"type":"balance","account":1}"#);
-    }
-
-    #[test]
-    fn limit_without_price_and_market_with_price_are_malformed() {
-        malformed(r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","lots":5}"#);
-        malformed(
-            r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":5}"#,
+        refused(r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":0,"lots":5}"#);
+        refused(
+            r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":9500,"limit":0,"lots":5}"#,
         );
     }
 
@@ -872,40 +599,6 @@ mod tests {
                 lots: lots(5),
                 time_in_force: TimeInForce::Ioc
             }))
-        );
-    }
-
-    #[test]
-    fn stop_without_trigger_or_with_protection_is_malformed() {
-        malformed(r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","lots":5}"#);
-        malformed(
-            r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":9500,"protection":9000,"lots":5}"#,
-        );
-        malformed(r#"{"type":"stop","instrument":"TESTE/BRL","side":"sell","trigger":0,"lots":5}"#);
-    }
-
-    #[test]
-    fn numbers_are_integers_the_domain_accepts() {
-        malformed(
-            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":100.5,"lots":5}"#,
-        );
-        malformed(r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":0,"lots":5}"#);
-        malformed(
-            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":-1}"#,
-        );
-        malformed(r#"{"type":"deposit","asset":"BRL","amount":-5}"#);
-        malformed(
-            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":"10000","lots":5}"#,
-        );
-    }
-
-    #[test]
-    fn side_and_tif_use_the_wire_words() {
-        malformed(
-            r#"{"type":"limit","instrument":"TESTE/BRL","side":"bid","price":10000,"lots":5}"#,
-        );
-        malformed(
-            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":5,"tif":"GTC"}"#,
         );
     }
 
@@ -987,7 +680,7 @@ mod tests {
     }
 
     fn lines(viewer: AccountId, event: &Event) -> String {
-        ServerMessage::from_event(viewer, event)
+        from_event(viewer, event)
             .iter()
             .map(ServerMessage::to_line)
             .collect()
@@ -1129,54 +822,9 @@ mod tests {
     }
 
     #[test]
-    fn session_messages_serialize_as_documented() {
-        assert_eq!(
-            ServerMessage::LoggedIn { account: ACCOUNT }.to_line(),
-            "{\"type\":\"logged_in\",\"account\":7}\n"
-        );
-        let balances = ServerMessage::Balances {
-            balances: vec![AssetBalance {
-                asset: "BRL".to_string(),
-                available: amount(10),
-                reserved: amount(5),
-            }],
-        };
-        assert_eq!(
-            balances.to_line(),
-            "{\"type\":\"balances\",\"balances\":[{\"asset\":\"BRL\",\"available\":10,\"reserved\":5}]}\n"
-        );
-        assert_eq!(
-            ServerMessage::Error {
-                message: "x".to_string()
-            }
-            .to_line(),
-            "{\"type\":\"error\",\"message\":\"x\"}\n"
-        );
-    }
-
-    #[test]
-    fn message_text_with_quotes_stays_one_valid_line() {
-        let error = ServerMessage::Error {
-            message: "ativo desconhecido \"OU\nRO\"".to_string(),
-        };
-
-        let line = error.to_line();
-
-        assert_eq!(line.matches('\n').count(), 1);
-        assert!(line.ends_with('\n'));
-    }
-
-    #[test]
-    fn subscribe_is_decoded_and_resolved_without_an_account() {
+    fn subscribe_is_resolved_without_an_account() {
         let line = r#"{"type":"subscribe","instrument":"TESTE/BRL","feed":"l2"}"#;
 
-        assert_eq!(
-            decode(line),
-            Ok(ClientMessage::Subscribe {
-                instrument: "TESTE/BRL".to_string(),
-                feed: Feed::L2
-            })
-        );
         assert_eq!(
             subscription("TESTE/BRL".to_string(), Feed::L1),
             Ok((TESTE_BRL, CoreFeed::L1))
@@ -1188,8 +836,6 @@ mod tests {
                 feed: CoreFeed::L2
             })
         );
-        malformed(r#"{"type":"subscribe","instrument":"TESTE/BRL","feed":"l3"}"#);
-        malformed(r#"{"type":"subscribe","instrument":"TESTE/BRL"}"#);
     }
 
     #[test]
@@ -1204,6 +850,10 @@ mod tests {
             }],
             asks: vec![],
         };
+        assert_eq!(
+            FeedMessage::from_wire(ServerMessage::from(&snapshot)),
+            Some(FeedMessage::Snapshot(snapshot.clone()))
+        );
         assert_eq!(
             ServerMessage::from(&snapshot).to_line(),
             "{\"type\":\"snapshot\",\"instrument\":\"TESTE/BRL\",\"feed\":\"l2\",\"seq\":41,\

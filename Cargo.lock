@@ -235,6 +235,7 @@ version = "0.1.0"
 dependencies = [
  "exchange-core",
  "exchange-fix",
+ "exchange-protocol",
  "exchange-wal",
  "proptest",
  "serde",
@@ -285,6 +286,14 @@ name = "exchange-fix"
 version = "0.1.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "exchange-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
