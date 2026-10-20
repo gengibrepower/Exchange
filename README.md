@@ -30,7 +30,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
 - **F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento, stop orders, relatórios privados e snapshots que encurtam o boot: concluída.
-- **Próxima: F8** — cliente de terminal (TUI) que conecta ao servidor e mostra o livro ao vivo. Não há interface web: tudo roda no terminal.
+- **F8** — cliente de terminal (TUI), em andamento: abas Mercado e por instrumento, livro ao vivo. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
 
@@ -317,3 +317,23 @@ Gravar um snapshot desse tamanho custa uns 25 ms para montar o estado e 15 ms pa
 ## Licença
 
 MIT — ver [`LICENSE`](LICENSE).
+
+## TUI
+
+```
+cargo run -p tui -- --account <conta> [--server <endereço:porta>]
+```
+
+Cliente de terminal que fala com o servidor só pelo protocolo JSON acima, pela crate `exchange-protocol`: o núcleo nem está no grafo de dependências dele. Com o servidor no ar (`127.0.0.1:7000` por padrão), a TUI faz login, pede os `instruments` e assina o L1 e o L2 de cada um.
+
+- **Mercado**: compra, venda, spread e último negócio de cada instrumento, com ▲/▼ em relação ao negócio anterior.
+- **Uma aba por instrumento**: o livro L2, com as vendas em cima e as compras embaixo, barras de profundidade e o spread no meio.
+- Um buraco na sequência do feed descarta aquele livro e pede um snapshot novo, sem intervenção.
+
+| Tecla | Efeito |
+|---|---|
+| `j` `k` / `↓` `↑` | mover dentro do painel |
+| `[` `]` | aba anterior / próxima |
+| `↵` | na aba Mercado, abrir o instrumento |
+| `?` | ajuda |
+| `q` / `ctrl-c` | sair |
