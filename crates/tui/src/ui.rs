@@ -3,6 +3,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row as TableRow, Table, Tabs};
 
@@ -42,6 +43,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+/// A cor de um número de mercado, ou cinza se a conexão caiu e ele é velho.
+fn live(app: &App, style: Style) -> Style {
+    if app.is_online() { style } else { theme::dim() }
+}
+
 fn panel(title: &str, focused: bool) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -51,9 +57,11 @@ fn panel(title: &str, focused: bool) -> Block<'static> {
 
 fn header(frame: &mut Frame, area: Rect, app: &App) {
     let (dot, state) = match &app.connection {
-        Connection::Connecting => (theme::key(), "conectando"),
-        Connection::Online => (theme::buy(), "online"),
-        Connection::Offline(_) => (theme::sell(), "offline"),
+        Connection::Connecting => (theme::key(), "conectando".to_string()),
+        Connection::Online => (theme::buy(), "online".to_string()),
+        Connection::Reconnecting { attempt, .. } => {
+            (theme::sell(), format!("reconectando ({attempt})"))
+        }
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -81,7 +89,7 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
     let tabs = Tabs::new(titles)
         .select(Some(selected))
         .style(theme::dim())
-        .highlight_style(theme::key().add_modifier(ratatui::style::Modifier::BOLD))
+        .highlight_style(theme::key().add_modifier(Modifier::BOLD))
         .divider("   ")
         .block(block);
     frame.render_widget(tabs, area);
@@ -108,8 +116,8 @@ fn market_tab(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(marker, theme::key()),
                 Span::raw(market.spec.symbol.clone()),
             ])),
-            Cell::from(Span::styled(quote(bid), theme::buy())),
-            Cell::from(Span::styled(quote(ask), theme::sell())),
+            Cell::from(Span::styled(quote(bid), live(app, theme::buy()))),
+            Cell::from(Span::styled(quote(ask), live(app, theme::sell()))),
             Cell::from(spread(bid, ask)),
             Cell::from(last(market)),
         ]);
@@ -169,7 +177,13 @@ fn instrument_tab(frame: &mut Frame, area: Rect, app: &App, market: &Market) {
     let [ticket, balances] =
         Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(bottom);
 
-    book(frame, book_area, market, app.focus == Focus::Book);
+    book(
+        frame,
+        book_area,
+        market,
+        app.focus == Focus::Book,
+        app.is_online(),
+    );
     tape(frame, trades, market);
     order_list(frame, orders, app, market);
     ticket_panel(frame, ticket, market, app.focus == Focus::Ticket);
@@ -269,6 +283,7 @@ fn order_line(order: &Order, selected: bool) -> Line<'static> {
         State::Cancelled => "cancel.",
         State::Expired => "expir.",
         State::Rejected(_) => "recus.",
+        State::Closed => "encerr.",
     };
     let marker = if selected { "▸ " } else { "  " };
     let line = Line::from(vec![
@@ -299,7 +314,7 @@ fn ticket_panel(frame: &mut Frame, area: Rect, market: &Market, focused: bool) {
     let field = |name: &str, value: String, which: Field| {
         let chosen = focused && ticket.field == which;
         let style = if chosen {
-            theme::key().add_modifier(ratatui::style::Modifier::BOLD)
+            theme::key().add_modifier(Modifier::BOLD)
         } else {
             theme::base()
         };
@@ -317,14 +332,8 @@ fn ticket_panel(frame: &mut Frame, area: Rect, market: &Market, focused: bool) {
         spans
     };
     let side = match ticket.side {
-        Side::Buy => Span::styled(
-            "COMPRA",
-            theme::buy().add_modifier(ratatui::style::Modifier::BOLD),
-        ),
-        Side::Sell => Span::styled(
-            "VENDA",
-            theme::sell().add_modifier(ratatui::style::Modifier::BOLD),
-        ),
+        Side::Buy => Span::styled("COMPRA", theme::buy().add_modifier(Modifier::BOLD)),
+        Side::Sell => Span::styled("VENDA", theme::sell().add_modifier(Modifier::BOLD)),
     };
     let side_chosen = focused && ticket.field == Field::Side;
     let brackets = if side_chosen {
@@ -415,7 +424,7 @@ fn balance_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn book(frame: &mut Frame, area: Rect, market: &Market, focused: bool) {
+fn book(frame: &mut Frame, area: Rect, market: &Market, focused: bool, online: bool) {
     let block = panel(&format!("Livro {}", market.spec.symbol), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -443,26 +452,48 @@ fn book(frame: &mut Frame, area: Rect, market: &Market, focused: bool) {
         ),
         theme::dim(),
     )];
-    let line = |row: &Row| level_line(row, market.is_selected(row), widest, bar_width);
+    let line = |row: &Row| {
+        let look = Look {
+            selected: market.is_selected(row),
+            flashing: market.is_flashing(row),
+            live: online,
+        };
+        level_line(row, look, widest, bar_width)
+    };
     lines.extend(visible[..shown_asks].iter().map(line));
     lines.push(spread_line(market, usize::from(inner.width)));
     lines.extend(visible[shown_asks..].iter().map(line));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn level_line(row: &Row, selected: bool, widest: i64, bar_width: usize) -> Line<'static> {
-    let side = match row.side {
-        Side::Buy => theme::buy(),
-        Side::Sell => theme::sell(),
+/// Como uma linha do livro aparece. Sem conexão (`live` falso) tudo fica cinza: os
+/// números são do instante da queda, não do mercado de agora.
+#[derive(Clone, Copy)]
+struct Look {
+    selected: bool,
+    flashing: bool,
+    live: bool,
+}
+
+fn level_line(row: &Row, look: Look, widest: i64, bar_width: usize) -> Line<'static> {
+    let side = match (look.live, row.side) {
+        (false, _) => theme::dim(),
+        (true, Side::Buy) => theme::buy(),
+        (true, Side::Sell) => theme::sell(),
     };
-    let marker = if selected { "▸ " } else { "  " };
+    let quantity = match (look.live, look.flashing) {
+        (false, _) => theme::dim(),
+        (true, true) => theme::last().add_modifier(Modifier::BOLD),
+        (true, false) => Style::new(),
+    };
+    let marker = if look.selected { "▸ " } else { "  " };
     let line = Line::from(vec![
         Span::styled(marker, theme::key()),
         Span::styled(format!("{:>PRICE_WIDTH$}", brl(row.level.price)), side),
-        Span::raw(format!(" {:>LOTS_WIDTH$} ", lots(row.level.lots))),
+        Span::styled(format!(" {:>LOTS_WIDTH$} ", lots(row.level.lots)), quantity),
         Span::styled(bar(row.level.lots, widest, bar_width), side),
     ]);
-    if selected {
+    if look.selected {
         line.style(theme::selected())
     } else {
         line
@@ -514,10 +545,7 @@ fn status(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(prompt) = &app.prompt {
         let line = Line::from(vec![
             Span::styled(" ? ", theme::key()),
-            Span::styled(
-                prompt.question(),
-                theme::key().add_modifier(ratatui::style::Modifier::BOLD),
-            ),
+            Span::styled(prompt.question(), theme::key().add_modifier(Modifier::BOLD)),
         ]);
         frame.render_widget(Paragraph::new(line), left);
     } else if let Some(status) = &app.status {
@@ -686,6 +714,66 @@ mod tests {
             });
         }
         app
+    }
+
+    /// A cor do texto na primeira célula onde `text` aparece na tela.
+    fn color_of(app: &App, text: &str) -> ratatui::style::Color {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let cells: Vec<&str> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            let line = cells.concat();
+            if let Some(byte) = line.find(text) {
+                let x = line[..byte].chars().count();
+                return buffer[(u16::try_from(x).unwrap(), y)].fg;
+            }
+        }
+        panic!("{text} não está na tela");
+    }
+
+    fn depth(seq: u64, lots: i64) -> Msg {
+        Msg::Server {
+            message: ServerMessage::Depth {
+                instrument: "TESTE/BRL".to_string(),
+                feed: Feed::L2,
+                seq,
+                side: Side::Buy,
+                price: 9_990,
+                lots,
+            },
+            at: "10:41:08".to_string(),
+        }
+    }
+
+    #[test]
+    fn changed_level_shows_its_lots_in_orange_until_the_flash_ends() {
+        let mut app = trading();
+        app.update(Msg::Key(Key::Char(']')));
+        app.update(depth(1, 7));
+
+        assert_eq!(color_of(&app, "     7 "), theme::ORANGE);
+        for _ in 0..crate::app::FLASH_TICKS {
+            app.update(Msg::Tick);
+        }
+        assert_ne!(color_of(&app, "     7 "), theme::ORANGE);
+    }
+
+    #[test]
+    fn lost_connection_greys_the_book_and_says_it_is_reconnecting() {
+        let mut app = trading();
+        app.update(Msg::Key(Key::Char(']')));
+        assert_eq!(color_of(&app, "99,90"), theme::GREEN);
+
+        app.update(Msg::Disconnected("o servidor fechou a conexão".to_string()));
+        app.update(Msg::Disconnected("conexão recusada".to_string()));
+
+        let screen = screen(&app);
+        assert!(screen.contains("reconectando (2)"), "{screen}");
+        assert!(screen.contains("tentando de novo a cada 2s"), "{screen}");
+        assert_eq!(color_of(&app, "99,90"), theme::GRAY);
     }
 
     #[test]

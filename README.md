@@ -30,7 +30,7 @@ Em desenvolvimento, por fases (ver seção 12 do escopo).
 - **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
 - **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
 - **F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento, stop orders, relatórios privados e snapshots que encurtam o boot: concluída.
-- **F8** — cliente de terminal (TUI), em andamento: abas Mercado e por instrumento, livro ao vivo, negócios, ordens da conta, saldos, boleta e cancelamento. Não há interface web: tudo roda no terminal.
+- **F8** — cliente de terminal (TUI): abas Mercado e por instrumento, livro ao vivo com destaque do nível que mudou, negócios, ordens da conta, saldos, boleta, cancelamento e reconexão automática; fala com o servidor só pelo protocolo (decisão 13): concluída. Não há interface web: tudo roda no terminal.
 
 As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
 
@@ -334,7 +334,9 @@ Cliente de terminal que fala com o servidor só pelo protocolo JSON acima, pela 
 - **Boleta**, uma por instrumento, que guarda os últimos valores: limite, mercado ou stop (gatilho e, opcional, limite), lots e TIF. Sem modo de inserção: `↵` num nível do livro traz o preço, `h`/`l` anda entre os campos, `j`/`k` sobe e desce (o preço de tick em tick), e os dígitos entram pela direita como centavos (`1 0 0 5 0` é 100,50); o primeiro dígito num campo começa um valor novo. `↵` envia na hora.
 - **Cancelamento**: `x` na ordem sob o cursor, confirmado com `y`.
 - As ordens abertas antes da TUI subir vêm da consulta `orders` no login; o resto, dos relatórios da conta. O saldo é pedido no login e de novo a cada relatório, um pedido por vez.
+- Um nível do livro que muda fica com os lots em laranja por cerca de um segundo.
 - Um buraco na sequência do feed descarta aquele livro e pede um snapshot novo, sem intervenção.
+- **Queda do servidor**: a TUI mostra `● reconectando (n)` e tenta de novo a cada 2s; enquanto isso o livro fica cinza (são os números do instante da queda) e nada é enviado. Ao voltar, refaz o login, os instrumentos, as assinaturas, as ordens e os saldos; a aba aberta e as boletas ficam. Uma ordem que estava aberta e não vem mais na consulta `orders` terminou enquanto a TUI estava fora e aparece como `encerr.`: o servidor não diz como ela terminou.
 
 | Tecla | Efeito |
 |---|---|
@@ -349,3 +351,7 @@ Cliente de terminal que fala com o servidor só pelo protocolo JSON acima, pela 
 | `?` | ajuda |
 | `q` | sair (pede `y` se houver ordem aberta) |
 | `ctrl-c` | sair na hora |
+
+### Critério de pronto da F8, à mão
+
+Em três terminais: o servidor (`cargo run -p edge --bin server`), a TUI (`cargo run -p tui -- --account 1`) e outro cliente (`socat - TCP:127.0.0.1:7000`). Pelo `socat`, deposite BRL na conta 1 (`{"type":"login","account":1}` e `{"type":"deposit","asset":"BRL","amount":100000000}`), saia e entre como a conta 2 para negociar (`{"type":"login","account":2}`, `{"type":"deposit","asset":"TESTE","amount":100000}`, `{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10050,"lots":7}`). Na TUI, `]` abre TESTE/BRL e a venda aparece no livro, com os lots em laranja; `k` e `↵` levam o preço à boleta, `l` `3` `↵` compra 3 lots e o fill aparece na linha de status, em Minhas ordens, em Negócios e nos saldos. Uma compra abaixo do preço (`h` `9990` `↵`) fica aberta; em Minhas ordens, `x` e `y` a cancelam.

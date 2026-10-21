@@ -3,6 +3,7 @@
 //! como [`Effect`] para o laço principal executar.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use exchange_protocol::{
     AssetBalance, ClientMessage, Feed, InstrumentSpec, Level, Role, ServerMessage, Side,
@@ -19,6 +20,15 @@ pub const DEPTH: usize = 10;
 /// Negócios guardados por instrumento no painel Negócios.
 pub const TAPE: usize = 100;
 
+/// O passo do relógio da tela: o laço principal manda um [`Msg::Tick`] a cada um.
+pub const TICK: Duration = Duration::from_millis(250);
+
+/// Por quantos ticks um nível que mudou fica em destaque: cerca de um segundo.
+pub const FLASH_TICKS: u8 = 4;
+
+/// O intervalo entre as tentativas de reconectar.
+pub const RETRY: Duration = Duration::from_secs(2);
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Msg {
     /// `at` é a hora de chegada na TUI, como texto: o `trade` do feed não traz hora, e o
@@ -30,6 +40,11 @@ pub enum Msg {
     Key(Key),
     /// O terminal mudou de tamanho: nada muda no estado, mas vale redesenhar.
     Resize,
+    /// Mais um [`TICK`] passou. O tempo entra como mensagem, e o `update` não lê relógio.
+    Tick,
+    /// Uma conexão nova está de pé, ainda sem login.
+    Connected,
+    /// A conexão caiu, ou a tentativa de refazê-la falhou.
     Disconnected(String),
 }
 
@@ -102,7 +117,11 @@ pub enum Tab {
 pub enum Connection {
     Connecting,
     Online,
-    Offline(String),
+    /// `attempt` conta as falhas seguidas desde que a conexão caiu.
+    Reconnecting {
+        attempt: u32,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -171,6 +190,15 @@ pub struct Market {
     pub selected: Option<Selection>,
     /// Uma boleta por instrumento, que guarda o que foi usado por último nele.
     pub ticket: Ticket,
+    /// Os níveis do L2 que acabaram de mudar, com os ticks de destaque que faltam.
+    pub flashes: Vec<Flash>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Flash {
+    pub side: Side,
+    pub price: i64,
+    pub left: u8,
 }
 
 impl Market {
@@ -183,7 +211,41 @@ impl Market {
             tape: VecDeque::new(),
             selected: None,
             ticket: Ticket::default(),
+            flashes: Vec::new(),
         }
+    }
+
+    /// Um nível mudou de quantidade: destaca. Se saiu do livro, não há linha para destacar.
+    fn flash(&mut self, side: Side, price: i64, lots: i64) {
+        self.flashes
+            .retain(|flash| (flash.side, flash.price) != (side, price));
+        if lots > 0 {
+            self.flashes.push(Flash {
+                side,
+                price,
+                left: FLASH_TICKS,
+            });
+        }
+    }
+
+    fn tick(&mut self) {
+        for flash in &mut self.flashes {
+            flash.left -= 1;
+        }
+        self.flashes.retain(|flash| flash.left > 0);
+    }
+
+    pub fn is_flashing(&self, row: &Row) -> bool {
+        self.flashes
+            .iter()
+            .any(|flash| (flash.side, flash.price) == (row.side, row.level.price))
+    }
+
+    /// Uma sessão nova vai mandar snapshots novos: o que estava na tela era da anterior.
+    fn forget_books(&mut self) {
+        self.top = None;
+        self.depth = None;
+        self.flashes.clear();
     }
 
     fn stream(&mut self, feed: Feed) -> &mut Option<Book> {
@@ -345,12 +407,58 @@ impl App {
             Msg::Server { message, at } => self.on_server(message, &at),
             Msg::Key(key) => self.on_key(key),
             Msg::Resize => Vec::new(),
+            Msg::Tick => {
+                for market in &mut self.markets {
+                    market.tick();
+                }
+                Vec::new()
+            }
+            Msg::Connected => self.on_connected(),
             Msg::Disconnected(reason) => {
-                self.say(Tone::Error, format!("conexão perdida: {reason}"));
-                self.connection = Connection::Offline(reason);
+                self.on_disconnected(reason);
                 Vec::new()
             }
         }
+    }
+
+    /// Uma sessão nova começa do zero no servidor: login, instrumentos, assinaturas, ordens
+    /// e saldos são pedidos de novo, e os livros esperam os snapshots dela.
+    fn on_connected(&mut self) -> Vec<Effect> {
+        if matches!(self.connection, Connection::Reconnecting { .. }) {
+            self.say(Tone::Info, "reconectado; refazendo o login");
+        }
+        self.connection = Connection::Connecting;
+        for market in &mut self.markets {
+            market.forget_books();
+        }
+        self.start()
+    }
+
+    /// O que estava na tela fica, esmaecido, até a sessão nova trazer o estado de verdade.
+    /// O que esperava resposta da sessão que caiu não vai recebê-la.
+    fn on_disconnected(&mut self, reason: String) {
+        let attempt = match &self.connection {
+            Connection::Reconnecting { attempt, .. } => attempt + 1,
+            Connection::Connecting | Connection::Online => 1,
+        };
+        self.say(
+            Tone::Error,
+            format!(
+                "conexão caiu: {reason}; tentando de novo a cada {}s",
+                RETRY.as_secs()
+            ),
+        );
+        self.connection = Connection::Reconnecting { attempt, reason };
+        self.orders.forget_pending();
+        self.balance_pending = false;
+        self.balance_stale = false;
+        if matches!(self.prompt, Some(Prompt::Cancel { .. })) {
+            self.prompt = None;
+        }
+    }
+
+    pub fn is_online(&self) -> bool {
+        self.connection == Connection::Online
     }
 
     /// O mercado da aba aberta; `None` na aba Mercado.
@@ -416,6 +524,9 @@ impl App {
             } => {
                 if let Some(market) = self.market(&instrument) {
                     *market.stream(feed) = Some(Book::from_snapshot(seq, &bids, &asks));
+                    if feed == Feed::L2 {
+                        market.flashes.clear();
+                    }
                 }
                 Vec::new()
             }
@@ -429,6 +540,9 @@ impl App {
             } => self.on_increment(&instrument, feed, seq, |market| {
                 if let Some(book) = market.stream(feed) {
                     book.set_level(side, price, lots);
+                }
+                if feed == Feed::L2 {
+                    market.flash(side, price, lots);
                 }
             }),
             ServerMessage::Top {
@@ -464,7 +578,14 @@ impl App {
                 }
             }
             ServerMessage::Orders { orders } => {
-                self.orders.open(orders);
+                match self.orders.sync(orders) {
+                    0 => {}
+                    1 => self.say(Tone::Info, "1 ordem terminou enquanto a TUI estava fora"),
+                    closed => self.say(
+                        Tone::Info,
+                        format!("{closed} ordens terminaram enquanto a TUI estava fora"),
+                    ),
+                }
                 Vec::new()
             }
             report => self.on_report(report),
@@ -627,9 +748,18 @@ impl App {
                 })
             })
             .collect();
-        self.markets = instruments.into_iter().map(Market::new).collect();
-        self.tab = Tab::Market;
-        self.market_cursor = 0;
+        // Na reconexão os instrumentos costumam ser os mesmos: a aba aberta e as boletas
+        // ficam.
+        let same = self
+            .markets
+            .iter()
+            .map(|market| &market.spec)
+            .eq(instruments.iter());
+        if !same {
+            self.markets = instruments.into_iter().map(Market::new).collect();
+            self.tab = Tab::Market;
+            self.market_cursor = 0;
+        }
         subscriptions
     }
 
@@ -704,6 +834,10 @@ impl App {
     fn confirm(&mut self, prompt: Prompt) -> Vec<Effect> {
         match prompt {
             Prompt::Quit { .. } => vec![Effect::Quit],
+            Prompt::Cancel { .. } if !self.is_online() => {
+                self.say(Tone::Error, "sem conexão com o servidor");
+                Vec::new()
+            }
             Prompt::Cancel { instrument, order } => {
                 self.say(Tone::Info, format!("cancelando #{order}"));
                 vec![Effect::Send(ClientMessage::Cancel { instrument, order })]
@@ -774,7 +908,7 @@ impl App {
     }
 
     fn send(&mut self, index: usize) -> Vec<Effect> {
-        if self.connection != Connection::Online {
+        if !self.is_online() {
             self.say(Tone::Error, "sem conexão com o servidor");
             return Vec::new();
         }
@@ -1091,8 +1225,162 @@ mod tests {
         app.update(Msg::Disconnected("o servidor fechou a conexão".to_string()));
         assert_eq!(
             app.connection,
-            Connection::Offline("o servidor fechou a conexão".to_string())
+            Connection::Reconnecting {
+                attempt: 1,
+                reason: "o servidor fechou a conexão".to_string()
+            }
         );
+    }
+
+    fn ticks(app: &mut App, count: u8) {
+        for _ in 0..count {
+            app.update(Msg::Tick);
+        }
+    }
+
+    fn row(side: Side, price: i64, lots: i64) -> Row {
+        Row {
+            side,
+            level: at(price, lots),
+        }
+    }
+
+    #[test]
+    fn changed_level_flashes_for_about_a_second() {
+        let mut app = ready();
+
+        server(&mut app, depth(5, Side::Sell, 10_000, 2));
+        let changed = row(Side::Sell, 10_000, 2);
+        assert!(teste(&app).is_flashing(&changed));
+        assert!(!teste(&app).is_flashing(&row(Side::Buy, 9_900, 3)));
+
+        ticks(&mut app, FLASH_TICKS - 1);
+        assert!(teste(&app).is_flashing(&changed));
+        ticks(&mut app, 1);
+        assert!(!teste(&app).is_flashing(&changed));
+    }
+
+    #[test]
+    fn a_new_change_restarts_the_flash() {
+        let mut app = ready();
+        server(&mut app, depth(5, Side::Sell, 10_000, 2));
+        ticks(&mut app, FLASH_TICKS - 1);
+
+        server(&mut app, depth(6, Side::Sell, 10_000, 1));
+        ticks(&mut app, FLASH_TICKS - 1);
+
+        assert!(teste(&app).is_flashing(&row(Side::Sell, 10_000, 1)));
+        assert_eq!(teste(&app).flashes.len(), 1);
+    }
+
+    #[test]
+    fn removed_level_and_new_snapshot_leave_nothing_flashing() {
+        let mut app = ready();
+        server(&mut app, depth(5, Side::Sell, 10_000, 2));
+        server(&mut app, depth(6, Side::Sell, 10_000, 0));
+        assert_eq!(teste(&app).flashes, []);
+
+        server(&mut app, depth(7, Side::Buy, 9_900, 4));
+        server(&mut app, snapshot(Feed::L2, 9));
+        assert_eq!(teste(&app).flashes, []);
+    }
+
+    #[test]
+    fn failed_attempts_are_counted_until_a_connection_comes_back() {
+        let mut app = ready();
+
+        app.update(Msg::Disconnected("o servidor fechou a conexão".to_string()));
+        app.update(Msg::Disconnected("conexão recusada".to_string()));
+        assert_eq!(
+            app.connection,
+            Connection::Reconnecting {
+                attempt: 2,
+                reason: "conexão recusada".to_string()
+            }
+        );
+        assert!(teste(&app).depth.is_some());
+
+        let effects = app.update(Msg::Connected);
+
+        assert_eq!(effects, app.start());
+        assert_eq!(app.connection, Connection::Connecting);
+        assert!(teste(&app).depth.is_none());
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "reconectado; refazendo o login"
+        );
+    }
+
+    #[test]
+    fn reconnection_keeps_the_open_tab_and_the_tickets() {
+        let mut app = ready();
+        press(&mut app, "]s");
+        app.update(Msg::Disconnected("caiu".to_string()));
+        app.update(Msg::Connected);
+        server(&mut app, ServerMessage::LoggedIn { account: 1 });
+
+        let effects = server(
+            &mut app,
+            ServerMessage::Instruments {
+                instruments: vec![spec("TESTE/BRL", 10), spec("OUTRO/BRL", 5)],
+            },
+        );
+
+        assert_eq!(effects.len(), 4);
+        assert_eq!(app.tab, Tab::Instrument(0));
+        assert_eq!(teste(&app).ticket.side, Side::Sell);
+    }
+
+    #[test]
+    fn orders_that_vanished_while_offline_are_closed() {
+        let mut app = ready();
+        server(&mut app, rested(1, 10_000, 5));
+        server(&mut app, rested(2, 9_900, 3));
+        app.update(Msg::Disconnected("caiu".to_string()));
+        app.update(Msg::Connected);
+
+        server(
+            &mut app,
+            ServerMessage::Orders {
+                orders: vec![exchange_protocol::OpenOrder {
+                    instrument: "TESTE/BRL".to_string(),
+                    order: 2,
+                    side: Side::Sell,
+                    kind: exchange_protocol::OrderType::Limit,
+                    price: Some(9_900),
+                    trigger: None,
+                    tif: exchange_protocol::Tif::Gtc,
+                    lots: 3,
+                    remaining: 1,
+                    state: exchange_protocol::OrderState::Resting,
+                }],
+            },
+        );
+
+        assert_eq!(
+            app.orders.get(1).unwrap().state,
+            crate::orders::State::Closed
+        );
+        assert_eq!(app.orders.get(2).unwrap().remaining, Some(1));
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "1 ordem terminou enquanto a TUI estava fora"
+        );
+    }
+
+    #[test]
+    fn cancel_question_is_dropped_when_the_connection_falls() {
+        let mut app = ready();
+        server(&mut app, rested(1, 10_000, 5));
+        press(&mut app, "]");
+        app.update(Msg::Key(Key::Tab));
+        press(&mut app, "jx");
+        assert!(app.prompt.is_some());
+
+        app.update(Msg::Disconnected("caiu".to_string()));
+
+        assert_eq!(app.prompt, None);
+        assert_eq!(app.update(Msg::Key(Key::Char('y'))), []);
     }
 
     #[test]

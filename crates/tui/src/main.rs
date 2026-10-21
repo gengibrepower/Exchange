@@ -2,13 +2,14 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::Instant;
 
 use exchange_protocol::ServerMessage;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use tui::app::{App, Effect, Key, Msg};
+use tui::app::{App, Effect, Key, Msg, RETRY, TICK};
 use tui::ui;
 
 const USAGE: &str = "uso: tui --account <conta> [--server <endereço:porta>]";
@@ -64,21 +65,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let reader = match stream.try_clone() {
-        Ok(reader) => reader,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     let (sender, inbox) = mpsc::channel();
-    spawn_server_reader(reader, sender.clone());
+    let (writer, writers) = mpsc::channel();
+    spawn_connection(args.server, stream, sender.clone(), writer);
     spawn_keyboard(sender);
 
     let app = App::new(args.server.to_string(), args.account);
     let mut terminal = ratatui::init();
-    let outcome = run(&mut terminal, app, &inbox, stream);
+    let outcome = run(&mut terminal, app, &inbox, &writers);
     ratatui::restore();
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -89,30 +84,59 @@ fn main() -> ExitCode {
     }
 }
 
-/// Uma linha do servidor por mensagem. Linha que este cliente não entende (de um servidor
-/// mais novo) é ignorada; o fim da conexão vira uma mensagem para a tela.
-fn spawn_server_reader(stream: TcpStream, inbox: Sender<Msg>) {
+/// A conexão inteira numa thread: lê as linhas, e quando a conexão cai, tenta outra a cada
+/// [`RETRY`] até conseguir. Cada conexão nova manda primeiro a ponta de escrita para o laço
+/// (`writers`) e depois o [`Msg::Connected`], então o laço já tem por onde escrever quando
+/// o `update` pede o login.
+fn spawn_connection(
+    server: SocketAddr,
+    first: TcpStream,
+    inbox: Sender<Msg>,
+    writers: Sender<TcpStream>,
+) {
     thread::spawn(move || {
-        let mut lines = BufReader::new(stream).lines();
-        let reason = loop {
-            match lines.next() {
-                None => break "o servidor fechou a conexão".to_string(),
-                Some(Err(error)) => break error.to_string(),
-                Some(Ok(line)) => {
-                    let Ok(message) = ServerMessage::from_line(&line) else {
-                        continue;
-                    };
-                    // A hora de chegada, no fuso da máquina; sem fuso conhecido, UTC.
-                    let at = jiff::Zoned::now().strftime("%H:%M:%S").to_string();
-                    if inbox.send(Msg::Server { message, at }).is_err() {
+        let mut attempt: io::Result<TcpStream> = Ok(first);
+        loop {
+            let reason = match attempt.and_then(|reader| Ok((reader.try_clone()?, reader))) {
+                Ok((writer, reader)) => {
+                    if writers.send(writer).is_err() || inbox.send(Msg::Connected).is_err() {
                         return;
                     }
+                    let Some(reason) = read_lines(reader, &inbox) else {
+                        return;
+                    };
+                    reason
                 }
+                Err(error) => error.to_string(),
+            };
+            if inbox.send(Msg::Disconnected(reason)).is_err() {
+                return;
             }
-        };
-        // Se a tela já fechou, não há para quem contar.
-        let _ = inbox.send(Msg::Disconnected(reason));
+            thread::sleep(RETRY);
+            attempt = TcpStream::connect_timeout(&server, RETRY);
+        }
     });
+}
+
+/// Uma linha do servidor por mensagem, até a conexão acabar; devolve o motivo, ou `None` se
+/// a tela já fechou e não há para quem contar. Linha que este cliente não entende (de um
+/// servidor mais novo) é ignorada.
+fn read_lines(stream: TcpStream, inbox: &Sender<Msg>) -> Option<String> {
+    let mut lines = BufReader::new(stream).lines();
+    loop {
+        match lines.next() {
+            None => return Some("o servidor fechou a conexão".to_string()),
+            Some(Err(error)) => return Some(error.to_string()),
+            Some(Ok(line)) => {
+                let Ok(message) = ServerMessage::from_line(&line) else {
+                    continue;
+                };
+                // A hora de chegada, no fuso da máquina; sem fuso conhecido, UTC.
+                let at = jiff::Zoned::now().strftime("%H:%M:%S").to_string();
+                inbox.send(Msg::Server { message, at }).ok()?;
+            }
+        }
+    }
 }
 
 fn spawn_keyboard(inbox: Sender<Msg>) {
@@ -155,32 +179,49 @@ fn translate(key: KeyEvent) -> Option<Key> {
     })
 }
 
-/// O laço: desenha, espera uma mensagem, junta as que chegaram juntas, atualiza o estado e
-/// executa os efeitos. Uma rajada do feed vira um redesenho só.
+/// O laço: desenha, espera uma mensagem (ou o próximo tick), junta as que chegaram juntas,
+/// atualiza o estado e executa os efeitos. Uma rajada do feed vira um redesenho só, e o
+/// tick sai no horário mesmo com o feed sem parar.
 fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     inbox: &Receiver<Msg>,
-    mut server: TcpStream,
+    writers: &Receiver<TcpStream>,
 ) -> io::Result<()> {
-    let mut effects = app.start();
+    let mut server: Option<TcpStream> = None;
+    let mut effects = Vec::new();
+    let mut next_tick = Instant::now() + TICK;
     loop {
+        if let Some(latest) = writers.try_iter().last() {
+            server = Some(latest);
+        }
         for effect in std::mem::take(&mut effects) {
             match effect {
                 Effect::Quit => return Ok(()),
+                // Uma escrita que falha quer dizer conexão morta: a thread de leitura percebe
+                // e avisa, e até lá o que for mandado se perde, como se perderia no fio.
                 Effect::Send(message) => {
-                    if let Err(error) = server.write_all(message.to_line().as_bytes()) {
-                        effects.extend(app.update(Msg::Disconnected(error.to_string())));
+                    if let Some(stream) = &mut server
+                        && stream.write_all(message.to_line().as_bytes()).is_err()
+                    {
+                        server = None;
                     }
                 }
             }
         }
         terminal.draw(|frame| ui::draw(frame, &app))?;
-        let Ok(first) = inbox.recv() else {
-            return Ok(());
-        };
-        effects.extend(app.update(first));
-        effects.extend(inbox.try_iter().flat_map(|msg| app.update(msg)));
+        match inbox.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+            Ok(first) => {
+                effects.extend(app.update(first));
+                effects.extend(inbox.try_iter().flat_map(|msg| app.update(msg)));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        if Instant::now() >= next_tick {
+            effects.extend(app.update(Msg::Tick));
+            next_tick = Instant::now() + TICK;
+        }
     }
 }
 
