@@ -12,6 +12,7 @@ use crate::app::{App, Connection, Focus, Market, Row, Tab, Tick, Tone};
 use crate::format::{brl, grouped};
 use crate::orders::{Order, State};
 use crate::theme;
+use crate::ticket::{Field, tif_label};
 
 const PRICE_WIDTH: usize = 12;
 const LOTS_WIDTH: usize = 8;
@@ -171,7 +172,7 @@ fn instrument_tab(frame: &mut Frame, area: Rect, app: &App, market: &Market) {
     book(frame, book_area, market, app.focus == Focus::Book);
     tape(frame, trades, market);
     order_list(frame, orders, app, market);
-    frame.render_widget(panel("Boleta", false), ticket);
+    ticket_panel(frame, ticket, market, app.focus == Focus::Ticket);
     balance_list(frame, balances, app);
 }
 
@@ -287,6 +288,104 @@ fn order_line(order: &Order, selected: bool) -> Line<'static> {
         line.style(theme::selected())
     } else {
         line
+    }
+}
+
+fn ticket_panel(frame: &mut Frame, area: Rect, market: &Market, focused: bool) {
+    let block = panel("Boleta", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let ticket = &market.ticket;
+    let field = |name: &str, value: String, which: Field| {
+        let chosen = focused && ticket.field == which;
+        let style = if chosen {
+            theme::key().add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            theme::base()
+        };
+        let brackets = if chosen { theme::key() } else { theme::dim() };
+        let mut spans = Vec::new();
+        if !name.is_empty() {
+            spans.push(Span::styled(format!("{name} "), theme::dim()));
+        }
+        spans.extend([
+            Span::styled("[", brackets),
+            Span::styled(value, style),
+            Span::styled("]", brackets),
+            Span::raw("  "),
+        ]);
+        spans
+    };
+    let side = match ticket.side {
+        Side::Buy => Span::styled(
+            "COMPRA",
+            theme::buy().add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Side::Sell => Span::styled(
+            "VENDA",
+            theme::sell().add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+    };
+    let side_chosen = focused && ticket.field == Field::Side;
+    let brackets = if side_chosen {
+        theme::key()
+    } else {
+        theme::dim()
+    };
+    let mut first = vec![
+        Span::raw(" "),
+        Span::styled("[", brackets),
+        side,
+        Span::styled("]", brackets),
+        Span::raw("  "),
+    ];
+    let kind = match ticket.kind {
+        OrderType::Limit => "lim",
+        OrderType::Market => "mkt",
+        OrderType::Stop => "stop",
+    };
+    first.extend(field("tipo", kind.to_string(), Field::Kind));
+    first.extend(field("tif", tif_label(ticket.tif).to_string(), Field::Tif));
+
+    let mut second = vec![Span::raw(" ")];
+    if ticket.fields().contains(&Field::Trigger) {
+        second.extend(field("gatilho", money(ticket.trigger), Field::Trigger));
+    }
+    if ticket.fields().contains(&Field::Price) {
+        let name = if ticket.kind == OrderType::Stop {
+            "limite"
+        } else {
+            "preço"
+        };
+        second.extend(field(name, money(ticket.price), Field::Price));
+    }
+    second.extend(field(
+        "lots",
+        format!("{:>5}", lots(ticket.lots)),
+        Field::Lots,
+    ));
+
+    let hint = if focused {
+        Line::from(vec![
+            Span::styled(" ↵ ", theme::key()),
+            Span::styled(format!("enviar {}", ticket.describe()), theme::dim()),
+        ])
+    } else {
+        Line::styled(
+            " tab até aqui para editar · b/s escolhe o lado",
+            theme::dim(),
+        )
+    };
+    let lines = vec![Line::from(first), Line::from(second), hint];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Zero é campo vazio.
+fn money(value: i64) -> String {
+    if value == 0 {
+        format!("{:>9}", "—")
+    } else {
+        format!("{:>9}", brl(value))
     }
 }
 
@@ -412,7 +511,16 @@ fn bar(lots: i64, widest: i64, width: usize) -> String {
 
 fn status(frame: &mut Frame, area: Rect, app: &App) {
     let [left, right] = Layout::horizontal([Constraint::Min(0), Constraint::Length(9)]).areas(area);
-    if let Some(status) = &app.status {
+    if let Some(prompt) = &app.prompt {
+        let line = Line::from(vec![
+            Span::styled(" ? ", theme::key()),
+            Span::styled(
+                prompt.question(),
+                theme::key().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), left);
+    } else if let Some(status) = &app.status {
         let (mark, style) = match status.tone {
             Tone::Info => ("·", theme::base()),
             Tone::Ok => ("✓", theme::buy()),
@@ -443,15 +551,24 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Instrument(_) => match app.focus {
             Focus::Book => &[
                 ("j/k", "nível"),
+                ("↵", "usar preço"),
                 ("tab", "ordens"),
                 ("[ ]", "aba"),
                 ("q", "sair"),
             ],
             Focus::Orders => &[
                 ("j/k", "ordem"),
-                ("tab", "livro"),
-                ("[ ]", "aba"),
+                ("x", "cancelar"),
+                ("tab", "boleta"),
                 ("q", "sair"),
+            ],
+            Focus::Ticket => &[
+                ("h/l", "campo"),
+                ("j/k", "ajustar"),
+                ("0-9", "digitar"),
+                ("b/s", "lado"),
+                ("↵", "enviar"),
+                ("tab", "livro"),
             ],
         },
     };
@@ -466,20 +583,26 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-const SHORTCUTS: [(&str, &str); 8] = [
-    ("j k ↓ ↑", "mover dentro do painel"),
-    ("tab", "trocar o foco entre livro e ordens"),
+const SHORTCUTS: [(&str, &str); 14] = [
+    ("j k ↓ ↑", "mover; na boleta, ajustar o campo"),
+    ("h l ← →", "na boleta, campo anterior / próximo"),
+    ("tab", "foco: livro → ordens → boleta"),
     ("[ ]", "aba anterior / próxima"),
-    ("↵", "na aba Mercado, abrir o instrumento"),
+    ("↵", "Mercado: abrir · livro: usar o preço"),
+    ("↵", "na boleta, enviar a ordem"),
+    ("0-9 ⌫", "na boleta, digitar (centavos)"),
+    ("b s", "lado da boleta: compra / venda"),
+    ("x", "nas ordens, cancelar (pede y)"),
+    ("y", "confirmar a pergunta da status"),
     ("?", "abrir / fechar esta ajuda"),
     ("esc", "fechar esta ajuda"),
-    ("q", "sair"),
-    ("ctrl-c", "sair"),
+    ("q", "sair (pede y com ordem aberta)"),
+    ("ctrl-c", "sair na hora"),
 ];
 
 fn help(frame: &mut Frame, area: Rect) {
     let height = u16::try_from(SHORTCUTS.len()).unwrap_or(u16::MAX) + 2;
-    let popup = centered(area, 52, height);
+    let popup = centered(area, 56, height);
     frame.render_widget(Clear, popup);
     let lines: Vec<Line> = SHORTCUTS
         .iter()

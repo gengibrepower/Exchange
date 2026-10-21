@@ -11,6 +11,7 @@ use exchange_protocol::{
 use crate::book::{Book, Gap, Sequence};
 use crate::format::{brl, grouped};
 use crate::orders::Orders;
+use crate::ticket::Ticket;
 
 /// Níveis por lado que o livro mostra e que o cursor alcança.
 pub const DEPTH: usize = 10;
@@ -59,6 +60,36 @@ pub enum Effect {
 pub enum Focus {
     Book,
     Orders,
+    Ticket,
+}
+
+impl Focus {
+    /// A ordem do `Tab`: livro, ordens, boleta, e de volta ao livro.
+    fn next(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Book, true) | (Self::Ticket, false) => Self::Orders,
+            (Self::Orders, true) | (Self::Book, false) => Self::Ticket,
+            (Self::Ticket, true) | (Self::Orders, false) => Self::Book,
+        }
+    }
+}
+
+/// Uma pergunta de sim ou não na linha de status: só `y` confirma, e qualquer outra tecla
+/// desiste sem fazer mais nada.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Prompt {
+    Cancel { instrument: String, order: u64 },
+    Quit { open: usize },
+}
+
+impl Prompt {
+    pub fn question(&self) -> String {
+        match self {
+            Self::Cancel { order, .. } => format!("cancelar #{order}? y/n"),
+            Self::Quit { open: 1 } => "há 1 ordem aberta; sair mesmo? y/n".to_string(),
+            Self::Quit { open } => format!("há {open} ordens abertas; sair mesmo? y/n"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -138,6 +169,8 @@ pub struct Market {
     /// Os negócios do fluxo L2, do mais recente para o mais antigo.
     pub tape: VecDeque<Print>,
     pub selected: Option<Selection>,
+    /// Uma boleta por instrumento, que guarda o que foi usado por último nele.
+    pub ticket: Ticket,
 }
 
 impl Market {
@@ -149,6 +182,7 @@ impl Market {
             last: None,
             tape: VecDeque::new(),
             selected: None,
+            ticket: Ticket::default(),
         }
     }
 
@@ -267,6 +301,7 @@ pub struct App {
     /// A ordem sob o cursor no painel Minhas ordens, guardada pelo id.
     pub order_cursor: Option<u64>,
     pub balances: Vec<AssetBalance>,
+    pub prompt: Option<Prompt>,
     /// O servidor só manda saldo quando pedido: um pedido por vez, e, se a conta mudou
     /// enquanto ele estava no ar, outro logo depois da resposta.
     balance_pending: bool,
@@ -288,6 +323,7 @@ impl App {
             orders: Orders::default(),
             order_cursor: None,
             balances: Vec::new(),
+            prompt: None,
             balance_pending: false,
             balance_stale: false,
         }
@@ -544,10 +580,11 @@ impl App {
         match report {
             ServerMessage::Fill {
                 instrument,
+                role,
                 order,
                 lots,
                 ..
-            } => orders.filled(&instrument, order, lots),
+            } => orders.filled(&instrument, order, lots, role == Role::Taker),
             ServerMessage::Rested {
                 instrument,
                 order,
@@ -561,7 +598,7 @@ impl App {
             ServerMessage::Expired {
                 instrument, order, ..
             } => orders.expired(&instrument, order),
-            ServerMessage::Rejected { order, code, .. } => orders.rejected(None, order, &code),
+            ServerMessage::Rejected { order, code, .. } => orders.rejected(order, &code),
             ServerMessage::Armed {
                 instrument,
                 order,
@@ -629,8 +666,15 @@ impl App {
     }
 
     fn on_key(&mut self, key: Key) -> Vec<Effect> {
-        if matches!(key, Key::Interrupt | Key::Char('q')) {
+        if key == Key::Interrupt {
             return vec![Effect::Quit];
+        }
+        if let Some(prompt) = self.prompt.take() {
+            return if key == Key::Char('y') {
+                self.confirm(prompt)
+            } else {
+                Vec::new()
+            };
         }
         if self.help {
             if matches!(key, Key::Char('?') | Key::Esc) {
@@ -638,24 +682,121 @@ impl App {
             }
             return Vec::new();
         }
-        match key {
-            Key::Char('?') => self.help = true,
-            Key::Tab | Key::BackTab if matches!(self.tab, Tab::Instrument(_)) => {
-                self.focus = match self.focus {
-                    Focus::Book => Focus::Orders,
-                    Focus::Orders => Focus::Book,
-                };
-            }
-            Key::Char(']') => self.tab = self.next_tab(true),
-            Key::Char('[') => self.tab = self.next_tab(false),
-            Key::Char('j') | Key::Down => self.move_cursor(true),
-            Key::Char('k') | Key::Up => self.move_cursor(false),
-            Key::Enter if self.tab == Tab::Market && self.market_cursor < self.markets.len() => {
+        match (self.tab, key) {
+            (_, Key::Char('q')) => match self.orders.open_count() {
+                0 => return vec![Effect::Quit],
+                open => self.prompt = Some(Prompt::Quit { open }),
+            },
+            (_, Key::Char('?')) => self.help = true,
+            (_, Key::Char(']')) => self.tab = self.next_tab(true),
+            (_, Key::Char('[')) => self.tab = self.next_tab(false),
+            (Tab::Market, Key::Char('j') | Key::Down) => self.move_cursor(true),
+            (Tab::Market, Key::Char('k') | Key::Up) => self.move_cursor(false),
+            (Tab::Market, Key::Enter) if self.market_cursor < self.markets.len() => {
                 self.tab = Tab::Instrument(self.market_cursor);
             }
+            (Tab::Instrument(index), key) => return self.on_instrument_key(index, key),
+            (Tab::Market, _) => {}
+        }
+        Vec::new()
+    }
+
+    fn confirm(&mut self, prompt: Prompt) -> Vec<Effect> {
+        match prompt {
+            Prompt::Quit { .. } => vec![Effect::Quit],
+            Prompt::Cancel { instrument, order } => {
+                self.say(Tone::Info, format!("cancelando #{order}"));
+                vec![Effect::Send(ClientMessage::Cancel { instrument, order })]
+            }
+        }
+    }
+
+    fn on_instrument_key(&mut self, index: usize, key: Key) -> Vec<Effect> {
+        let Some(market) = self.markets.get_mut(index) else {
+            return Vec::new();
+        };
+        let tick = market.spec.tick;
+        let ticket = &mut market.ticket;
+        match (self.focus, key) {
+            (_, Key::Tab | Key::BackTab) => {
+                self.focus = self.focus.next(key == Key::Tab);
+                if self.focus == Focus::Ticket {
+                    ticket.enter();
+                }
+            }
+            (_, Key::Char('b')) => ticket.side = Side::Buy,
+            (_, Key::Char('s')) => ticket.side = Side::Sell,
+            (Focus::Book, Key::Enter) => self.take_price(index),
+            (Focus::Orders, Key::Char('x')) => self.ask_cancel(),
+            (Focus::Ticket, Key::Enter) => return self.send(index),
+            (Focus::Ticket, Key::Char('h') | Key::Left) => ticket.step_field(false),
+            (Focus::Ticket, Key::Char('l') | Key::Right) => ticket.step_field(true),
+            (Focus::Ticket, Key::Char('j') | Key::Down) => ticket.adjust(false, tick),
+            (Focus::Ticket, Key::Char('k') | Key::Up) => ticket.adjust(true, tick),
+            (Focus::Ticket, Key::Backspace) => ticket.backspace(),
+            (Focus::Ticket, Key::Char(digit)) if digit.is_ascii_digit() => {
+                ticket.digit(digit.to_digit(10).unwrap_or(0));
+            }
+            (_, Key::Char('j') | Key::Down) => self.move_cursor(true),
+            (_, Key::Char('k') | Key::Up) => self.move_cursor(false),
             _ => {}
         }
         Vec::new()
+    }
+
+    fn take_price(&mut self, index: usize) {
+        let Some(market) = self.markets.get_mut(index) else {
+            return;
+        };
+        let Some(selected) = market.selected else {
+            self.say(Tone::Info, "escolha um nível do livro com j/k");
+            return;
+        };
+        market.ticket.take_price(selected.price);
+        self.focus = Focus::Ticket;
+    }
+
+    fn ask_cancel(&mut self) {
+        let Some(id) = self.order_cursor else {
+            self.say(Tone::Info, "escolha uma ordem com j/k");
+            return;
+        };
+        match self.orders.get(id) {
+            Some(order) if order.state.is_open() => {
+                self.prompt = Some(Prompt::Cancel {
+                    instrument: order.instrument.clone(),
+                    order: id,
+                });
+            }
+            Some(_) => self.say(Tone::Info, format!("#{id} já terminou")),
+            None => self.say(Tone::Info, "escolha uma ordem com j/k"),
+        }
+    }
+
+    fn send(&mut self, index: usize) -> Vec<Effect> {
+        if self.connection != Connection::Online {
+            self.say(Tone::Error, "sem conexão com o servidor");
+            return Vec::new();
+        }
+        let Some(market) = self.markets.get(index) else {
+            return Vec::new();
+        };
+        match market.ticket.order(&market.spec.symbol) {
+            Ok((message, pending)) => {
+                let text = format!(
+                    "enviando: {} em {}",
+                    market.ticket.describe(),
+                    market.spec.symbol
+                );
+                self.orders.expect(pending);
+                self.say(Tone::Info, text);
+                vec![Effect::Send(message)]
+            }
+            Err(problem) => {
+                self.say(Tone::Error, problem);
+                Vec::new()
+            }
+        }
     }
 
     /// A aba seguinte (`forward`) ou a anterior, dando a volta: Mercado, depois um
@@ -694,6 +835,7 @@ impl App {
                     }
                 }
                 Focus::Orders => self.move_order_cursor(index, down),
+                Focus::Ticket => {}
             },
         }
     }
@@ -1230,6 +1372,173 @@ mod tests {
         press(&mut app, "k");
         assert_eq!(app.order_cursor, Some(2));
         assert_eq!(teste(&app).selected, None);
+    }
+
+    fn key(app: &mut App, key: Key) -> Vec<Effect> {
+        app.update(Msg::Key(key))
+    }
+
+    /// Na aba de TESTE/BRL, com o foco na boleta.
+    fn at_ticket() -> App {
+        let mut app = ready();
+        press(&mut app, "]");
+        key(&mut app, Key::Tab);
+        key(&mut app, Key::Tab);
+        assert_eq!(app.focus, Focus::Ticket);
+        app
+    }
+
+    #[test]
+    fn tab_cycles_book_orders_ticket() {
+        let mut app = ready();
+        press(&mut app, "]");
+
+        key(&mut app, Key::Tab);
+        key(&mut app, Key::Tab);
+        assert_eq!(app.focus, Focus::Ticket);
+        key(&mut app, Key::Tab);
+        assert_eq!(app.focus, Focus::Book);
+        key(&mut app, Key::BackTab);
+        assert_eq!(app.focus, Focus::Ticket);
+    }
+
+    #[test]
+    fn enter_on_a_book_level_takes_its_price_to_the_ticket() {
+        let mut app = ready();
+        press(&mut app, "]k");
+
+        key(&mut app, Key::Enter);
+
+        assert_eq!(app.focus, Focus::Ticket);
+        assert_eq!(teste(&app).ticket.price, 10_000);
+    }
+
+    #[test]
+    fn enter_on_the_book_without_a_level_only_explains() {
+        let mut app = ready();
+        press(&mut app, "]");
+
+        key(&mut app, Key::Enter);
+
+        assert_eq!(app.focus, Focus::Book);
+        assert_eq!(teste(&app).ticket.price, 0);
+    }
+
+    #[test]
+    fn typed_ticket_is_sent_and_awaited() {
+        let mut app = at_ticket();
+        press(&mut app, "s10050lk");
+        press(&mut app, "kkkk");
+
+        let effects = key(&mut app, Key::Enter);
+
+        assert_eq!(
+            effects,
+            [Effect::Send(ClientMessage::Limit {
+                instrument: "TESTE/BRL".to_string(),
+                side: Side::Sell,
+                price: 10_050,
+                lots: 6,
+                tif: exchange_protocol::Tif::Gtc,
+            })]
+        );
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "enviando: venda 6 lots @ 100,50 lim GTC em TESTE/BRL"
+        );
+        server(&mut app, rested(1, 10_050, 6));
+        assert_eq!(app.orders.get(1).unwrap().total, Some(6));
+    }
+
+    #[test]
+    fn j_and_k_on_the_price_walk_the_instrument_tick() {
+        let mut app = at_ticket();
+
+        press(&mut app, "kkk");
+
+        assert_eq!(teste(&app).ticket.price, 30);
+    }
+
+    #[test]
+    fn incomplete_ticket_is_refused_locally() {
+        let mut app = at_ticket();
+
+        assert_eq!(key(&mut app, Key::Enter), []);
+        assert_eq!(app.status.as_ref().unwrap().tone, Tone::Error);
+    }
+
+    #[test]
+    fn nothing_is_sent_while_offline() {
+        let mut app = at_ticket();
+        press(&mut app, "10050");
+        app.update(Msg::Disconnected("caiu".to_string()));
+
+        assert_eq!(key(&mut app, Key::Enter), []);
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "sem conexão com o servidor"
+        );
+    }
+
+    #[test]
+    fn x_asks_and_only_y_cancels() {
+        let mut app = ready();
+        server(&mut app, rested(1, 10_000, 5));
+        press(&mut app, "]");
+        key(&mut app, Key::Tab);
+        press(&mut app, "j");
+
+        press(&mut app, "x");
+        assert_eq!(app.prompt.as_ref().unwrap().question(), "cancelar #1? y/n");
+        assert_eq!(key(&mut app, Key::Char('n')), []);
+        assert_eq!(app.prompt, None);
+
+        press(&mut app, "x");
+        assert_eq!(
+            key(&mut app, Key::Char('y')),
+            [Effect::Send(ClientMessage::Cancel {
+                instrument: "TESTE/BRL".to_string(),
+                order: 1,
+            })]
+        );
+    }
+
+    #[test]
+    fn finished_order_cannot_be_cancelled() {
+        let mut app = ready();
+        server(&mut app, rested(1, 10_000, 5));
+        server(&mut app, fill(1, 5));
+        press(&mut app, "]");
+        key(&mut app, Key::Tab);
+        press(&mut app, "jx");
+
+        assert_eq!(app.prompt, None);
+        assert_eq!(app.status.as_ref().unwrap().text, "#1 já terminou");
+    }
+
+    #[test]
+    fn q_with_open_orders_asks_first_but_ctrl_c_does_not() {
+        let mut app = ready();
+        server(&mut app, rested(1, 10_000, 5));
+
+        assert_eq!(key(&mut app, Key::Char('q')), []);
+        assert_eq!(
+            app.prompt.as_ref().unwrap().question(),
+            "há 1 ordem aberta; sair mesmo? y/n"
+        );
+        assert_eq!(key(&mut app, Key::Char('y')), [Effect::Quit]);
+
+        assert_eq!(key(&mut app, Key::Interrupt), [Effect::Quit]);
+    }
+
+    #[test]
+    fn b_and_s_choose_the_side_from_any_panel() {
+        let mut app = ready();
+        press(&mut app, "]s");
+        assert_eq!(teste(&app).ticket.side, Side::Sell);
+        key(&mut app, Key::Tab);
+        press(&mut app, "b");
+        assert_eq!(teste(&app).ticket.side, Side::Buy);
     }
 
     #[test]
