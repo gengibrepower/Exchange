@@ -534,8 +534,6 @@ dependencies = [
  "exchange-protocol",
  "exchange-wal",
  "proptest",
- "serde",
- "serde_json",
  "tokio",
 ]
 

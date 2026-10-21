@@ -21,7 +21,7 @@ pub struct SessionConfig {
     pub sender: Text,
     pub target: Text,
     /// O initiator propõe este intervalo no Logon e o acceptor adota o que vier. Também é
-    /// o prazo para o Logon (ou a resposta ao Logout) chegar.
+    /// o prazo para o Logon chegar.
     pub heartbeat_secs: NonZeroU32,
 }
 
@@ -50,7 +50,6 @@ enum Link {
     Disconnected,
     AwaitingLogon { since: UtcTimestamp },
     Active(Active),
-    LoggingOut { since: UtcTimestamp },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,15 +129,6 @@ impl Session {
         out
     }
 
-    pub fn logout(&mut self, now: UtcTimestamp) -> Vec<Action> {
-        let mut out = Vec::new();
-        if self.is_active() {
-            self.transmit(now, Body::Admin(Admin::Logout { text: None }), &mut out);
-            self.link = Link::LoggingOut { since: now };
-        }
-        out
-    }
-
     pub fn receive(&mut self, now: UtcTimestamp, message: Message) -> Vec<Action> {
         let mut out = Vec::new();
         if let Link::Active(active) = &mut self.link {
@@ -156,7 +146,7 @@ impl Session {
                 self.terminate(now, "CompID inesperado", &mut out);
             }
             (Link::AwaitingLogon { .. }, Ok(envelope)) => self.on_logon(now, &envelope, &mut out),
-            (Link::Active(_) | Link::LoggingOut { .. }, Ok(envelope)) => {
+            (Link::Active(_), Ok(envelope)) => {
                 self.on_sequenced(now, envelope, &mut out);
             }
         }
@@ -167,7 +157,7 @@ impl Session {
         let mut out = Vec::new();
         match self.link {
             Link::Disconnected => {}
-            Link::AwaitingLogon { since } | Link::LoggingOut { since } => {
+            Link::AwaitingLogon { since } => {
                 let timeout = u64::from(self.config.heartbeat_secs.get()) * 1_000;
                 if now.saturating_millis_since(since) >= timeout {
                     self.drop_link(&mut out);
@@ -259,9 +249,7 @@ impl Session {
             Admin::SequenceReset { new_seq, .. } => self.jump_inbound(now, seq, new_seq, out),
             Admin::Logon { .. } => self.terminate(now, "Logon com a sessão já ativa", out),
             Admin::Logout { .. } => {
-                if self.is_active() {
-                    self.transmit(now, Body::Admin(Admin::Logout { text: None }), out);
-                }
+                self.transmit(now, Body::Admin(Admin::Logout { text: None }), out);
                 self.drop_link(out);
             }
         }
