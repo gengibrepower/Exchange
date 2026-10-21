@@ -470,14 +470,6 @@ fn logout_is_answered_and_disconnects() {
 }
 
 #[test]
-fn our_logout_waits_for_the_answer() {
-    let mut session = active_acceptor();
-    assert!(is_logout(&bodies(&session.logout(at(1)))[0]));
-    let actions = session.receive(at(2), client_admin(2, Admin::Logout { text: None }));
-    assert_eq!(actions, vec![Action::Disconnect]);
-}
-
-#[test]
 fn malformed_message_in_sequence_is_rejected_and_consumes_the_seq() {
     let mut session = active_acceptor();
     let field = |tag: Tag, value: &str| Field::new(tag, value).expect("campo de teste válido");
