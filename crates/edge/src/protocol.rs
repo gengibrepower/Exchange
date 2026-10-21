@@ -140,6 +140,7 @@ pub fn resolve(message: ClientMessage, account: AccountId) -> Result<Inbound, Pr
             price,
             lots,
             tif,
+            tag: _,
         } => Intent::Order {
             account,
             instrument: known_instrument(instrument)?,
@@ -154,6 +155,7 @@ pub fn resolve(message: ClientMessage, account: AccountId) -> Result<Inbound, Pr
             lots,
             protection,
             tif,
+            tag: _,
         } => Intent::Order {
             account,
             instrument: known_instrument(instrument)?,
@@ -171,6 +173,7 @@ pub fn resolve(message: ClientMessage, account: AccountId) -> Result<Inbound, Pr
             limit,
             lots,
             tif,
+            tag: _,
         } => Intent::Order {
             account,
             instrument: known_instrument(instrument)?,

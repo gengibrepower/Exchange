@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exchange_core::domain::{AccountId, InstrumentId};
+use exchange_core::engine::Event;
 use exchange_protocol::{AssetBalance, ClientMessage, ServerMessage};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -154,8 +155,12 @@ pub async fn respond(
         }]);
     };
     let account = reports.account();
+    let tag = message.tag();
     match protocol::resolve(message, account) {
-        Err(problem) => Ok(vec![error(problem.to_string())]),
+        Err(problem) => Ok(vec![ServerMessage::Error {
+            message: problem.to_string(),
+            tag,
+        }]),
         Ok(Inbound::Login(_)) => Ok(vec![error(format!(
             "sessão já autenticada como conta {}",
             account.get()
@@ -167,13 +172,27 @@ pub async fn respond(
         )]),
         Ok(Inbound::Submit(intent)) => {
             let submitted = reports.submit(intent).await?;
-            Ok(submitted
+            let mut replies: Vec<ServerMessage> = submitted
                 .earlier
                 .iter()
-                .chain([&submitted.events])
                 .flatten()
                 .flat_map(|event| protocol::from_event(account, event))
-                .collect())
+                .collect();
+            // O primeiro evento de uma ordem nova é sempre dela: num fill, ela é o taker.
+            let order = submitted.events.first().and_then(Event::order);
+            if let (Some(tag), Some(order)) = (tag, order) {
+                replies.push(ServerMessage::Accepted {
+                    tag,
+                    order: order.get(),
+                });
+            }
+            replies.extend(
+                submitted
+                    .events
+                    .iter()
+                    .flat_map(|event| protocol::from_event(account, event)),
+            );
+            Ok(replies)
         }
         Ok(Inbound::Subscribe { instrument, feed }) => {
             subscriptions.subscribe(core, instrument, feed).await
@@ -238,6 +257,7 @@ impl Subscriptions {
 fn error(message: impl Into<String>) -> ServerMessage {
     ServerMessage::Error {
         message: message.into(),
+        tag: None,
     }
 }
 
@@ -509,6 +529,112 @@ mod tests {
         assert_eq!(
             bob.recv().await,
             r#"{"type":"balances","balances":[{"asset":"TESTE","available":100200,"reserved":0},{"asset":"BRL","available":99979980,"reserved":0},{"asset":"OUTRO","available":0,"reserved":0}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn tagged_order_is_acknowledged_before_anything_else_about_it() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut alice = Client::login(address, 1).await;
+        let mut bob = Client::login(address, 2).await;
+        alice.fund().await;
+        bob.fund().await;
+
+        alice
+            .send(
+                r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":5,"tag":7}"#,
+            )
+            .await;
+        assert_eq!(
+            alice.recv().await,
+            r#"{"type":"accepted","tag":7,"order":1}"#
+        );
+        assert!(alice.recv().await.starts_with(r#"{"type":"rested""#));
+
+        bob.send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2,"tag":1}"#)
+            .await;
+        assert_eq!(bob.recv().await, r#"{"type":"accepted","tag":1,"order":2}"#);
+        assert!(
+            bob.recv()
+                .await
+                .starts_with(r#"{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":2"#)
+        );
+
+        bob.send(r#"{"type":"stop","instrument":"TESTE/BRL","side":"buy","trigger":10500,"lots":1,"tag":2}"#)
+            .await;
+        assert_eq!(bob.recv().await, r#"{"type":"accepted","tag":2,"order":3}"#);
+        assert!(bob.recv().await.starts_with(r#"{"type":"armed""#));
+    }
+
+    #[tokio::test]
+    async fn order_refused_by_the_core_is_still_acknowledged_first() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut alice = Client::login(address, 1).await;
+
+        alice
+            .send(
+                r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":10000,"lots":5,"tag":3}"#,
+            )
+            .await;
+
+        assert_eq!(
+            alice.recv().await,
+            r#"{"type":"accepted","tag":3,"order":1}"#
+        );
+        assert!(
+            alice
+                .recv()
+                .await
+                .starts_with(r#"{"type":"rejected","order":1,"code":"insufficient_funds""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn order_refused_before_the_core_carries_its_tag_in_the_error() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut alice = Client::login(address, 1).await;
+
+        alice
+            .send(r#"{"type":"limit","instrument":"NADA/BRL","side":"buy","price":10000,"lots":5,"tag":9}"#)
+            .await;
+        let reply = alice.recv().await;
+        assert!(reply.starts_with(r#"{"type":"error","#), "{reply}");
+        assert!(reply.ends_with(r#","tag":9}"#), "{reply}");
+
+        alice
+            .send(r#"{"type":"limit","instrument":"NADA/BRL","side":"buy","price":10000,"lots":5}"#)
+            .await;
+        let reply = alice.recv().await;
+        assert!(!reply.contains("tag"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn reports_from_earlier_commands_come_before_the_acknowledgement() {
+        let address = start(Sequencer::in_memory()).await;
+        let mut alice = Client::login(address, 1).await;
+        let mut bob = Client::login(address, 2).await;
+        alice.fund().await;
+        bob.fund().await;
+        alice
+            .send(
+                r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":2}"#,
+            )
+            .await;
+        alice.recv().await;
+        bob.send(r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2}"#)
+            .await;
+        bob.recv().await;
+
+        alice
+            .send(
+                r#"{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10100,"lots":1,"tag":4}"#,
+            )
+            .await;
+
+        assert!(alice.recv().await.starts_with(r#"{"type":"fill""#));
+        assert_eq!(
+            alice.recv().await,
+            r#"{"type":"accepted","tag":4,"order":3}"#
         );
     }
 

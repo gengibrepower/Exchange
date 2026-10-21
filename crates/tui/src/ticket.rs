@@ -192,6 +192,7 @@ impl Ticket {
                     price: self.price,
                     lots: self.lots,
                     tif: self.tif,
+                    tag: None,
                 },
                 Some(self.price),
                 None,
@@ -203,6 +204,7 @@ impl Ticket {
                     lots: self.lots,
                     protection: None,
                     tif: self.tif,
+                    tag: None,
                 },
                 None,
                 None,
@@ -217,6 +219,7 @@ impl Ticket {
                         limit,
                         lots: self.lots,
                         tif: self.tif,
+                        tag: None,
                     },
                     limit,
                     Some(self.trigger),
@@ -434,6 +437,7 @@ mod tests {
                 price: 10_050,
                 lots: 5,
                 tif: Tif::Gtc,
+                tag: None,
             }
         );
 
@@ -451,6 +455,7 @@ mod tests {
                 lots: 5,
                 protection: None,
                 tif: Tif::Ioc,
+                tag: None,
             }
         );
 
@@ -470,6 +475,7 @@ mod tests {
                 limit: None,
                 lots: 5,
                 tif: Tif::Gtc,
+                tag: None,
             }
         );
         assert_eq!(pending.trigger, Some(9_500));
