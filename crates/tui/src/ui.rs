@@ -277,6 +277,7 @@ fn order_line(order: &Order, selected: bool) -> Line<'static> {
         None => "—",
     };
     let state = match order.state {
+        State::Accepted => "receb.",
         State::Resting => "aberta",
         State::Armed => "armada",
         State::Filled => "exec.",

@@ -173,11 +173,15 @@ impl Ticket {
         }
     }
 
-    /// A mensagem para o servidor e o que a TUI espera ver voltar dela.
+    /// A mensagem para o servidor, marcada com `tag`, e o que a TUI espera ver voltar dela.
     ///
     /// # Errors
     /// Um texto para a linha de status se faltar um campo que o tipo exige.
-    pub fn order(&self, instrument: &str) -> Result<(ClientMessage, Pending), &'static str> {
+    pub fn order(
+        &self,
+        instrument: &str,
+        tag: u64,
+    ) -> Result<(ClientMessage, Pending), &'static str> {
         if self.lots <= 0 {
             return Err("informe os lots");
         }
@@ -192,7 +196,7 @@ impl Ticket {
                     price: self.price,
                     lots: self.lots,
                     tif: self.tif,
-                    tag: None,
+                    tag: Some(tag),
                 },
                 Some(self.price),
                 None,
@@ -204,7 +208,7 @@ impl Ticket {
                     lots: self.lots,
                     protection: None,
                     tif: self.tif,
-                    tag: None,
+                    tag: Some(tag),
                 },
                 None,
                 None,
@@ -219,7 +223,7 @@ impl Ticket {
                         limit,
                         lots: self.lots,
                         tif: self.tif,
-                        tag: None,
+                        tag: Some(tag),
                     },
                     limit,
                     Some(self.trigger),
@@ -430,14 +434,14 @@ mod tests {
             ..Ticket::default()
         };
         assert_eq!(
-            limit.order("TESTE/BRL").unwrap().0,
+            limit.order("TESTE/BRL", 1).unwrap().0,
             ClientMessage::Limit {
                 instrument: "TESTE/BRL".to_string(),
                 side: Side::Buy,
                 price: 10_050,
                 lots: 5,
                 tif: Tif::Gtc,
-                tag: None,
+                tag: Some(1),
             }
         );
 
@@ -448,14 +452,14 @@ mod tests {
             ..limit.clone()
         };
         assert_eq!(
-            market.order("TESTE/BRL").unwrap().0,
+            market.order("TESTE/BRL", 1).unwrap().0,
             ClientMessage::Market {
                 instrument: "TESTE/BRL".to_string(),
                 side: Side::Sell,
                 lots: 5,
                 protection: None,
                 tif: Tif::Ioc,
-                tag: None,
+                tag: Some(1),
             }
         );
 
@@ -465,7 +469,7 @@ mod tests {
             price: 0,
             ..limit
         };
-        let (message, pending) = stop_market.order("TESTE/BRL").unwrap();
+        let (message, pending) = stop_market.order("TESTE/BRL", 1).unwrap();
         assert_eq!(
             message,
             ClientMessage::Stop {
@@ -475,7 +479,7 @@ mod tests {
                 limit: None,
                 lots: 5,
                 tif: Tif::Gtc,
-                tag: None,
+                tag: Some(1),
             }
         );
         assert_eq!(pending.trigger, Some(9_500));
@@ -485,20 +489,20 @@ mod tests {
     #[test]
     fn missing_fields_are_refused_before_reaching_the_server() {
         assert_eq!(
-            Ticket::default().order("TESTE/BRL").unwrap_err(),
+            Ticket::default().order("TESTE/BRL", 1).unwrap_err(),
             "informe o preço"
         );
         let stop = Ticket {
             kind: OrderType::Stop,
             ..Ticket::default()
         };
-        assert_eq!(stop.order("TESTE/BRL").unwrap_err(), "informe o gatilho");
+        assert_eq!(stop.order("TESTE/BRL", 1).unwrap_err(), "informe o gatilho");
         let empty = Ticket {
             price: 100,
             lots: 0,
             ..Ticket::default()
         };
-        assert_eq!(empty.order("TESTE/BRL").unwrap_err(), "informe os lots");
+        assert_eq!(empty.order("TESTE/BRL", 1).unwrap_err(), "informe os lots");
     }
 
     #[test]

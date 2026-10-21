@@ -5,7 +5,7 @@
 //! não traz lado nem total. O que não se sabe fica `None` e aparece como "—", em vez de ser
 //! adivinhado.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 
 use exchange_protocol::{OpenOrder, OrderState, OrderType, Side, Tif};
 
@@ -14,6 +14,8 @@ pub const KEEP_FINISHED: usize = 20;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum State {
+    /// O servidor deu o id pelo `accepted`, e o primeiro relatório ainda não chegou.
+    Accepted,
     Resting,
     Armed,
     Filled,
@@ -27,7 +29,7 @@ pub enum State {
 
 impl State {
     pub fn is_open(&self) -> bool {
-        matches!(self, Self::Resting | Self::Armed)
+        matches!(self, Self::Accepted | Self::Resting | Self::Armed)
     }
 }
 
@@ -68,7 +70,7 @@ impl Order {
     }
 }
 
-/// Uma ordem que a boleta mandou e cujo id o servidor ainda não revelou.
+/// Uma ordem que a boleta mandou e cujo `accepted` ainda não chegou.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Pending {
     pub instrument: String,
@@ -84,12 +86,8 @@ pub struct Pending {
 pub struct Orders {
     known: Vec<Order>,
     finishes: u64,
-    /// O servidor não ecoa nada da ordem enviada, mas responde aos comandos de uma sessão
-    /// na ordem em que chegaram: o primeiro relatório de um id novo que combine com a
-    /// pendente mais antiga é a resposta a ela. Só uma ordem nova da mesma conta, mandada
-    /// por outra sessão no mesmo instante, confunde isso, e o efeito é a linha mostrar o
-    /// tipo ou o TIF dela.
-    pending: VecDeque<Pending>,
+    /// Pelo `tag` que foi junto com a ordem e volta no `accepted` com o id dela.
+    pending: HashMap<u64, Pending>,
 }
 
 impl Orders {
@@ -104,26 +102,17 @@ impl Orders {
             .count()
     }
 
-    pub fn expect(&mut self, pending: Pending) {
-        self.pending.push_back(pending);
+    pub fn expect(&mut self, tag: u64, pending: Pending) {
+        self.pending.insert(tag, pending);
     }
 
-    /// Um id que a TUI ainda não conhece, num relatório que começa a vida de uma ordem:
-    /// se combinar com a pendente mais antiga, a ordem herda o que a boleta mandou. O que o
-    /// relatório não diz (`None`) não conta contra.
-    fn claim(&mut self, id: u64, instrument: Option<&str>, side: Option<Side>) -> Option<String> {
-        if self.get(id).is_some() {
-            return None;
-        }
-        let first = self.pending.front()?;
-        if instrument.is_some_and(|instrument| instrument != first.instrument)
-            || side.is_some_and(|side| side != first.side)
-        {
-            return None;
-        }
-        let pending = self.pending.pop_front()?;
-        let instrument = pending.instrument.clone();
-        let order = self.entry(&instrument, id);
+    /// O id da ordem que foi com `tag`: a linha nasce com o que a boleta mandou. Um `tag`
+    /// que esta TUI não mandou (de antes de uma reconexão) é ignorado.
+    pub fn accepted(&mut self, tag: u64, id: u64) {
+        let Some(pending) = self.pending.remove(&tag) else {
+            return;
+        };
+        let order = self.entry(&pending.instrument, id);
         order.side = Some(pending.side);
         order.kind = Some(pending.kind);
         order.price = pending.price;
@@ -131,7 +120,12 @@ impl Orders {
         order.tif = Some(pending.tif);
         order.total = Some(pending.lots);
         order.remaining = Some(pending.lots);
-        Some(instrument)
+        self.reopen(id, State::Accepted);
+    }
+
+    /// A ordem que foi com `tag` voltou num `error`: nunca chegou ao núcleo nem tem id.
+    pub fn refused(&mut self, tag: u64) {
+        self.pending.remove(&tag);
     }
 
     /// As ordens de um instrumento como a tela lista: abertas primeiro, da mais nova para a
@@ -232,7 +226,6 @@ impl Orders {
     /// A sobra foi para o livro. Uma ordem que só descansa é limite com GTC: IOC e FOK nunca
     /// ficam no livro, e um stop disparado já foi conhecido como stop pelo `armed`.
     pub fn rested(&mut self, instrument: &str, id: u64, side: Side, price: i64, lots: i64) {
-        self.claim(id, Some(instrument), Some(side));
         let order = self.entry(instrument, id);
         order.side = Some(side);
         order.price = Some(price);
@@ -245,12 +238,7 @@ impl Orders {
 
     /// Sem saber quanto faltava, a ordem fica como executada: se sobrar algo, o `rested` ou
     /// o `expired` que vem em seguida corrige.
-    /// Só o fill do taker pode ser a resposta a uma ordem que acabou de chegar: o do maker
-    /// é de uma ordem que já estava no livro.
-    pub fn filled(&mut self, instrument: &str, id: u64, lots: i64, taker: bool) {
-        if taker {
-            self.claim(id, Some(instrument), None);
-        }
+    pub fn filled(&mut self, instrument: &str, id: u64, lots: i64) {
         let order = self.entry(instrument, id);
         order.filled += lots;
         order.remaining = order.remaining.map(|remaining| (remaining - lots).max(0));
@@ -265,25 +253,25 @@ impl Orders {
     }
 
     pub fn expired(&mut self, instrument: &str, id: u64) {
-        self.claim(id, Some(instrument), None);
         self.entry(instrument, id).remaining = Some(0);
         self.finish(id, State::Expired);
     }
 
-    /// Uma recusa com o id de uma ordem conhecida é de um cancelamento: a ordem continua
-    /// como estava. Com id novo, é a própria ordem que foi recusada; como o `rejected` não
-    /// diz o instrumento, ela só entra na lista se for a resposta a uma pendente.
+    /// Logo depois do `accepted`, é a própria ordem que foi recusada. Numa ordem que já
+    /// estava aberta, é um cancelamento recusado, e ela continua como estava. Uma ordem
+    /// que a TUI não conhece (de outra sessão) fica de fora: o `rejected` não diz o
+    /// instrumento.
     pub fn rejected(&mut self, id: u64, code: &str) {
-        if self.claim(id, None, None).is_some() {
-            if let Some(order) = self.known.iter_mut().find(|order| order.id == id) {
-                order.remaining = Some(0);
-            }
+        let Some(order) = self.known.iter_mut().find(|order| order.id == id) else {
+            return;
+        };
+        if order.state == State::Accepted {
+            order.remaining = Some(0);
             self.finish(id, State::Rejected(code.to_string()));
         }
     }
 
     pub fn armed(&mut self, instrument: &str, id: u64, side: Side, trigger: i64, lots: i64) {
-        self.claim(id, Some(instrument), Some(side));
         let order = self.entry(instrument, id);
         order.side = Some(side);
         order.kind = Some(OrderType::Stop);
@@ -344,7 +332,7 @@ mod tests {
     fn partial_fill_then_rest_keeps_the_order_open_with_its_total() {
         let mut orders = Orders::default();
 
-        orders.filled(TESTE, 7, 2, true);
+        orders.filled(TESTE, 7, 2);
         assert_eq!(orders.get(7).unwrap().state, State::Filled);
         orders.rested(TESTE, 7, Side::Buy, 9_900, 3);
 
@@ -361,9 +349,9 @@ mod tests {
         let mut orders = Orders::default();
         orders.rested(TESTE, 1, Side::Sell, 10_000, 5);
 
-        orders.filled(TESTE, 1, 2, false);
+        orders.filled(TESTE, 1, 2);
         assert_eq!(orders.get(1).unwrap().state, State::Resting);
-        orders.filled(TESTE, 1, 3, false);
+        orders.filled(TESTE, 1, 3);
 
         let order = orders.get(1).unwrap();
         assert_eq!(order.state, State::Filled);
@@ -394,35 +382,13 @@ mod tests {
     }
 
     #[test]
-    fn rejection_of_a_sent_order_is_kept_as_finished() {
+    fn accepted_order_starts_with_what_the_ticket_sent() {
         let mut orders = Orders::default();
-        orders.expect(pending(Side::Buy, OrderType::Limit, Tif::Gtc));
+        orders.expect(1, pending(Side::Buy, OrderType::Market, Tif::Ioc));
 
-        orders.rejected(9, "insufficient_funds");
-
-        let order = orders.get(9).unwrap();
-        assert_eq!(
-            order.state,
-            State::Rejected("insufficient_funds".to_string())
-        );
-        assert_eq!(order.instrument, TESTE);
-    }
-
-    #[test]
-    fn rejection_of_an_unknown_order_with_nothing_pending_is_not_listed() {
-        let mut orders = Orders::default();
-
-        orders.rejected(9, "insufficient_funds");
-
-        assert!(orders.get(9).is_none());
-    }
-
-    #[test]
-    fn first_report_of_a_new_id_inherits_the_pending_order() {
-        let mut orders = Orders::default();
-        orders.expect(pending(Side::Buy, OrderType::Market, Tif::Ioc));
-
-        orders.filled(TESTE, 4, 5, true);
+        orders.accepted(1, 4);
+        assert_eq!(orders.get(4).unwrap().state, State::Accepted);
+        orders.filled(TESTE, 4, 5);
 
         let order = orders.get(4).unwrap();
         assert_eq!(order.kind, Some(OrderType::Market));
@@ -433,18 +399,57 @@ mod tests {
     }
 
     #[test]
-    fn report_that_does_not_match_leaves_the_pending_order_waiting() {
+    fn tags_pair_each_order_with_its_id_whatever_the_order_of_arrival() {
         let mut orders = Orders::default();
-        orders.expect(pending(Side::Buy, OrderType::Limit, Tif::Gtc));
+        orders.expect(1, pending(Side::Buy, OrderType::Limit, Tif::Gtc));
+        orders.expect(2, pending(Side::Sell, OrderType::Market, Tif::Fok));
 
-        orders.rested(TESTE, 4, Side::Sell, 10_100, 2);
-        orders.filled(TESTE, 1, 1, false);
-        orders.rested(TESTE, 5, Side::Buy, 10_000, 5);
+        orders.rested(TESTE, 3, Side::Buy, 9_000, 1);
+        orders.accepted(2, 5);
+        orders.accepted(1, 6);
 
-        assert_eq!(orders.get(4).unwrap().tif, Some(Tif::Gtc));
-        assert_eq!(orders.get(4).unwrap().total, Some(2));
-        assert_eq!(orders.get(5).unwrap().total, Some(5));
-        assert_eq!(orders.get(5).unwrap().kind, Some(OrderType::Limit));
+        assert_eq!(orders.get(3).unwrap().total, Some(1));
+        assert_eq!(orders.get(5).unwrap().kind, Some(OrderType::Market));
+        assert_eq!(orders.get(6).unwrap().kind, Some(OrderType::Limit));
+    }
+
+    #[test]
+    fn rejection_right_after_acceptance_finishes_the_order() {
+        let mut orders = Orders::default();
+        orders.expect(1, pending(Side::Buy, OrderType::Limit, Tif::Gtc));
+        orders.accepted(1, 9);
+
+        orders.rejected(9, "insufficient_funds");
+
+        let order = orders.get(9).unwrap();
+        assert_eq!(
+            order.state,
+            State::Rejected("insufficient_funds".to_string())
+        );
+        assert_eq!(order.instrument, TESTE);
+        assert_eq!(orders.open_count(), 0);
+    }
+
+    #[test]
+    fn rejection_of_an_unknown_order_is_not_listed() {
+        let mut orders = Orders::default();
+
+        orders.rejected(9, "insufficient_funds");
+
+        assert!(orders.get(9).is_none());
+    }
+
+    #[test]
+    fn refused_or_unknown_tags_leave_no_order_behind() {
+        let mut orders = Orders::default();
+        orders.expect(1, pending(Side::Buy, OrderType::Limit, Tif::Gtc));
+
+        orders.refused(1);
+        orders.accepted(1, 4);
+        orders.accepted(77, 5);
+
+        assert!(orders.get(4).is_none());
+        assert!(orders.get(5).is_none());
     }
 
     #[test]
@@ -463,7 +468,7 @@ mod tests {
         orders.armed(TESTE, 3, Side::Buy, 10_100, 4);
 
         orders.triggered(TESTE, 3);
-        orders.filled(TESTE, 3, 1, true);
+        orders.filled(TESTE, 3, 1);
         orders.expired(TESTE, 3);
 
         let order = orders.get(3).unwrap();
