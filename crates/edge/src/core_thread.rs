@@ -122,8 +122,10 @@ enum Query {
         feed: Feed,
         reply: oneshot::Sender<Option<Snapshot>>,
     },
+    /// Responde pelo fluxo da inscrição de `origin`, como um comando: uma marca sem eventos
+    /// entra no fluxo no ponto da consulta, e a lista vai pelo `reply` logo depois.
     OpenOrders {
-        account: AccountId,
+        origin: Origin,
         reply: oneshot::Sender<Vec<AccountOrder>>,
     },
 }
@@ -240,21 +242,6 @@ impl CoreHandle {
         response.await.map_err(|_| CoreError::Stopped)
     }
 
-    /// As ordens abertas de `account`, em ordem de id, no ponto da fila em que a consulta
-    /// entrou. Relatórios ainda a caminho da sessão podem chegar depois e repetir o que a
-    /// resposta já mostra: quem junta os dois deve juntar pelo id.
-    ///
-    /// # Errors
-    /// [`CoreError::Stopped`] se o núcleo parou antes de receber ou de responder.
-    pub async fn open_orders(&self, account: AccountId) -> Result<Vec<AccountOrder>, CoreError> {
-        let (reply, response) = oneshot::channel();
-        self.requests
-            .send(Request::Query(Query::OpenOrders { account, reply }))
-            .await
-            .map_err(|_| CoreError::Stopped)?;
-        response.await.map_err(|_| CoreError::Stopped)
-    }
-
     /// Passa a receber todos os incrementos publicados daqui em diante. Assine **antes** de
     /// pedir o snapshot: o que chegar com `seq` já coberto por ele é descartado pelo
     /// [`crate::market_data::LocalBook`], e nada fica de fora.
@@ -306,6 +293,14 @@ pub struct Submitted {
     pub events: Vec<Event>,
 }
 
+/// As ordens abertas da conta e, antes delas, os relatórios que já estavam a caminho: tudo
+/// em `earlier` está refletido em `orders`, e nada que chegar depois está.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Listed {
+    pub earlier: Vec<Vec<Event>>,
+    pub orders: Vec<AccountOrder>,
+}
+
 impl Reports {
     pub fn account(&self) -> AccountId {
         self.account
@@ -317,13 +312,7 @@ impl Reports {
     /// [`CoreError::Stopped`] se o núcleo parou; [`CoreError::FellBehind`] se a inscrição
     /// foi cortada.
     pub async fn submit(&mut self, intent: Intent) -> Result<Submitted, CoreError> {
-        let ticket = self.next_ticket;
-        self.next_ticket += 1;
-        let origin = Origin {
-            account: self.account,
-            subscriber: self.subscriber,
-            ticket,
-        };
+        let origin = self.origin();
         self.core
             .requests
             .send(Request::Submit(Submission {
@@ -332,14 +321,46 @@ impl Reports {
             }))
             .await
             .map_err(|_| CoreError::Stopped)?;
+        let (earlier, events) = self.until(origin.ticket).await?;
+        Ok(Submitted { earlier, events })
+    }
+
+    /// As ordens abertas da conta, em ordem de id, no ponto da fila em que a consulta
+    /// entrou, depois dos relatórios que vieram antes dela no fluxo. Quem aplica os
+    /// `earlier` e depois as `orders` não conta duas vezes um fill que as duas mostram.
+    ///
+    /// # Errors
+    /// Os mesmos de [`Reports::submit`].
+    pub async fn open_orders(&mut self) -> Result<Listed, CoreError> {
+        let origin = self.origin();
+        let (reply, response) = oneshot::channel();
+        self.core
+            .requests
+            .send(Request::Query(Query::OpenOrders { origin, reply }))
+            .await
+            .map_err(|_| CoreError::Stopped)?;
+        let (earlier, _) = self.until(origin.ticket).await?;
+        let orders = response.await.map_err(|_| CoreError::Stopped)?;
+        Ok(Listed { earlier, orders })
+    }
+
+    fn origin(&mut self) -> Origin {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        Origin {
+            account: self.account,
+            subscriber: self.subscriber,
+            ticket,
+        }
+    }
+
+    /// Lê o fluxo até a entrega marcada com `ticket`; o que vier antes é de outros comandos.
+    async fn until(&mut self, ticket: u64) -> Result<(Vec<Vec<Event>>, Vec<Event>), CoreError> {
         let mut earlier = Vec::new();
         loop {
             let delivery = self.receive().await?;
             if delivery.ticket == Some(ticket) {
-                return Ok(Submitted {
-                    earlier,
-                    events: delivery.events,
-                });
+                return Ok((earlier, delivery.events));
             }
             earlier.push(delivery.events);
         }
@@ -537,7 +558,7 @@ fn serve(
                         }
                     }
                 }
-                Step::Query(query) => answer(&sequencer, &market_data, query),
+                Step::Query(query) => answer(&sequencer, &market_data, router, query),
                 Step::Subscribe {
                     account,
                     buffer,
@@ -602,7 +623,7 @@ fn steps(round: Vec<Request>) -> Vec<Step> {
     steps
 }
 
-fn answer(sequencer: &Sequencer, market_data: &MarketData, query: Query) {
+fn answer(sequencer: &Sequencer, market_data: &MarketData, router: &mut Router, query: Query) {
     match query {
         Query::Balance {
             account,
@@ -618,8 +639,9 @@ fn answer(sequencer: &Sequencer, market_data: &MarketData, query: Query) {
         } => {
             let _ = reply.send(market_data.snapshot(instrument, feed));
         }
-        Query::OpenOrders { account, reply } => {
-            let _ = reply.send(open_orders(sequencer.engine_state(), account));
+        Query::OpenOrders { origin, reply } => {
+            router.deliver(&[], Some(origin));
+            let _ = reply.send(open_orders(sequencer.engine_state(), origin.account));
         }
     }
 }
@@ -1200,6 +1222,71 @@ mod tests {
                 ..
             }]
         ));
+        drop(alice);
+        shut_down(handle, thread);
+    }
+
+    async fn open_orders(reports: &mut Reports) -> Result<Listed, CoreError> {
+        tokio::time::timeout(Duration::from_secs(5), reports.open_orders())
+            .await
+            .expect("a resposta chegou a tempo")
+    }
+
+    // A dívida da F8: o fill de Alice já estava no fluxo dela quando ela pediu as ordens. Se
+    // a lista chegasse antes dele, quem soma o fill por cima da lista contaria duas vezes.
+    #[tokio::test]
+    async fn reports_on_the_way_come_before_the_open_orders_that_already_reflect_them() {
+        let (handle, thread) = core_with_reports(16);
+        funded(&handle, &[ALICE, BOB]).await;
+        let mut alice = handle.reports(ALICE).await.unwrap();
+        submit(&mut alice, limit(ALICE, Side::Ask, 10_000, 3))
+            .await
+            .unwrap();
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 1))
+            .await
+            .unwrap();
+
+        let listed = open_orders(&mut alice).await.unwrap();
+
+        let earlier: Vec<_> = listed
+            .earlier
+            .iter()
+            .map(|events| fills_of(events))
+            .collect();
+        assert_eq!(earlier, [vec![(OrderId::new(2), OrderId::new(1))]]);
+        let remaining: Vec<_> = listed
+            .orders
+            .iter()
+            .map(|open| open.order.remaining.get())
+            .collect();
+        assert_eq!(remaining, [2]);
+
+        handle
+            .submit(limit(BOB, Side::Bid, 10_000, 1))
+            .await
+            .unwrap();
+        let later = next(&mut alice).await.unwrap();
+        assert_eq!(fills_of(&later), [(OrderId::new(3), OrderId::new(1))]);
+        drop(alice);
+        shut_down(handle, thread);
+    }
+
+    #[tokio::test]
+    async fn open_orders_with_nothing_on_the_way_has_no_earlier_reports() {
+        let (handle, thread) = core_with_reports(16);
+        funded(&handle, &[ALICE]).await;
+        let mut alice = handle.reports(ALICE).await.unwrap();
+
+        let listed = open_orders(&mut alice).await.unwrap();
+
+        assert_eq!(
+            listed,
+            Listed {
+                earlier: Vec::new(),
+                orders: Vec::new()
+            }
+        );
         drop(alice);
         shut_down(handle, thread);
     }
