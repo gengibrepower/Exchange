@@ -20,6 +20,9 @@ pub enum State {
     Cancelled,
     Expired,
     Rejected(String),
+    /// Estava aberta e sumiu enquanto a TUI estava desconectada: o servidor só diz que ela
+    /// não está mais aberta, não como terminou.
+    Closed,
 }
 
 impl State {
@@ -185,7 +188,29 @@ impl Orders {
     }
 
     /// As abertas segundo o servidor, que valem por cima do que a TUI sabia delas.
-    pub fn open(&mut self, open: Vec<OpenOrder>) {
+    /// A resposta do `orders`: as que vêm nela estão abertas, com os números do servidor, e
+    /// as que a TUI achava abertas e não vêm terminaram enquanto ela estava fora. Devolve
+    /// quantas eram essas.
+    pub fn sync(&mut self, open: Vec<OpenOrder>) -> usize {
+        let gone: Vec<u64> = self
+            .known
+            .iter()
+            .filter(|order| order.state.is_open())
+            .map(|order| order.id)
+            .filter(|id| open.iter().all(|open| open.order != *id))
+            .collect();
+        self.open(open);
+        for &id in &gone {
+            self.finish(id, State::Closed);
+        }
+        gone.len()
+    }
+
+    pub fn forget_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    fn open(&mut self, open: Vec<OpenOrder>) {
         for open in open {
             let order = self.entry(&open.instrument, open.order);
             order.side = Some(open.side);
@@ -305,7 +330,7 @@ mod tests {
     fn open_orders_from_the_server_come_complete() {
         let mut orders = Orders::default();
 
-        orders.open(vec![open(1, OrderState::Resting)]);
+        orders.sync(vec![open(1, OrderState::Resting)]);
 
         let order = orders.get(1).unwrap();
         assert_eq!(order.side, Some(Side::Sell));
