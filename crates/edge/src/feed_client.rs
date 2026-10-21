@@ -51,7 +51,7 @@ impl Tracker {
     /// incrementos seguintes não podem ser aplicados sobre um estado que sabemos incompleto,
     /// e são ignorados até o snapshot novo chegar.
     pub fn handle(&mut self, message: ServerMessage) -> Action {
-        if let ServerMessage::Error { message } = message {
+        if let ServerMessage::Error { message, .. } = message {
             return Action::ServerError(message);
         }
         match FeedMessage::from_wire(message) {
@@ -294,7 +294,8 @@ mod tests {
 
         assert_eq!(
             tracker.handle(ServerMessage::Error {
-                message: "o núcleo parou".to_string()
+                message: "o núcleo parou".to_string(),
+                tag: None,
             }),
             Action::ServerError("o núcleo parou".to_string())
         );
@@ -307,6 +308,7 @@ mod tests {
             ask_level(5, 10_000, 3),
             ServerMessage::Error {
                 message: "x".to_string(),
+                tag: None,
             },
             ServerMessage::LoggedIn { account: 3 },
         ];

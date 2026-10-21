@@ -511,7 +511,7 @@ impl App {
                 effects
             }
             ServerMessage::Instruments { instruments } => self.on_instruments(instruments),
-            ServerMessage::Error { message } => {
+            ServerMessage::Error { message, .. } => {
                 self.say(Tone::Error, message);
                 Vec::new()
             }
@@ -685,6 +685,7 @@ impl App {
                 format!("stop #{order} disparou em {instrument}"),
             ),
             ServerMessage::LoggedIn { .. }
+            | ServerMessage::Accepted { .. }
             | ServerMessage::Instruments { .. }
             | ServerMessage::Error { .. }
             | ServerMessage::Snapshot { .. }
@@ -1218,6 +1219,7 @@ mod tests {
             &mut app,
             ServerMessage::Error {
                 message: "a conta da casa não negocia".to_string(),
+                tag: None,
             },
         );
         assert_eq!(app.status.as_ref().unwrap().tone, Tone::Error);
@@ -1728,6 +1730,7 @@ mod tests {
                 price: 10_050,
                 lots: 6,
                 tif: exchange_protocol::Tif::Gtc,
+                tag: None,
             })]
         );
         assert_eq!(

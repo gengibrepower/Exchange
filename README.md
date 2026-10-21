@@ -182,12 +182,22 @@ Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
 | `market` | `instrument`, `side`, `lots`, `protection` e `tif` opcionais | ordem a mercado; sem `protection`, vale o colar de preço |
 | `stop` | `instrument`, `side`, `trigger`, `lots`, `limit` e `tif` opcionais | stop dormente até o último negócio chegar a `trigger`; aí vira limite em `limit` ou, sem ele, a mercado |
 | `cancel` | `instrument`, `order` | cancela uma ordem descansando ou um stop dormente |
+
+Toda ordem (`limit`, `market`, `stop`) aceita um `tag` opcional, um número inteiro não negativo escolhido pelo cliente.
 | `balance` | — | saldos da conta da sessão |
 | `subscribe` | `instrument`, `feed` (`l1`/`l2`) | assina o feed (não exige login); assinar de novo traz um snapshot novo |
 | `instruments` | — | a especificação de cada instrumento: `symbol`, `base`, `quote`, `tick`, `lot_size` e `max_lots` (não exige login) |
 | `orders` | — | as ordens abertas da conta, inclusive as de antes da conexão |
 
-O servidor responde com `logged_in`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances`, `instruments`, `orders` e `error`. O `fill` fala só da ordem de quem recebe: `role` diz se ela era `taker` ou `maker`, `fee` é o que essa conta pagou (o maker não paga), e um autonegócio vira duas linhas, uma por ordem. O `rested` traz o `side` e o `price` em que a sobra ficou no livro.
+O servidor responde com `logged_in`, `accepted`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances`, `instruments`, `orders` e `error`. O `fill` fala só da ordem de quem recebe: `role` diz se ela era `taker` ou `maker`, `fee` é o que essa conta pagou (o maker não paga), e um autonegócio vira duas linhas, uma por ordem. O `rested` traz o `side` e o `price` em que a sobra ficou no livro.
+
+Uma ordem com `tag` recebe primeiro um `accepted` com o `tag` e o id que o servidor deu a ela, e só depois os relatórios da própria ordem; um erro de validação (instrumento desconhecido, preço zero) volta como `error` com o mesmo `tag`. É o jeito de o cliente saber qual id é de qual envio. O servidor não guarda o `tag` nem confere se ele é único: só o devolve. `accepted` quer dizer recebida, não aceita no livro, e pode vir seguida de um `rejected`. Sem `tag`, nada muda nas respostas.
+
+```
+{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10100,"lots":1,"tag":7}
+{"type":"accepted","tag":7,"order":3}
+{"type":"rested","instrument":"TESTE/BRL","order":3,"side":"sell","price":10100,"lots":1}
+```
 
 O `orders` lista as ordens descansando no livro (`"state":"resting"`) e os stops dormentes (`"armed"`), em ordem de id, com o pedido original (`type`, `price`, `trigger`, `tif`, `lots`) e o que falta (`remaining`). A resposta mostra o estado no ponto em que a consulta entrou na fila do núcleo; um relatório que já estava a caminho pode chegar depois dela e repetir o que ela mostra, então quem junta os dois junta pelo id da ordem.
 

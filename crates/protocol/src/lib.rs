@@ -42,6 +42,10 @@ pub enum Tif {
 /// Mensagem do cliente. `type` decide a variante e campo desconhecido é erro: nada é
 /// adivinhado. Ordem limite e a mercado são tipos distintos para que um `price` esquecido
 /// nunca transforme uma limite numa ordem a mercado.
+///
+/// O `tag` opcional de uma ordem é do cliente: o servidor não o guarda nem confere se é
+/// único, só o devolve no [`ServerMessage::Accepted`] (ou no `error`) que responde a ela,
+/// para o cliente saber qual id o servidor deu a qual envio.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
@@ -59,6 +63,8 @@ pub enum ClientMessage {
         lots: i64,
         #[serde(default)]
         tif: Tif,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<u64>,
     },
     Market {
         instrument: String,
@@ -68,6 +74,8 @@ pub enum ClientMessage {
         protection: Option<i64>,
         #[serde(default)]
         tif: Tif,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<u64>,
     },
     /// Dormente até o último negócio chegar a `trigger`; aí entra como limite em `limit`
     /// ou, sem ele, a mercado. Tipo próprio, e não um campo em `limit`/`market`: um stop
@@ -81,6 +89,8 @@ pub enum ClientMessage {
         lots: i64,
         #[serde(default)]
         tif: Tif,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<u64>,
     },
     Cancel {
         instrument: String,
@@ -182,6 +192,12 @@ pub enum ServerMessage {
         asset: String,
         amount: i64,
     },
+    /// A primeira resposta a uma ordem que veio com `tag`: o id que ela recebeu. Sai mesmo
+    /// que o núcleo a recuse logo em seguida; quer dizer recebida, não aceita no livro.
+    Accepted {
+        tag: u64,
+        order: u64,
+    },
     /// Fala só da ordem de quem recebe: `fee` é o que ele pagou, zero para o maker.
     Fill {
         instrument: String,
@@ -235,8 +251,11 @@ pub enum ServerMessage {
     Orders {
         orders: Vec<OpenOrder>,
     },
+    /// `tag` só quando o erro responde a uma ordem que trouxe um.
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<u64>,
     },
     Snapshot {
         instrument: String,
@@ -284,6 +303,14 @@ impl ClientMessage {
     /// serializa.
     pub fn to_line(&self) -> String {
         line_of(self)
+    }
+
+    /// O `tag` do cliente, se a mensagem é uma ordem que trouxe um.
+    pub fn tag(&self) -> Option<u64> {
+        match *self {
+            Self::Limit { tag, .. } | Self::Market { tag, .. } | Self::Stop { tag, .. } => tag,
+            _ => None,
+        }
     }
 }
 
@@ -345,7 +372,8 @@ mod tests {
                 side: Side::Buy,
                 price: 10_000,
                 lots: 5,
-                tif: Tif::Ioc
+                tif: Tif::Ioc,
+                tag: None,
             })
         );
         assert_eq!(
@@ -357,7 +385,8 @@ mod tests {
                 side: Side::Sell,
                 lots: 2,
                 protection: Some(9_500),
-                tif: Tif::Gtc
+                tif: Tif::Gtc,
+                tag: None,
             })
         );
         assert_eq!(
@@ -370,7 +399,8 @@ mod tests {
                 trigger: 9_500,
                 limit: Some(9_400),
                 lots: 5,
-                tif: Tif::Gtc
+                tif: Tif::Gtc,
+                tag: None,
             })
         );
         assert_eq!(
@@ -407,7 +437,8 @@ mod tests {
                 side: Side::Buy,
                 lots: 1,
                 protection: None,
-                tif: Tif::Gtc
+                tif: Tif::Gtc,
+                tag: None,
             })
         );
     }
@@ -491,6 +522,7 @@ mod tests {
             lots: 2,
             protection: None,
             tif: Tif::Gtc,
+            tag: None,
         };
         assert_eq!(
             market.to_line(),
@@ -512,6 +544,7 @@ mod tests {
                 price: 505,
                 lots: 3,
                 tif: Tif::Fok,
+                tag: None,
             },
             ClientMessage::Stop {
                 instrument: "TESTE/BRL".to_string(),
@@ -520,6 +553,7 @@ mod tests {
                 limit: None,
                 lots: 1,
                 tif: Tif::Ioc,
+                tag: None,
             },
             ClientMessage::Balance {},
         ];
@@ -548,10 +582,64 @@ mod tests {
         );
         assert_eq!(
             ServerMessage::Error {
-                message: "x".to_string()
+                message: "x".to_string(),
+                tag: None,
             }
             .to_line(),
             "{\"type\":\"error\",\"message\":\"x\"}\n"
+        );
+    }
+
+    #[test]
+    fn orders_carry_an_optional_tag_and_other_messages_have_none() {
+        let tagged = ClientMessage::from_line(
+            r#"{"type":"stop","instrument":"TESTE/BRL","side":"buy","trigger":10500,"lots":1,"tag":42}"#,
+        )
+        .unwrap();
+        assert_eq!(tagged.tag(), Some(42));
+        assert!(tagged.to_line().contains(r#""tag":42"#));
+
+        let untagged = ClientMessage::from_line(
+            r#"{"type":"limit","instrument":"TESTE/BRL","side":"buy","price":100,"lots":1}"#,
+        )
+        .unwrap();
+        assert_eq!(untagged.tag(), None);
+        assert!(!untagged.to_line().contains("tag"));
+
+        assert!(
+            ClientMessage::from_line(
+                r#"{"type":"cancel","instrument":"TESTE/BRL","order":1,"tag":1}"#
+            )
+            .is_err()
+        );
+        assert!(
+            ClientMessage::from_line(
+                r#"{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":1,"tag":-1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn acknowledgement_and_tagged_error_serialize_as_documented() {
+        assert_eq!(
+            ServerMessage::Accepted { tag: 7, order: 12 }.to_line(),
+            "{\"type\":\"accepted\",\"tag\":7,\"order\":12}\n"
+        );
+        assert_eq!(
+            ServerMessage::Error {
+                message: "x".to_string(),
+                tag: Some(7),
+            }
+            .to_line(),
+            "{\"type\":\"error\",\"message\":\"x\",\"tag\":7}\n"
+        );
+        assert_eq!(
+            ServerMessage::from_line(r#"{"type":"error","message":"x"}"#).unwrap(),
+            ServerMessage::Error {
+                message: "x".to_string(),
+                tag: None,
+            }
         );
     }
 
@@ -627,6 +715,7 @@ mod tests {
     fn message_text_with_quotes_stays_one_valid_line() {
         let error = ServerMessage::Error {
             message: "ativo desconhecido \"OU\nRO\"".to_string(),
+            tag: None,
         };
 
         let line = error.to_line();
