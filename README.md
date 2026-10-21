@@ -199,7 +199,7 @@ Uma ordem com `tag` recebe primeiro um `accepted` com o `tag` e o id que o servi
 {"type":"rested","instrument":"TESTE/BRL","order":3,"side":"sell","price":10100,"lots":1}
 ```
 
-O `orders` lista as ordens descansando no livro (`"state":"resting"`) e os stops dormentes (`"armed"`), em ordem de id, com o pedido original (`type`, `price`, `trigger`, `tif`, `lots`) e o que falta (`remaining`). A resposta mostra o estado no ponto em que a consulta entrou na fila do núcleo; um relatório que já estava a caminho pode chegar depois dela e repetir o que ela mostra, então quem junta os dois junta pelo id da ordem.
+O `orders` lista as ordens descansando no livro (`"state":"resting"`) e os stops dormentes (`"armed"`), em ordem de id, com o pedido original (`type`, `price`, `trigger`, `tif`, `lots`) e o que falta (`remaining`). A resposta mostra o estado no ponto em que a consulta entrou na fila do núcleo e vem no mesmo fluxo dos relatórios: o que já estava a caminho chega antes dela (e está refletido nela), e o que chega depois aconteceu depois. Quem aplica os relatórios e depois a lista não conta nada duas vezes.
 
 Cada sessão recebe tudo que acontece com a sua conta, inclusive o que vem do comando de outra sessão: o fill de uma ordem descansando, o disparo de um stop. Nunca recebe o que é de outra conta: quem dispara o stop alheio vê o próprio negócio e nada do stop. Tudo chega num fluxo só, na ordem do núcleo, então o fill que explica a recusa de um cancelamento chega antes dela. Uma sessão que acumula 1.024 entregas sem ler é desconectada com um `error`: o núcleo não espera ninguém, e descartar em silêncio perderia um fill que não há como pedir de novo.
 

@@ -167,9 +167,17 @@ pub async fn respond(
         ))]),
         Ok(Inbound::Balance) => Ok(vec![balances(core, account).await?]),
         Ok(Inbound::Instruments) => Ok(vec![protocol::instruments()]),
-        Ok(Inbound::Orders) => Ok(vec![protocol::open_orders(
-            &core.open_orders(account).await?,
-        )]),
+        Ok(Inbound::Orders) => {
+            let listed = reports.open_orders().await?;
+            let mut replies: Vec<ServerMessage> = listed
+                .earlier
+                .iter()
+                .flatten()
+                .flat_map(|event| protocol::from_event(account, event))
+                .collect();
+            replies.push(protocol::open_orders(&listed.orders));
+            Ok(replies)
+        }
         Ok(Inbound::Submit(intent)) => {
             let submitted = reports.submit(intent).await?;
             let mut replies: Vec<ServerMessage> = submitted
