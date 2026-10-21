@@ -364,6 +364,9 @@ pub struct App {
     pub order_cursor: Option<u64>,
     pub balances: Vec<AssetBalance>,
     pub prompt: Option<Prompt>,
+    /// O `tag` da próxima ordem da boleta. Não recomeça na reconexão: um `accepted`
+    /// atrasado da sessão anterior não pode ser tomado por resposta a uma ordem nova.
+    next_tag: u64,
     /// O servidor só manda saldo quando pedido: um pedido por vez, e, se a conta mudou
     /// enquanto ele estava no ar, outro logo depois da resposta.
     balance_pending: bool,
@@ -386,6 +389,7 @@ impl App {
             order_cursor: None,
             balances: Vec::new(),
             prompt: None,
+            next_tag: 1,
             balance_pending: false,
             balance_stale: false,
         }
@@ -511,7 +515,14 @@ impl App {
                 effects
             }
             ServerMessage::Instruments { instruments } => self.on_instruments(instruments),
-            ServerMessage::Error { message, .. } => {
+            ServerMessage::Accepted { tag, order } => {
+                self.orders.accepted(tag, order);
+                Vec::new()
+            }
+            ServerMessage::Error { message, tag } => {
+                if let Some(tag) = tag {
+                    self.orders.refused(tag);
+                }
                 self.say(Tone::Error, message);
                 Vec::new()
             }
@@ -702,11 +713,10 @@ impl App {
         match report {
             ServerMessage::Fill {
                 instrument,
-                role,
                 order,
                 lots,
                 ..
-            } => orders.filled(&instrument, order, lots, role == Role::Taker),
+            } => orders.filled(&instrument, order, lots),
             ServerMessage::Rested {
                 instrument,
                 order,
@@ -916,14 +926,16 @@ impl App {
         let Some(market) = self.markets.get(index) else {
             return Vec::new();
         };
-        match market.ticket.order(&market.spec.symbol) {
+        let tag = self.next_tag;
+        match market.ticket.order(&market.spec.symbol, tag) {
             Ok((message, pending)) => {
                 let text = format!(
                     "enviando: {} em {}",
                     market.ticket.describe(),
                     market.spec.symbol
                 );
-                self.orders.expect(pending);
+                self.next_tag += 1;
+                self.orders.expect(tag, pending);
                 self.say(Tone::Info, text);
                 vec![Effect::Send(message)]
             }
@@ -1730,15 +1742,57 @@ mod tests {
                 price: 10_050,
                 lots: 6,
                 tif: exchange_protocol::Tif::Gtc,
-                tag: None,
+                tag: Some(1),
             })]
         );
         assert_eq!(
             app.status.as_ref().unwrap().text,
             "enviando: venda 6 lots @ 100,50 lim GTC em TESTE/BRL"
         );
-        server(&mut app, rested(1, 10_050, 6));
+        server(&mut app, ServerMessage::Accepted { tag: 1, order: 1 });
         assert_eq!(app.orders.get(1).unwrap().total, Some(6));
+        server(&mut app, rested(1, 10_050, 6));
+        assert_eq!(
+            app.orders.get(1).unwrap().state,
+            crate::orders::State::Resting
+        );
+    }
+
+    fn tag_of(effects: &[Effect]) -> Option<u64> {
+        match effects {
+            [Effect::Send(message)] => message.tag(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn each_order_from_the_ticket_gets_its_own_tag() {
+        let mut app = at_ticket();
+        press(&mut app, "10050");
+
+        let first = key(&mut app, Key::Enter);
+        let second = key(&mut app, Key::Enter);
+
+        assert_eq!((tag_of(&first), tag_of(&second)), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn tagged_error_drops_the_order_it_answers() {
+        let mut app = at_ticket();
+        press(&mut app, "10050");
+        key(&mut app, Key::Enter);
+
+        server(
+            &mut app,
+            ServerMessage::Error {
+                message: "preço fora do colar".to_string(),
+                tag: Some(1),
+            },
+        );
+        server(&mut app, ServerMessage::Accepted { tag: 1, order: 1 });
+
+        assert!(app.orders.get(1).is_none());
+        assert_eq!(app.status.as_ref().unwrap().tone, Tone::Error);
     }
 
     #[test]
