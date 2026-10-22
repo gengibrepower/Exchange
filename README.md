@@ -1,367 +1,165 @@
-# Exchange (simulador) — Rust
+# Exchange — a deterministic matching engine in Rust
 
-Simulador de motor de negociação escrito em Rust, como **projeto pessoal de aprendizado**.
+[![CI](https://github.com/gengibrepower/exchange/actions/workflows/ci.yml/badge.svg)](https://github.com/gengibrepower/exchange/actions/workflows/ci.yml)
+![Rust 1.99](https://img.shields.io/badge/rust-1.99-orange?logo=rust)
+![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-> **Não é uma exchange real.** Não opera com dinheiro real, não tem clientes, não está em produção. Existe para estudar engenharia de sistemas de alta corretude: matching determinístico, liquidação por partidas dobradas, event sourcing / WAL e sessão de protocolo FIX.
+🇧🇷 [Leia em português](README.pt-BR.md)
 
-## Objetivo
+A trading-engine simulator built from scratch: price-time matching, double-entry settlement, a write-ahead log with crash recovery, a market-data feed, a hand-written **FIX 4.4** session layer, and a terminal client. It runs in the terminal, and every behavior is backed by property-based tests.
 
-Demonstrar quatro competências:
+> **This is a personal learning project, not a real exchange.** No real money, no customers, not in production. It exists to practice the engineering of high-correctness systems.
 
-1. Determinismo como disciplina de projeto — mesma entrada, mesmo estado, sempre.
-2. A cadeia atômica reservar → casar → liquidar que nunca desbalanceia o dinheiro.
-3. Recuperação via event sourcing / WAL — estado reconstruído relendo o log.
-4. Corretude de sessão de protocolo (FIX) — mensageria confiável, sem perder nem duplicar ordem.
+<!-- TUI screenshot: docs/img/tui.png -->
 
-## Documentação
+## Highlights
 
-- [`docs/escopo.md`](docs/escopo.md) — escopo, arquitetura, regras de domínio e decisões fechadas.
-- [`CLAUDE.md`](CLAUDE.md) — instruções para assistência de IA no repositório.
+| | |
+|---|---|
+| **2.9 M orders/s** on one thread | full `Engine::apply` (risk → reserve → match → settle), p50 ≈ 300 ns, p99 ≤ 2.6 µs |
+| **609 tests**, property-based where it matters | thousands of random order flows checked against reference models and invariants |
+| **Crash-tested WAL** | crash injected at *every byte* of the log, a bit flipped in every byte, a tail of zeros: boot always rebuilds the exact state |
+| **FIX 4.4 written by hand** | codec + session (logon, heartbeat, resend, gap fill); dropped connections recover without losing or duplicating an order |
+| **Zero `unsafe`, zero floats for money** | `#![forbid(unsafe_code)]` in every crate; prices and quantities are integer newtypes |
+| **Lean dependencies** | the core depends only on `serde` + `postcard`; the FIX crate has no dependencies at all |
+
+## Why this is hard
+
+Toy matching engines are easy. This project goes after the four properties that make a real one hard ([scope](docs/escopo.md), section 1):
+
+1. **Determinism as a design discipline.** The same input sequence always produces exactly the same state and the same trades. The core never reads a clock, never spawns a thread, never touches a float; time enters as data inside the command.
+2. **An atomic reserve → match → settle chain that never unbalances money.** Under partial fills, cancels and crashes, the sum of every balance of every asset (including the fee account) stays constant.
+3. **Recovery by event sourcing.** The log is the source of truth. State is rebuilt by replaying it, and snapshots are only a shortcut.
+4. **Protocol session correctness.** FIX sequence numbers, resend requests and gap fills, so a client that loses its connection mid-order neither loses nor duplicates it.
+
+## Architecture
+
+The system has two halves with opposite natures, and they talk **only through channels** (single-writer pattern, as in the LMAX Disruptor):
+
+```mermaid
+flowchart TB
+    subgraph clients[Clients]
+        tui[TUI]
+        json[JSON client<br/>socat / nc]
+        fixc[FIX initiator]
+        feed[feed viewer]
+    end
+
+    subgraph edge["Edge: async, concurrent (tokio)"]
+        gw[JSON gateway :7000]
+        fixgw[FIX gateway :7001]
+        md[market-data fanout<br/>L1 / L2, sequenced]
+    end
+
+    subgraph core["Core thread: sync, single-threaded, deterministic"]
+        direction LR
+        wal[(WAL<br/>fsync + group commit)] --> risk[pre-trade risk] --> book[order books<br/>price-time] --> ledger[double-entry ledger]
+    end
+
+    tui & json & feed --> gw
+    fixc --> fixgw
+    gw & fixgw -->|commands| wal
+    ledger -->|events| gw & fixgw & md
+    md --> gw
+```
+
+If the core became `async` with locks, determinism, replay and recovery would all go with it. That separation is the backbone of the project.
+
+| Crate | Role |
+|---|---|
+| [`core`](crates/core) | Order books, matching, ledger, engine. Pure and synchronous: commands in, events out |
+| [`wal`](crates/wal) | Append-only log `[len][crc32][postcard]`, batched `fsync`, atomic snapshots |
+| [`fix`](crates/fix) | FIX 4.4 codec and session state machine. Pure: no clock, no network, no dependencies |
+| [`protocol`](crates/protocol) | JSON wire types shared by the server and its clients |
+| [`edge`](crates/edge) | `tokio` TCP server (JSON + FIX), core thread, sequencer, market-data feed, CLI |
+| [`tui`](crates/tui) | Terminal client (`ratatui`). Speaks only the wire protocol and never links the core |
+
+## Quick start
+
+Requires Rust (the toolchain is pinned in `rust-toolchain.toml`) and, for the third terminal, `socat`.
+
+```sh
+# terminal 1: the server (JSON on :7000, FIX on :7001)
+cargo run -p edge --bin server
+
+# terminal 2: the terminal client, as account 1
+cargo run -p tui -- --account 1
+
+# terminal 3: another account places a sell order
+socat - TCP:127.0.0.1:7000
+{"type":"login","account":2}
+{"type":"deposit","asset":"TESTE","amount":100000}
+{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10050,"lots":7}
+```
+
+In the TUI, `]` opens the `TESTE/BRL` tab, and the order shows up in the live book. `?` lists the keys. For an in-process REPL with no network, run `cargo run -p edge` instead. Add `--wal exchange.wal` to either one to persist state, then restart it and watch the log replay.
+
+## How correctness is tested
+
+The invariants in section 3.5 of the scope are the definition of correct. Each one is checked by `proptest` over thousands of random command streams:
+
+- **Book never crossed**, and **price-time priority**: matching is compared against a naive reference model.
+- **Conservation of value**: per asset, `available + reserved` summed over all accounts, house account included, never changes.
+- **Consistent reservation**: every resting order has its funds locked, and a cancel releases exactly what was locked.
+- **Balances against an independent oracle** that recomputes them from scratch.
+
+The persistence layer is tested just as hard:
+
+- **Replay determinism:** restarting from the log, with or without a snapshot, rebuilds the same state as a session that never stopped, and the same state always serializes to the same bytes.
+- **WAL:** crash at every byte offset, bit flips at every byte, and zeroed tails. Boot must recover exactly the commands that fully reached the disk, and must refuse to start on a valid but inconsistent record.
+- **Snapshot:** a crash at any point of the write leaves either the old snapshot or the new one, never a mix.
+- **FIX:** a property test runs two sessions over a simulated TCP that drops at random points, loses in-flight data and delivers extra resends. Each side must receive exactly what the other sent, once and in order. An integration test then kills the connection after the order reached the core but before the ack was read.
+
+CI runs `cargo fmt --check`, `cargo clippy -D warnings` (pedantic) and `cargo test --workspace` on every PR, and master only accepts merges that pass.
+
+## Performance
+
+AMD Ryzen 5 PRO 5650U (laptop), `bench` profile. Full numbers and methodology are in [docs/benchmarks.md](docs/benchmarks.md).
+
+| Core scenario | Throughput | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| `resting` (nothing crosses) | 2.87 M cmd/s | 321 ns | 742 ns | 5.24 µs |
+| `crossing` (half crosses) | 1.89 M cmd/s | 311 ns | 2.62 µs | 3.87 µs |
+| `with_cancels` | 2.14 M cmd/s | 251 ns | 2.26 µs | 3.67 µs |
+
+Durability costs almost everything: one `fsync` per command caps the server at a few hundred commands/s. **Group commit** lets commands that arrive during an `fsync` share the next one, so 64 concurrent sessions reach 7–21 k durable cmd/s, 10–30× more, with no artificial batching delay. **Snapshots** cut the boot of a 1 M-command log from 1.33 s to 0.37 s.
+
+## Engineering decisions
+
+The full list, with the reasoning behind each choice, is in section 11 of the [scope](docs/escopo.md). These are the ones with the most interesting trade-offs:
+
+- **Integer money, no division.** Quantity is in lots and price is in minimum quote units per lot, so a trade's value is `price × lots`, exact and deterministic. Floats would make replay non-reproducible.
+- **Single-threaded core.** One thread, N books, one global ledger. Matching and ledger talk by message, never by shared state, so a thread per instrument later means swapping a call for a channel send. The ledger stays the serialization point anyway: every trade touches two accounts and the house.
+- **`fsync` per record first, group commit when the benchmark asked for it.** The WAL benchmark showed `fsync` was ~99% of the cost before any batching was added.
+- **The log stays whole.** Snapshots skip replay but don't truncate the log. A snapshot that claims more commands than the log holds stops the boot, because there is no way to tell which of the two is right.
+- **Slow consumers never block the core.** Feed subscribers that fall behind see a sequence gap and resubscribe for a fresh snapshot. A private-report session that stops reading gets disconnected, because silently dropping a fill would be worse.
+- **The TUI never touches the core.** It is a separate crate that speaks the public protocol, which also keeps the protocol honest.
 
 ## Status
 
-Em desenvolvimento, por fases (ver seção 12 do escopo).
+All planned phases are done (scope, section 12):
 
-- **F0** — modelo de domínio e matching por prioridade preço-tempo: concluída.
-- **F1** — ordens a mercado, execução parcial, GTC/IOC/FOK, cancelamento: concluída.
-- **F2** — contas, reservas, ledger de partidas dobradas com taxa de taker, risco pré-trade (tamanho máximo e colar de preço): concluída.
-- **F3** — WAL com `fsync` por registro, recuperação no boot e replay determinístico: concluída.
-- **F4** — servidor TCP com protocolo JSON por linha; o núcleo roda numa thread própria e a borda `tokio` fala com ele só por canais: concluída.
-- **F5** — feed de market data: snapshot e incrementos numerados por fluxo (L1 e L2), publicados sem que assinante lento segure o núcleo; o cliente `feed` detecta buraco pela sequência e se recupera: concluída.
-- **F6** — FIX 4.4 escrito à mão: codec `tag=valor`, sessão (logon, heartbeat, TestRequest, ResendRequest/GapFill, logout) e ordens por `NewOrderSingle`/`OrderCancelRequest` com `ExecutionReport`; uma queda de conexão é recuperada sem perder nem duplicar ordem: concluída.
-- **F7** — endurecimento: benchmarks, group commit no WAL, segundo instrumento, stop orders, relatórios privados e snapshots que encurtam o boot: concluída.
-- **F8** — cliente de terminal (TUI): abas Mercado e por instrumento, livro ao vivo com destaque do nível que mudou, negócios, ordens da conta, saldos, boleta, cancelamento e reconexão automática; fala com o servidor só pelo protocolo (decisão 13): concluída. Não há interface web: tudo roda no terminal.
-
-As invariantes da seção 3.5 do escopo são verificadas por `proptest` (milhares de fluxos aleatórios): livro nunca cruzado, prioridade preço-tempo contra um modelo de referência, conservação de valor incluindo a conta da casa, reserva consistente e saldos contra um oráculo independente.
-
-A recuperação é testada injetando crash em cada byte do log, um bit trocado em cada byte e um rabo de zeros: em todos os casos o boot sobe e reconstrói um estado idêntico ao dos comandos que chegaram inteiros ao disco.
-
-## Uso
-
-```
-cargo run -p edge
-```
-
-Um comando por linha:
-
-| Comando | Efeito |
+| Phase | Delivered |
 |---|---|
-| `deposit <ativo> <quantia>` | credita a conta (ativos: `TESTE`, `OUTRO`, `BRL`) |
-| `buy\|sell <instrumento> <preço> <lots> [gtc\|ioc\|fok]` | ordem limite |
-| `buy\|sell <instrumento> mkt <lots> [max <proteção>] [gtc\|ioc\|fok]` | ordem a mercado; sem `max`, a proteção vem do colar de preço |
-| `buy\|sell <instrumento> <preço\|mkt> <lots> stop <gatilho> [gtc\|ioc\|fok]` | stop: dormente até um negócio chegar ao gatilho (compra: no gatilho ou acima; venda: no gatilho ou abaixo); aí entra como limite em `<preço>` ou a mercado |
-| `cancel <instrumento> <id>` | cancela uma ordem descansando ou um stop dormente |
-| `balance` | saldos disponível e reservado |
-| `quit` | sai |
-
-Unidades inteiras, sem casas decimais: preço em centavos por lot, quantidade em lots, quantias em unidades-mínimas do ativo. Há dois instrumentos, com taxa de taker de 10 bps nos dois:
-
-| Instrumento | Tick | 1 lot | Máximo por ordem | Colar |
-|---|---|---|---|---|
-| `TESTE/BRL` | 10 centavos | 100 unidades de TESTE | 1.000 lots | 10% |
-| `OUTRO/BRL` | 5 centavos | 10 unidades de OUTRO | 500 lots | 5% |
-
-Cada instrumento tem o seu livro e o seu feed, e os dois dividem o mesmo ledger: o BRL travado por uma ordem num livro não pode ser usado no outro.
-
-```
-deposit BRL 10000000
-depósito: 10000000 BRL
-deposit TESTE 100000
-depósito: 100000 TESTE
-sell TESTE/BRL 10000 5
-#1 descansou: 5 lots em TESTE/BRL
-buy TESTE/BRL 10100 3
-fill TESTE/BRL: taker #2, maker #1, 3 lots @ 10000, taxa 30
-buy TESTE/BRL mkt 4
-fill TESTE/BRL: taker #3, maker #1, 2 lots @ 10000, taxa 20
-#3 cancelada: 2 lots em TESTE/BRL
-balance
-TESTE: disponível 100000, reservado 0
-BRL: disponível 9999950, reservado 0
-```
-
-A conta negocia consigo mesma, então só os 50 centavos de taxa saem dela — foram para a conta da casa.
-
-### Persistência
-
-Com `--wal`, cada comando é gravado no log e sincronizado com o disco (`fsync`) antes de ser aplicado e respondido. No servidor, os comandos que chegam juntos dividem um mesmo `fsync` (group commit), sem mudar nada do que é gravado. Ao subir de novo com o mesmo arquivo, o log é reaplicado e o estado volta igual:
-
-```
-$ cargo run -p edge -- --wal exchange.wal
-log: 0 comandos reaplicados, 0 bytes descartados
-deposit BRL 10000000
-depósito: 10000000 BRL
-deposit TESTE 100000
-depósito: 100000 TESTE
-sell TESTE/BRL 10000 5
-#1 descansou: 5 lots em TESTE/BRL
-quit
-
-$ cargo run -p edge -- --wal exchange.wal
-log: 3 comandos reaplicados, 0 bytes descartados
-buy TESTE/BRL 10000 2
-fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20
-```
-
-Cada registro é `[tamanho u32][crc32 u32][comando em postcard]`, com o crc cobrindo tamanho e comando. Um registro cortado por crash é descartado no boot. Um registro íntegro mas inválido interrompe o boot com erro, em vez de seguir com um estado que não corresponde ao log. Sem `--wal`, tudo fica só em memória.
-
-#### Snapshots
-
-Com `--snapshot-every <n>` (só junto com `--wal`), o estado inteiro é gravado em `<wal>.snapshot` a cada `n` comandos e também no boot, se algo foi reaplicado. No boot seguinte, o estado sai do snapshot e só os comandos depois dele são reaplicados:
-
-```
-$ cargo run -p edge -- --wal exchange.wal --snapshot-every 2
-log: 0 comandos reaplicados, 0 bytes descartados
-deposit BRL 100000000
-depósito: 100000000 BRL
-deposit TESTE 100000
-depósito: 100000 TESTE
-sell TESTE/BRL 10000 5
-#1 descansou: 5 lots em TESTE/BRL
-quit
-
-$ cargo run -p edge -- --wal exchange.wal
-log: 1 comandos reaplicados, 0 bytes descartados
-snapshot: carregado, cobre 2 comandos
-buy TESTE/BRL 10000 2
-fill TESTE/BRL: taker #2, maker #1, 2 lots @ 10000, taxa 20
-```
-
-O snapshot é só um atalho: o log continua inteiro e é ele a verdade. O snapshot guarda o que não dá para reconstruir — ordens abertas na ordem da fila, stops dormentes, último negócio, saldos e os contadores de `seq` e de id de ordem —, e o resto (índices, reservas, oferta de cada ativo, livro do feed) é recalculado na carga. A carga confere as invariantes da seção 3.5 do escopo antes de aceitar o estado.
-
-- A gravação é atômica: vai para um temporário, que é sincronizado e renomeado por cima do anterior, e o diretório é sincronizado em seguida. Um crash em qualquer ponto deixa o snapshot antigo ou o novo inteiro. O arquivo é `[EXSNAP01][tamanho][crc32][payload]`.
-- Snapshot ausente, danificado ou recusado pela configuração atual: o boot avisa e reaplica o log inteiro. Snapshot que cobre mais comandos do que o log tem interrompe o boot, porque aí não há como saber qual dos dois é a verdade.
-- Falha ao gravar um snapshot só gera um aviso: o log está íntegro, e o atalho volta na próxima tentativa.
-- As sequências do feed recomeçam do zero em todo boot: as conexões caíram, e todo assinante começa por um snapshot do feed.
-
-## Servidor
-
-```
-cargo run -p edge --bin server -- [--listen <endereço:porta>] [--fix <endereço:porta>] [--wal <caminho> [--snapshot-every <n>]]
-```
-
-Escuta JSON em `127.0.0.1:7000` e FIX em `127.0.0.1:7001` por padrão — só a própria máquina; para expor na rede, passe `--listen` explicitamente. Com `--wal` e `--snapshot-every`, persiste e retoma como o CLI. Cada linha enviada é uma mensagem JSON; cada resposta também. Qualquer cliente TCP serve, como `socat` ou `nc`:
-
-```
-$ socat - TCP:127.0.0.1:7000
-{"type":"login","account":1}
-{"type":"logged_in","account":1}
-{"type":"deposit","asset":"TESTE","amount":100000}
-{"type":"deposited","asset":"TESTE","amount":100000}
-{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10000,"lots":5}
-{"type":"rested","instrument":"TESTE/BRL","order":1,"side":"sell","price":10000,"lots":5}
-```
-
-Em outro terminal, outra conta compra parte dessa oferta:
-
-```
-$ socat - TCP:127.0.0.1:7000
-{"type":"login","account":2}
-{"type":"logged_in","account":2}
-{"type":"deposit","asset":"BRL","amount":10000000}
-{"type":"deposited","asset":"BRL","amount":10000000}
-{"type":"market","instrument":"TESTE/BRL","side":"buy","lots":2}
-{"type":"fill","instrument":"TESTE/BRL","role":"taker","order":2,"lots":2,"price":10000,"fee":20}
-{"type":"balance"}
-{"type":"balances","balances":[{"asset":"TESTE","available":200,"reserved":0},{"asset":"BRL","available":9979980,"reserved":0},{"asset":"OUTRO","available":0,"reserved":0}]}
-```
-
-E, no primeiro terminal, a conta 1 fica sabendo na hora, sem ter mandado nada:
-
-```
-{"type":"fill","instrument":"TESTE/BRL","role":"maker","order":1,"lots":2,"price":10000,"fee":0}
-```
-
-Mensagens do cliente (`type` obrigatório; campo desconhecido é erro):
-
-| `type` | Campos | Efeito |
-|---|---|---|
-| `login` | `account` | primeira mensagem da conexão; a conta da casa (`0`) é recusada |
-| `deposit` | `asset`, `amount` | credita a conta da sessão |
-| `limit` | `instrument`, `side` (`buy`/`sell`), `price`, `lots`, `tif` opcional (`gtc`/`ioc`/`fok`) | ordem limite |
-| `market` | `instrument`, `side`, `lots`, `protection` e `tif` opcionais | ordem a mercado; sem `protection`, vale o colar de preço |
-| `stop` | `instrument`, `side`, `trigger`, `lots`, `limit` e `tif` opcionais | stop dormente até o último negócio chegar a `trigger`; aí vira limite em `limit` ou, sem ele, a mercado |
-| `cancel` | `instrument`, `order` | cancela uma ordem descansando ou um stop dormente |
-
-Toda ordem (`limit`, `market`, `stop`) aceita um `tag` opcional, um número inteiro não negativo escolhido pelo cliente.
-| `balance` | — | saldos da conta da sessão |
-| `subscribe` | `instrument`, `feed` (`l1`/`l2`) | assina o feed (não exige login); assinar de novo traz um snapshot novo |
-| `instruments` | — | a especificação de cada instrumento: `symbol`, `base`, `quote`, `tick`, `lot_size` e `max_lots` (não exige login) |
-| `orders` | — | as ordens abertas da conta, inclusive as de antes da conexão |
-
-O servidor responde com `logged_in`, `accepted`, `deposited`, `deposit_rejected`, `rested`, `fill`, `cancelled`, `expired`, `armed` (stop aceito e dormente), `triggered` (o stop disparou; os eventos dele vêm em seguida), `rejected` (com `code` estável e `message` legível), `balances`, `instruments`, `orders` e `error`. O `fill` fala só da ordem de quem recebe: `role` diz se ela era `taker` ou `maker`, `fee` é o que essa conta pagou (o maker não paga), e um autonegócio vira duas linhas, uma por ordem. O `rested` traz o `side` e o `price` em que a sobra ficou no livro.
-
-Uma ordem com `tag` recebe primeiro um `accepted` com o `tag` e o id que o servidor deu a ela, e só depois os relatórios da própria ordem; um erro de validação (instrumento desconhecido, preço zero) volta como `error` com o mesmo `tag`. É o jeito de o cliente saber qual id é de qual envio. O servidor não guarda o `tag` nem confere se ele é único: só o devolve. `accepted` quer dizer recebida, não aceita no livro, e pode vir seguida de um `rejected`. Sem `tag`, nada muda nas respostas.
-
-```
-{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10100,"lots":1,"tag":7}
-{"type":"accepted","tag":7,"order":3}
-{"type":"rested","instrument":"TESTE/BRL","order":3,"side":"sell","price":10100,"lots":1}
-```
-
-O `orders` lista as ordens descansando no livro (`"state":"resting"`) e os stops dormentes (`"armed"`), em ordem de id, com o pedido original (`type`, `price`, `trigger`, `tif`, `lots`) e o que falta (`remaining`). A resposta mostra o estado no ponto em que a consulta entrou na fila do núcleo e vem no mesmo fluxo dos relatórios: o que já estava a caminho chega antes dela (e está refletido nela), e o que chega depois aconteceu depois. Quem aplica os relatórios e depois a lista não conta nada duas vezes.
-
-Cada sessão recebe tudo que acontece com a sua conta, inclusive o que vem do comando de outra sessão: o fill de uma ordem descansando, o disparo de um stop. Nunca recebe o que é de outra conta: quem dispara o stop alheio vê o próprio negócio e nada do stop. Tudo chega num fluxo só, na ordem do núcleo, então o fill que explica a recusa de um cancelamento chega antes dela. Uma sessão que acumula 1.024 entregas sem ler é desconectada com um `error`: o núcleo não espera ninguém, e descartar em silêncio perderia um fill que não há como pedir de novo.
-
-A quem assina o feed, o servidor envia `snapshot` e depois os incrementos `depth` (quantidade absoluta no preço, `0` quando o nível some), `top` e `trade`. Erro numa mensagem não derruba a conexão; ela fecha em linha acima de 4 KiB, sessão ociosa por 5 minutos, servidor cheio (1.024 conexões) ou núcleo parado.
-
-## FIX
-
-A porta FIX fala FIX 4.4, com codec e sessão implementados à mão no crate `exchange-fix` (puro: não lê relógio nem toca rede; o instante entra como dado). O `SenderCompID` é o número da conta (a casa, `0`, é recusada) e o `TargetCompID` é `EXCHANGE`; o cliente é o initiator e propõe o `HeartBtInt` no Logon.
-
-- **Sessão**: todo `MsgSeqNum` é conferido. Buraco gera um único `ResendRequest`; o reenvio volta com `PossDupFlag=Y`, e as mensagens administrativas viram `SequenceReset-GapFill`. Duplicata abaixo do esperado com `PossDupFlag` é ignorada; sem ela, a sessão encerra com Logout. Silêncio além do intervalo gera `TestRequest` e, sem resposta, a conexão cai. Seqs e mensagens enviadas sobrevivem à queda da conexão: ao reconectar, o Logon revela o que faltou.
-- **Aplicação**: `NewOrderSingle` (`35=D`, `OrdType` 1 mercado, 2 limite, 3 stop e 4 stop-limite, com o gatilho em `StopPx`, tag 99) e `OrderCancelRequest` (`35=F`) entram; saem `ExecutionReport` (`35=8`: New, Trade, Canceled, Expired, Rejected e Triggered, `ExecType=L`, quando o stop dispara), `OrderCancelReject` (`35=9`) e `BusinessMessageReject` (`35=j`). `ClOrdID` já usado é recusado sem chegar ao núcleo, o que protege o cliente que, na dúvida depois de uma queda, manda a mesma ordem de novo.
-- **Relatórios sem pedido**: o que acontece com as ordens da sessão por causa do comando de outra (o fill de uma ordem descansando, o disparo de um stop) vira `ExecutionReport` sem o cliente ter mandado nada. Com o cliente desconectado, eles ficam guardados e saem depois do próximo Logon, em ordem: diferente da borda JSON, a sessão FIX não é cortada por acumular, porque o que acumula fora do ar é limitado pelas ordens que a própria conta já tem. Ordens da mesma conta mandadas pelo JSON não aparecem aqui, porque não têm `ClOrdID` nesta sessão.
-- **Desvios do padrão**: preço inteiro por lot (sem casas decimais), como na borda JSON; sem `AvgPx`.
-
-A garantia "nem perde nem duplica" é testada de duas formas: um `proptest` com duas sessões num TCP simulado que cai em pontos aleatórios, perde o que estava em trânsito e recebe reenvios a mais (cada lado recebe exatamente o que o outro enviou, uma vez e em ordem); e um teste de integração com o servidor real, em que a conexão cai depois de a ordem chegar ao núcleo e antes de a confirmação ser lida.
-
-## Feed de market data
-
-Cada instrumento tem dois fluxos, cada um com sua sequência contígua: **L2** (profundidade: cada nível de preço e os negócios) e **L1** (topo do livro e os negócios). Quem assina recebe um `snapshot` com o `seq` e, depois, só os incrementos seguintes. O núcleo nunca espera assinante: quem fica para trás perde mensagens, vê o salto na sequência e assina de novo para receber um snapshot novo.
-
-O cliente `feed` faz isso e desenha o livro no terminal a cada mudança:
-
-```
-cargo run -p edge --bin feed -- [--connect <endereço:porta>] [--instrument <símbolo>] [--feed l1|l2] [--plain]
-```
-
-Com o servidor rodando e outra conexão negociando:
-
-```
-TESTE/BRL  L2  seq 5
-        preço     lots
-venda   10100        2
-venda   10000        3
------- spread 100 ------
-compra   9900        3
-último negócio: 2 lots @ 10000
-```
-
-Num buraco, ele avisa (`buraco na sequência: esperava 6, veio 9 — pedindo snapshot novo`) e segue com o livro reconstruído. `--plain` imprime cada redesenho em sequência em vez de limpar a tela.
-
-## Benchmark
-
-```
-cargo bench -p exchange-core
-```
-
-Mede `Engine::apply` inteiro (risco pré-trade, reserva, matching e liquidação no ledger), sem WAL nem rede, sobre um fluxo determinístico de ordens limite em torno de um preço médio, em três cenários: `resting` (nada cruza), `crossing` (metade cruza o spread) e `with_cancels` (40% cruza, 20% são cancelamentos). Antes de medir, o fluxo é rodado uma vez e o benchmark falha se mais de 1% dos comandos for rejeitado: rejeitar é o caminho barato e daria um número falso.
-
-- `matching` (`criterion`): throughput, 10 mil comandos por iteração, cada uma num engine novo.
-- `latency`: cada `apply` cronometrado em 100 mil comandos, com os percentis pelo método nearest-rank.
-
-Numa AMD Ryzen 5 PRO 5650U, perfil `bench`:
-
-| Cenário | Throughput | p50 | p99 | p99.9 | máx |
-|---|---|---|---|---|---|
-| `resting` | 2,87 M comandos/s | 321 ns | 742 ns | 5,24 µs | 3,71 ms |
-| `crossing` | 1,89 M comandos/s | 311 ns | 2,62 µs | 3,87 µs | 1,15 ms |
-| `with_cancels` | 2,14 M comandos/s | 251 ns | 2,26 µs | 3,67 µs | 230 µs |
-
-A referência da seção 12 do escopo é mais de 100 mil ordens/s numa thread. O máximo, na casa dos milissegundos, é uma amostra isolada; o p99.9 mostra que a cauda fica em poucos microssegundos.
-
-### WAL
-
-```
-cargo bench -p exchange-wal
-```
-
-Mede o custo de um registro durável com payload do tamanho de um comando real (21 bytes). Os arquivos ficam em `target/tmp`, no disco: num `tmpfs` o `fsync` não faz nada e o número seria falso.
-
-- `append`: o `Wal::append` de hoje, um `fsync` por registro.
-- `no_fsync`: o mesmo frame sem `fsync`. Só para comparação, nunca uma opção: sem ele o registro não sobrevive a queda de energia.
-- `batch/{1,8,64}`: `Wal::append_batch` com N registros, um `write` e um `fsync` para todos.
-- `latency`: p50/p99/p99.9/máx de 5 mil `append`.
-
-Num NVMe SK Hynix com btrfs, em várias rodadas (o `fsync` oscila bastante de uma rodada para outra):
-
-| Cenário | Por registro | Registros/s |
-|---|---|---|
-| `append` | 2–4 ms | 250–450 |
-| `no_fsync` | 6–7 µs | ~150 mil |
-| `batch/8` | 0,3–0,6 ms | 1,8–3,5 mil |
-| `batch/64` | 25–75 µs | 14–41 mil |
-
-Latência do `append`: p50 de 0,7 a 4,4 ms, p99 em torno de 5 ms, máximo de dezenas de ms.
-
-O `fsync` é praticamente todo o custo, e um lote o divide pelo número de registros. Com um `fsync` por comando, o servidor com `--wal` fica em centenas de comandos/s, enquanto o núcleo faz milhões: é o caso que a decisão 5 previa para adotar group commit.
-
-### Group commit de ponta a ponta
-
-```
-cargo bench -p edge --bench group_commit
-```
-
-Sessões concorrentes falando com a thread do núcleo pelo `CoreHandle`, como as conexões do servidor, cada uma em closed loop: manda um depósito e só manda o próximo depois da resposta. São 2.048 comandos no total, divididos entre as sessões, com o WAL no disco e, para comparação, só em memória.
-
-Com uma sessão, a fila nunca tem mais de um pedido e cada comando paga um `fsync` inteiro. Com mais sessões, os pedidos que chegam durante um `fsync` entram juntos no próximo, e um `fsync` atende vários clientes. Ninguém espera de propósito por um lote.
-
-| Sessões | Memória | WAL |
-|---|---|---|
-| 1 | 50–64 mil cmd/s | 430–770 cmd/s |
-| 8 | 260–280 mil cmd/s | 1,6–3,7 mil cmd/s |
-| 64 | 450–660 mil cmd/s | 7–21 mil cmd/s |
-
-Com 64 sessões, o WAL atende de 10 a 30 vezes mais comandos por segundo que com uma, e cada cliente continua esperando mais ou menos um `fsync` por comando. A coluna de memória é o teto sem disco: o custo dos canais e da troca de thread. Por ela, uma sessão sozinha passa uns 15–20 µs só indo e voltando do núcleo.
-
-### Boot com snapshot
-
-```
-cargo bench -p edge --bench boot
-```
-
-Monta um log com um fluxo determinístico de 16 contas negociando TESTE/BRL — ordens limite dos dois lados, um quinto delas cruzando o spread, 10% de cancelamentos — e mede o boot de três jeitos: replay completo, snapshot cobrindo o log todo e snapshot com 1% do log depois dele. Mede também as duas metades de gravar um snapshot: montar o estado em bytes e gravar o arquivo com os `fsync`. Cada caso roda 5 vezes, com o log já no cache de páginas, e fica a mediana.
-
-Na mesma máquina e no mesmo NVMe:
-
-| Log | Ordens abertas no fim | Log / snapshot | Replay completo | Snapshot | Snapshot + 1% | Só ler o log |
-|---|---|---|---|---|---|---|
-| 100 mil comandos | 51 mil | 2,7 MB / 0,8 MB | 67 ms | 28 ms | 27–33 ms | 6 ms |
-| 1 milhão de comandos | 510 mil | 28 MB / 8,1 MB | 1,33 s | 370 ms | 390 ms | 83 ms |
-
-Com 1 milhão de comandos, o boot fica 3,5 vezes mais rápido. O que sobra tem duas partes:
-
-- **Ler o log inteiro** (~83 ms): o WAL confere o crc de todo quadro, inclusive dos que o snapshot cobre. Cortar o log depois do snapshot tiraria esse custo, mas mudaria a decisão 6, que guarda o log inteiro; fica para quando o tamanho do log pedir.
-- **Carregar o snapshot** (~280 ms, cerca de 0,55 µs por ordem aberta): decodificar o estado, validar cada ordem e reconstruir livro, índices e reservas. Cresce com o livro, não com o log: um log de 10 milhões de comandos com o mesmo livro custaria o mesmo.
-
-Gravar um snapshot desse tamanho custa uns 25 ms para montar o estado e 15 ms para gravar o arquivo, na thread do núcleo: é o pico de latência que aparece a cada `--snapshot-every` comandos.
-
-## Licença
-
-MIT — ver [`LICENSE`](LICENSE).
-
-## TUI
-
-```
-cargo run -p tui -- --account <conta> [--server <endereço:porta>]
-```
-
-Cliente de terminal que fala com o servidor só pelo protocolo JSON acima, pela crate `exchange-protocol`: o núcleo nem está no grafo de dependências dele. Com o servidor no ar (`127.0.0.1:7000` por padrão), a TUI faz login, pede os `instruments` e assina o L1 e o L2 de cada um.
-
-- **Mercado**: compra, venda, spread e último negócio de cada instrumento, com ▲/▼ em relação ao negócio anterior.
-- **Uma aba por instrumento**: o livro L2, com as vendas em cima e as compras embaixo, barras de profundidade e o spread no meio; os negócios, com a hora de chegada; as ordens da conta naquele instrumento, abertas primeiro e as últimas 20 terminadas esmaecidas embaixo; e os saldos.
-- **Boleta**, uma por instrumento, que guarda os últimos valores: limite, mercado ou stop (gatilho e, opcional, limite), lots e TIF. Sem modo de inserção: `↵` num nível do livro traz o preço, `h`/`l` anda entre os campos, `j`/`k` sobe e desce (o preço de tick em tick), e os dígitos entram pela direita como centavos (`1 0 0 5 0` é 100,50); o primeiro dígito num campo começa um valor novo. `↵` envia na hora.
-- **Cancelamento**: `x` na ordem sob o cursor, confirmado com `y`.
-- As ordens abertas antes da TUI subir vêm da consulta `orders` no login; o resto, dos relatórios da conta. Cada ordem da boleta vai com um `tag` próprio, e o `accepted` diz qual id ela recebeu: a linha em Minhas ordens nasce com o tipo, o TIF e o total que foram enviados, mesmo com outra sessão da conta negociando ao mesmo tempo. O saldo é pedido no login e de novo a cada relatório, um pedido por vez.
-- Um nível do livro que muda fica com os lots em laranja por cerca de um segundo.
-- Um buraco na sequência do feed descarta aquele livro e pede um snapshot novo, sem intervenção.
-- **Queda do servidor**: a TUI mostra `● reconectando (n)` e tenta de novo a cada 2s; enquanto isso o livro fica cinza (são os números do instante da queda) e nada é enviado. Ao voltar, refaz o login, os instrumentos, as assinaturas, as ordens e os saldos; a aba aberta e as boletas ficam. Uma ordem que estava aberta e não vem mais na consulta `orders` terminou enquanto a TUI estava fora e aparece como `encerr.`: o servidor não diz como ela terminou.
-
-| Tecla | Efeito |
-|---|---|
-| `j` `k` / `↓` `↑` | mover; na boleta, ajustar o campo |
-| `h` `l` / `←` `→` | na boleta, campo anterior / próximo |
-| `tab` / `shift-tab` | foco: livro → ordens → boleta |
-| `[` `]` | aba anterior / próxima |
-| `↵` | na aba Mercado, abrir o instrumento; no livro, levar o preço à boleta; na boleta, enviar |
-| `0`–`9` `⌫` | na boleta, digitar |
-| `b` `s` | lado da boleta: compra / venda |
-| `x` | nas ordens, cancelar (pede `y`) |
-| `?` | ajuda |
-| `q` | sair (pede `y` se houver ordem aberta) |
-| `ctrl-c` | sair na hora |
-
-### Critério de pronto da F8, à mão
-
-Em três terminais: o servidor (`cargo run -p edge --bin server`), a TUI (`cargo run -p tui -- --account 1`) e outro cliente (`socat - TCP:127.0.0.1:7000`). Pelo `socat`, deposite BRL na conta 1 (`{"type":"login","account":1}` e `{"type":"deposit","asset":"BRL","amount":100000000}`), saia e entre como a conta 2 para negociar (`{"type":"login","account":2}`, `{"type":"deposit","asset":"TESTE","amount":100000}`, `{"type":"limit","instrument":"TESTE/BRL","side":"sell","price":10050,"lots":7}`). Na TUI, `]` abre TESTE/BRL e a venda aparece no livro, com os lots em laranja; `k` e `↵` levam o preço à boleta, `l` `3` `↵` compra 3 lots e o fill aparece na linha de status, em Minhas ordens, em Negócios e nos saldos. Uma compra abaixo do preço (`h` `9990` `↵`) fica aberta; em Minhas ordens, `x` e `y` a cancelam.
+| F0–F1 | Domain model, price-time matching, market orders, partial fills, GTC / IOC / FOK, cancel |
+| F2 | Accounts, reservations, double-entry ledger with taker fee, pre-trade risk (max size, price collar) |
+| F3 | WAL with per-record `fsync`, boot-time recovery, deterministic replay |
+| F4 | `tokio` TCP server with a line-delimited JSON protocol; the core runs on its own thread behind channels |
+| F5 | L1 / L2 market-data feed: snapshot + sequenced increments, gap detection and recovery |
+| F6 | FIX 4.4: codec, session, `NewOrderSingle` / `OrderCancelRequest` / `ExecutionReport` |
+| F7 | Benchmarks, group commit, a second instrument, stop orders, private reports, snapshots |
+| F8 | Terminal client: live book, trades, orders, balances, order ticket, cancel, auto-reconnect |
+
+## Reference documentation (Portuguese)
+
+- [docs/escopo.md](docs/escopo.md): scope, architecture, domain rules and closed decisions
+- [docs/cli.md](docs/cli.md): CLI commands, instruments, WAL and snapshots
+- [docs/protocolo.md](docs/protocolo.md): JSON protocol and market-data feed
+- [docs/fix.md](docs/fix.md): FIX session and application messages
+- [docs/tui.md](docs/tui.md): terminal client and key bindings
+- [docs/benchmarks.md](docs/benchmarks.md): methodology and full results
+
+## License
+
+MIT. See [LICENSE](LICENSE).
